@@ -677,6 +677,12 @@ _SIDEBAR_HTML = f"""
   body[data-sidebar-open="true"] .mobile-sidebar-backdrop {{
     display: block;
   }}
+  [data-testid="stSidebarCollapseButton"] {{
+    display: none !important;
+  }}
+  [data-testid="stSidebar"] button[aria-label="Close sidebar"] {{
+    display: none !important;
+  }}
 }}
 `;
     doc.head.appendChild(style);
@@ -701,6 +707,19 @@ _SIDEBAR_HTML = f"""
       var isOpen = doc.body.getAttribute("data-sidebar-open") === "true";
       doc.body.setAttribute("data-sidebar-open", isOpen ? "false" : "true");
     }};
+  }}
+
+  var sidebar = doc.querySelector('[data-testid="stSidebar"]');
+  if (sidebar && !sidebar.hasAttribute("data-mobile-close-bound")) {{
+    sidebar.setAttribute("data-mobile-close-bound", "true");
+    sidebar.addEventListener("click", function(event) {{
+      var isMobile = window.matchMedia && window.matchMedia("(max-width: 768px)").matches;
+      if (!isMobile) return;
+      var btn = event.target && event.target.closest("button");
+      if (btn) {{
+        doc.body.setAttribute("data-sidebar-open", "false");
+      }}
+    }});
   }}
 
   var f = window.frameElement;
