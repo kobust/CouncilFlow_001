@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 35
 TOP_K_MIN, TOP_K_MAX = 1, 100
-RERANK_ENABLED = True
+RERANK_ENABLED = True  # Set False to skip LLM re-ranking if it hangs (e.g. AFC/timeouts)
 RERANK_FACTOR = 2
 
 

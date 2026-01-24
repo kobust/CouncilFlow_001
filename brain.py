@@ -397,7 +397,9 @@ def summarize_files_batch(
             "Use the same order as the documents. No other text.\n\n"
             + "\n\n---\n\n".join(parts)
         )
-        config = types.GenerateContentConfig()
+        config = types.GenerateContentConfig(
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
         contents = [types.Content(role="user", parts=[_text_part(prompt)])]
         delay = 1.0
         for attempt in range(3):
@@ -468,7 +470,9 @@ def describe_library(
         "Reply with only the 1–2 sentence description, no JSON or prefix."
     )
     client = _client()
-    config = types.GenerateContentConfig()
+    config = types.GenerateContentConfig(
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
     contents = [types.Content(role="user", parts=[_text_part(prompt)])]
     try:
         r = client.models.generate_content(model=DEFAULT_MODEL, contents=contents, config=config)
@@ -568,7 +572,9 @@ def run_retrieval_planner(
         .replace("{{ task_description }}", (task_description or "")[:2500])
         .replace("{{ user_content }}", (user_content or "")[:3500])
     )
-    config = types.GenerateContentConfig()
+    config = types.GenerateContentConfig(
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
     contents = [types.Content(role="user", parts=[_text_part(prompt)])]
     delay = 1.0
     for attempt in range(max_retries + 1):
@@ -636,7 +642,9 @@ def expand_queries(
             .replace("{{ task_description }}", (template_text or "")[:1500])
             .replace("{{ user_content }}", (user_content or "")[:2500])
         )
-        config = types.GenerateContentConfig()
+        config = types.GenerateContentConfig(
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
         contents = [types.Content(role="user", parts=[_text_part(prompt)])]
         r = client.models.generate_content(model=m, contents=contents, config=config)
         text = (r.text or "").strip()
@@ -690,6 +698,7 @@ def rerank_chunks_llm(
     if len(chunks) <= top_k:
         return chunks
 
+    logger.info("rerank_chunks_llm: starting re-rank of %d chunks -> top_k %d", len(chunks), top_k)
     client = _client()
     m = model or DEFAULT_MODEL
     scored: list[tuple[float, dict[str, Any]]] = []
@@ -699,8 +708,14 @@ def rerank_chunks_llm(
         "Query: {{ query }}\n\nPassages:\n{{ passages }}"
     )
 
+    total_batches = (len(chunks) + RERANK_BATCH_SIZE - 1) // RERANK_BATCH_SIZE
+    rerank_config = types.GenerateContentConfig(
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
     for start in range(0, len(chunks), RERANK_BATCH_SIZE):
+        batch_idx = start // RERANK_BATCH_SIZE + 1
         batch = chunks[start : start + RERANK_BATCH_SIZE]
+        logger.info("rerank batch %d/%d (%d chunks)", batch_idx, total_batches, len(batch))
         passages = []
         for i, c in enumerate(batch, 1):
             t = (c.get("text") or "")[:RERANK_MAX_CHUNK_CHARS]
@@ -711,10 +726,9 @@ def rerank_chunks_llm(
         prompt = prompt_tpl.replace("{{ query }}", q).replace(
             "{{ passages }}", "\n\n".join(passages)
         )
-        config = types.GenerateContentConfig()
         contents = [types.Content(role="user", parts=[_text_part(prompt)])]
         try:
-            r = client.models.generate_content(model=m, contents=contents, config=config)
+            r = client.models.generate_content(model=m, contents=contents, config=rerank_config)
             text = (r.text or "").strip()
             parsed = _parse_json_robust(text)
             scores = parsed.get("scores") if isinstance(parsed, dict) else None
