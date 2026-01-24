@@ -1,0 +1,1405 @@
+"""
+Attleboro Council Agent: auth, Drive-backed knowledge base, prompt tasks, Gemini agent.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import subprocess
+import tempfile
+import uuid
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+import streamlit_authenticator as stauth
+import yaml
+from docx import Document
+from pypdf import PdfReader
+from yaml.loader import SafeLoader
+
+# HTML to Markdown conversion (optional)
+HTML2MD_AVAILABLE = False
+try:
+    import html2text
+    HTML2MD_AVAILABLE = True
+except ImportError:
+    HTML2MD_AVAILABLE = False
+
+# OCR imports (optional - will fail gracefully if not available)
+OCR_AVAILABLE = False
+OCR_ERROR_MSG = None
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    # Check if Tesseract binary is actually available
+    try:
+        pytesseract.get_tesseract_version()
+        OCR_AVAILABLE = True
+    except Exception as tess_err:
+        OCR_AVAILABLE = False
+        OCR_ERROR_MSG = f"Tesseract OCR binary not found: {tess_err}"
+except ImportError as import_err:
+    OCR_AVAILABLE = False
+    OCR_ERROR_MSG = f"OCR Python libraries not installed: {import_err}"
+
+import brain
+from brain import (
+    CacheExpiredError,
+    DEFAULT_MODEL,
+    TOKENS_PER_BIBLE,
+    chars_to_tokens,
+    format_bible_equivalent,
+    format_context_usage,
+    model_max_context,
+)
+import db
+from librarian import get_cached_file_list, get_cached_folder_info
+from rag_cache import clear_disk_cache_for_folder
+from rag_loader import get_cached_rag_state, plan_retrieval, retrieve_and_build_context
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Log OCR availability after logger is initialized
+if not OCR_AVAILABLE:
+    if OCR_ERROR_MSG:
+        logger.warning(f"OCR not available: {OCR_ERROR_MSG}")
+    else:
+        logger.warning("OCR libraries (pytesseract, pdf2image) not available. OCR will be disabled for scanned PDFs.")
+
+# Log HTML2MD availability
+if not HTML2MD_AVAILABLE:
+    logger.warning("html2text library not available. HTML to Markdown conversion will be disabled.")
+
+APP_NAME = "Attleboro Council Agent"
+
+# -----------------------------------------------------------------------------
+# Auth
+# -----------------------------------------------------------------------------
+
+logger.info("Starting %s", APP_NAME)
+
+# Page config must be first Streamlit command
+st.set_page_config(
+    page_title=APP_NAME,
+    page_icon="🏛️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+try:
+    logger.debug("Loading config.yaml")
+    with open(Path(__file__).parent / "config.yaml", encoding="utf-8") as f:
+        config = yaml.load(f, Loader=SafeLoader)
+    logger.debug("Config loaded successfully")
+except FileNotFoundError:
+    logger.error("config.yaml not found")
+    st.error("Configuration file (config.yaml) not found. Please create it.")
+    st.stop()
+except Exception as e:
+    logger.error(f"Error loading config.yaml: {e}", exc_info=True)
+    st.error(f"Error loading configuration: {e}")
+    st.stop()
+
+try:
+    logger.debug("Initializing authenticator")
+    authenticator = stauth.Authenticate(
+        config["credentials"],
+        config["cookie"]["name"],
+        config["cookie"]["key"],
+        config["cookie"]["expiry_days"],
+    )
+    logger.debug("Authenticator initialized")
+except KeyError as e:
+    logger.error(f"Missing config key: {e}")
+    st.error(f"Configuration error: missing {e}")
+    st.stop()
+except Exception as e:
+    logger.error(f"Error initializing authenticator: {e}", exc_info=True)
+    st.error(f"Authentication setup failed: {e}")
+    st.stop()
+
+logger.debug("Rendering login widget")
+authenticator.login(location="main")
+
+if not st.session_state.get("authentication_status"):
+    if st.session_state.get("authentication_status") is False:
+        logger.warning("Login failed: incorrect credentials")
+        st.error("Username/password is incorrect")
+    else:
+        logger.debug("User not authenticated, stopping")
+    st.stop()
+
+_username = st.session_state.get("username", "")
+logger.info(f"User authenticated: {_username} ({st.session_state.get('name', 'unknown')})")
+is_admin = _username == "admin"
+
+# -----------------------------------------------------------------------------
+# Init
+# -----------------------------------------------------------------------------
+
+logger.debug("Initializing database")
+try:
+    db.init_db()
+    logger.debug("Database initialized")
+except Exception as e:
+    logger.error(f"Database initialization failed: {e}", exc_info=True)
+    st.error(f"Database error: {e}")
+    st.stop()
+
+# Initialize session state
+if "last_result" not in st.session_state:
+    st.session_state["last_result"] = None
+if "last_mode" not in st.session_state:
+    st.session_state["last_mode"] = None
+if "last_task_name" not in st.session_state:
+    st.session_state["last_task_name"] = None
+if "gemini_cache_name" not in st.session_state:
+    st.session_state["gemini_cache_name"] = None
+if "gemini_cache_folder_id" not in st.session_state:
+    st.session_state["gemini_cache_folder_id"] = None
+if "kb_loading_started" not in st.session_state:
+    st.session_state["kb_loading_started"] = False
+if "kb_loaded" not in st.session_state:
+    st.session_state["kb_loaded"] = False
+if "kb_load_error" not in st.session_state:
+    st.session_state["kb_load_error"] = None
+if "transient_items" not in st.session_state:
+    st.session_state["transient_items"] = []  # [{id, name, content, type: 'file'|'paste'}, ...]
+if "transient_deleted_file_names" not in st.session_state:
+    st.session_state["transient_deleted_file_names"] = []  # file names user deleted
+if "current_page" not in st.session_state:
+    st.session_state["current_page"] = "runner"  # "runner" | "edit_prompts"
+if "analysis_session_id" not in st.session_state:
+    st.session_state["analysis_session_id"] = 0  # incremented on New Analysis
+if "last_rag_retrieval_report" not in st.session_state:
+    st.session_state["last_rag_retrieval_report"] = None
+if "last_chain" not in st.session_state:
+    st.session_state["last_chain"] = None  # [(name, output), ...]
+if "last_chain_error" not in st.session_state:
+    st.session_state["last_chain_error"] = None
+logger.debug("Session state initialized")
+
+# -----------------------------------------------------------------------------
+# Load Knowledge Base at Boot (moved to after sidebar setup)
+# -----------------------------------------------------------------------------
+
+DEFAULT_FOLDER_ID = "1DBKa-Ol0TU-TVUkl73HomoMdUK8RjE-0"
+folder_id = DEFAULT_FOLDER_ID
+
+
+def _extract_text_via_poppler_html(pdf_bytes: bytes, name: str) -> str | None:
+    """
+    Extract text from PDF using Poppler's pdftohtml, then convert HTML to Markdown.
+    This preserves structure like tables, lists, headings, etc.
+    
+    Returns markdown text or None if conversion fails.
+    """
+    if not HTML2MD_AVAILABLE:
+        logger.debug("html2text not available, skipping Poppler HTML extraction")
+        return None
+    
+    try:
+        # Check if pdftohtml is available
+        pdftohtml_cmd = "pdftohtml"
+        try:
+            subprocess.run([pdftohtml_cmd, "-v"], capture_output=True, check=True, timeout=5)
+        except FileNotFoundError:
+            # Try common Windows installation paths
+            import os
+            possible_paths = [
+                r"C:\Program Files\poppler\bin\pdftohtml.exe",
+                r"C:\poppler\bin\pdftohtml.exe",
+                r"C:\Program Files (x86)\poppler\bin\pdftohtml.exe",
+            ]
+            for path in possible_paths:
+                if os.path.exists(path):
+                    pdftohtml_cmd = path
+                    logger.debug(f"Found pdftohtml at: {path}")
+                    break
+            else:
+                logger.debug("pdftohtml not found in PATH or common locations, skipping Poppler HTML extraction")
+                return None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            logger.debug("pdftohtml found but failed version check, skipping Poppler HTML extraction")
+            return None
+        
+        logger.info(f"Extracting PDF {name} via Poppler HTML (preserves structure)")
+        
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as pdf_temp:
+            pdf_path = pdf_temp.name
+            pdf_temp.write(pdf_bytes)
+        
+        try:
+            html_path = pdf_path.replace(".pdf", ".html")
+            
+            # Convert PDF to HTML using pdftohtml
+            # -i: ignore images
+            # -s: single HTML file
+            # -noframes: no frames
+            result = subprocess.run(
+                [pdftohtml_cmd, "-i", "-s", "-noframes", pdf_path, html_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=True
+            )
+            
+            # Read the HTML file
+            try:
+                with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
+                    html_content = f.read()
+            except FileNotFoundError:
+                # Sometimes pdftohtml creates files with different names
+                base_name = html_path.replace(".html", "")
+                possible_names = [f"{base_name}.html", f"{base_name}-1.html", f"{base_name}-s.html"]
+                html_content = None
+                for possible_name in possible_names:
+                    try:
+                        with open(possible_name, "r", encoding="utf-8", errors="ignore") as f:
+                            html_content = f.read()
+                            logger.debug(f"Found HTML file: {possible_name}")
+                            break
+                    except FileNotFoundError:
+                        continue
+                
+                if html_content is None:
+                    logger.warning(f"Could not find HTML output file for {name}")
+                    return None
+            
+            if not html_content or len(html_content.strip()) < 50:
+                logger.warning(f"HTML output for {name} is too small or empty")
+                return None
+            
+            # Convert HTML to Markdown
+            h = html2text.HTML2Text()
+            h.ignore_links = False
+            h.ignore_images = True
+            h.body_width = 0  # Don't wrap lines
+            h.unicode_snob = True  # Use unicode
+            markdown_text = h.handle(html_content)
+            
+            # Clean up temporary files
+            try:
+                os.unlink(pdf_path)
+                if os.path.exists(html_path):
+                    os.unlink(html_path)
+                # Clean up any numbered HTML files
+                base_name = html_path.replace(".html", "")
+                for possible_name in [f"{base_name}-1.html", f"{base_name}-s.html"]:
+                    if os.path.exists(possible_name):
+                        os.unlink(possible_name)
+            except Exception as cleanup_err:
+                logger.debug(f"Error cleaning up temp files: {cleanup_err}")
+            
+            if markdown_text and len(markdown_text.strip()) > 50:
+                logger.info(f"Successfully extracted {len(markdown_text)} chars from {name} via Poppler HTML")
+                return markdown_text
+            else:
+                logger.warning(f"Poppler HTML extraction for {name} produced too little text")
+                return None
+                
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"pdftohtml failed for {name}: {e.stderr or e.stdout}")
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning(f"pdftohtml timed out for {name}")
+            return None
+        except Exception as e:
+            logger.warning(f"Error in Poppler HTML extraction for {name}: {e}", exc_info=True)
+            return None
+        finally:
+            # Ensure cleanup
+            import os
+            try:
+                if os.path.exists(pdf_path):
+                    os.unlink(pdf_path)
+            except Exception:
+                pass
+    
+    except Exception as e:
+        logger.error(f"Poppler HTML extraction failed for {name}: {e}", exc_info=True)
+        return None
+
+
+def _extract_text_with_ocr(pdf_bytes: bytes, name: str) -> str:
+    """Extract text from PDF using OCR (for scanned/image-based PDFs)."""
+    if not OCR_AVAILABLE:
+        logger.warning(f"OCR not available for {name}: {OCR_ERROR_MSG or 'OCR libraries not installed'}")
+        return None
+    
+    try:
+        logger.info(f"Attempting OCR on {name}")
+        # Convert PDF pages to images
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=300)
+            logger.info(f"Converted {len(images)} pages to images for OCR")
+        except Exception as pdf2img_err:
+            logger.error(f"Failed to convert PDF to images for {name}: {pdf2img_err}", exc_info=True)
+            # Check if it's a Poppler error
+            error_str = str(pdf2img_err).lower()
+            if "poppler" in error_str or "pdftoppm" in error_str:
+                logger.error("Poppler (pdf2image dependency) may not be installed. On Windows, download from: https://github.com/oschwartz10612/poppler-windows/releases")
+            return None
+        
+        ocr_parts = []
+        successful_ocr_pages = 0
+        for page_num, image in enumerate(images, 1):
+            try:
+                # Perform OCR on the image
+                text = pytesseract.image_to_string(image, lang='eng')
+                if text and text.strip():
+                    ocr_parts.append(text)
+                    successful_ocr_pages += 1
+                    logger.debug(f"OCR page {page_num}: Extracted {len(text)} chars")
+                else:
+                    logger.debug(f"OCR page {page_num}: No text found")
+            except pytesseract.TesseractNotFoundError as tess_err:
+                logger.error(f"Tesseract OCR binary not found for page {page_num} of {name}: {tess_err}")
+                logger.error("Please install Tesseract OCR. On Windows: https://github.com/UB-Mannheim/tesseract/wiki")
+                return None
+            except Exception as ocr_error:
+                logger.warning(f"OCR failed on page {page_num} of {name}: {ocr_error}", exc_info=True)
+                ocr_parts.append(f"[Page {page_num}: OCR error - {type(ocr_error).__name__}]")
+        
+        result = "\n\n".join(ocr_parts)
+        logger.info(f"OCR completed: {len(result)} chars extracted from {name} ({successful_ocr_pages}/{len(images)} pages successful)")
+        return result if result.strip() else None
+    except Exception as e:
+        logger.error(f"OCR failed for {name}: {e}", exc_info=True)
+        # Provide helpful error messages
+        error_str = str(e).lower()
+        if "tesseract" in error_str or "tesseractnotfound" in error_str:
+            logger.error("Tesseract OCR binary not found. Please install Tesseract OCR.")
+        elif "poppler" in error_str or "pdftoppm" in error_str:
+            logger.error("Poppler not found. Required for pdf2image. On Windows: https://github.com/oschwartz10612/poppler-windows/releases")
+        return None
+
+
+def _extract_text_from_upload(file) -> str:
+    """Extract text from uploaded PDF or DOCX."""
+    name = (getattr(file, "name", None) or "file").lower()
+    logger.info(f"Extracting text from uploaded file: {name} (type: {type(file).__name__})")
+    try:
+        # Reset file pointer in case it was already read
+        if hasattr(file, 'seek'):
+            file.seek(0)
+        
+        # Read file content
+        raw = file.read()
+        logger.info(f"Read {len(raw)} bytes from {name}")
+        
+        if len(raw) == 0:
+            logger.warning(f"File {name} appears to be empty (0 bytes)")
+            return f"[Error: File {name} is empty]"
+        
+        # Verify it looks like a PDF (starts with %PDF)
+        if name.endswith(".pdf"):
+            if not raw.startswith(b'%PDF'):
+                logger.warning(f"File {name} has .pdf extension but doesn't start with %PDF signature. First bytes: {raw[:20]}")
+                # Still try to process it
+            
+            logger.debug(f"Extracting from PDF: {name}")
+            
+            # First, try Poppler HTML extraction (preserves structure like tables, lists)
+            poppler_result = _extract_text_via_poppler_html(raw, name)
+            if poppler_result and len(poppler_result.strip()) > 100:
+                logger.info(f"Successfully extracted {len(poppler_result)} chars from {name} via Poppler HTML (with structure)")
+                return poppler_result
+            
+            # Fallback to standard pypdf extraction
+            try:
+                bio = io.BytesIO(raw)
+                reader = PdfReader(bio)
+                logger.debug(f"PDF reader created, {len(reader.pages)} pages found")
+                
+                parts = []
+                total_pages = len(reader.pages)
+                successful_pages = 0
+                failed_pages = []
+                
+                for page_num, p in enumerate(reader.pages, 1):
+                    try:
+                        t = p.extract_text()
+                        if t and t.strip():
+                            parts.append(t)
+                            successful_pages += 1
+                            logger.debug(f"Page {page_num}: Extracted {len(t)} chars")
+                        else:
+                            logger.debug(f"Page {page_num}: No text extracted (empty or whitespace only)")
+                            parts.append(f"[Page {page_num}: No text found]")
+                    except (KeyError, AttributeError, ValueError) as page_error:
+                        # Common PDF parsing errors (malformed fonts, missing bbox, etc.)
+                        failed_pages.append(page_num)
+                        error_type = type(page_error).__name__
+                        error_msg = str(page_error)[:100]
+                        logger.warning(f"Error extracting text from page {page_num}/{total_pages} of {name}: {error_type} - {error_msg}")
+                        parts.append(f"[Page {page_num}: Error extracting text - {error_type}]")
+                    except Exception as page_error:
+                        # Other unexpected errors
+                        failed_pages.append(page_num)
+                        logger.warning(f"Unexpected error extracting text from page {page_num}/{total_pages} of {name}: {page_error}", exc_info=True)
+                        parts.append(f"[Page {page_num}: Error extracting text - {type(page_error).__name__}]")
+                
+                result = "\n".join(parts)
+                if failed_pages:
+                    logger.info(f"Extracted text from {successful_pages}/{total_pages} pages of {name} (failed pages: {failed_pages})")
+                logger.info(f"Extracted {len(result)} chars from PDF {name} ({successful_pages}/{total_pages} pages successful)")
+                
+                # Calculate actual text content (excluding error messages)
+                # Filter out error placeholders to get real text length
+                actual_text_parts = [p for p in parts if not (p.startswith("[Page") or p.startswith("[Error"))]
+                actual_text = "\n".join(actual_text_parts)
+                actual_text_len = len(actual_text.strip())
+                
+                # If no pages succeeded OR very little actual text was extracted, try OCR (for scanned PDFs)
+                should_try_ocr = successful_pages == 0 or actual_text_len < 50
+                
+                if should_try_ocr:
+                    logger.info(f"PDF {name} has no successful pages or very little text ({actual_text_len} chars from {successful_pages} pages). Attempting OCR...")
+                    ocr_result = _extract_text_with_ocr(raw, name)
+                    if ocr_result and len(ocr_result.strip()) > 50:
+                        logger.info(f"OCR successfully extracted {len(ocr_result)} chars from {name}")
+                        return ocr_result
+                    elif ocr_result:
+                        logger.warning(f"OCR extracted only {len(ocr_result)} chars from {name}")
+                        return ocr_result
+                    else:
+                        logger.warning(f"OCR failed or unavailable for {name}. Returning minimal text extraction.")
+                        if not OCR_AVAILABLE:
+                            error_detail = OCR_ERROR_MSG or "OCR libraries not installed"
+                            install_msg = ""
+                            if "tesseract" in error_detail.lower():
+                                install_msg = "\n\nTo install Tesseract OCR on Windows:\n1. Download from: https://github.com/UB-Mannheim/tesseract/wiki\n2. Install to default location or add to PATH\n3. Also install Poppler: https://github.com/oschwartz10612/poppler-windows/releases"
+                            return f"[ERROR: PDF {name} appears to be a scanned/image-based document. Text extraction failed on all pages.\n\nOCR is required but not available: {error_detail}{install_msg}\n\nPlease install Tesseract OCR and Poppler, then restart Streamlit and try again.]\n\n{result}"
+                        return f"[Warning: PDF {name} appears to be image-based (scanned). OCR was attempted but failed. Check logs for details.]\n\n{result}"
+                
+                return result
+            except Exception as pdf_error:
+                logger.error(f"Failed to read PDF {name}: {pdf_error}", exc_info=True)
+                return f"[Error reading PDF {name}: {pdf_error}]"
+        if name.endswith(".docx") or name.endswith(".doc"):
+            logger.debug(f"Extracting from Word doc: {name}")
+            try:
+                doc = Document(io.BytesIO(raw))
+                result = "\n".join(p.text for p in doc.paragraphs if p.text)
+                logger.debug(f"Extracted {len(result)} chars from Word doc {name}")
+                if len(result) == 0:
+                    logger.warning(f"Word document {name} appears to have no extractable text")
+                    return f"[Warning: Document {name} contains no extractable text]"
+                return result
+            except Exception as doc_error:
+                logger.error(f"Failed to read Word doc {name}: {doc_error}", exc_info=True)
+                return f"[Error reading Word document {name}: {doc_error}]"
+        logger.debug(f"Decoding as plain text: {name}")
+        result = raw.decode("utf-8", errors="replace")
+        logger.debug(f"Decoded {len(result)} chars")
+        if len(result) == 0:
+            logger.warning(f"Text file {name} appears to be empty")
+            return f"[Warning: Text file {name} is empty]"
+        return result
+    except Exception as e:
+        logger.error(f"Error extracting text from {name}: {e}", exc_info=True)
+        return f"[Error extracting text from {name}: {e}]"
+
+
+def _dict_to_dataframe(obj) -> pd.DataFrame | None:
+    """Convert JSON result to DataFrame (list of dicts or headers/rows)."""
+    logger.debug(f"Converting to DataFrame: type={type(obj).__name__}")
+    try:
+        if isinstance(obj, list):
+            if obj and isinstance(obj[0], dict):
+                logger.debug(f"Converting list of {len(obj)} dicts to DataFrame")
+                return pd.DataFrame(obj)
+            else:
+                logger.warning("List is empty or first element is not a dict")
+                return None
+        if isinstance(obj, dict):
+            rows = obj.get("rows")
+            headers = obj.get("headers")
+            if headers and rows:
+                logger.debug(f"Converting headers/rows format: {len(rows)} rows, {len(headers)} cols")
+                return pd.DataFrame(rows, columns=headers)
+            if "data" in obj and isinstance(obj["data"], list):
+                logger.debug(f"Converting data array: {len(obj['data'])} items")
+                return pd.DataFrame(obj["data"])
+            # Try to convert dict directly (if it's a single row)
+            logger.debug("Attempting to convert dict as single-row DataFrame")
+            return pd.DataFrame([obj])
+        logger.warning(f"Cannot convert {type(obj).__name__} to DataFrame")
+        return None
+    except Exception as e:
+        logger.error(f"Error converting to DataFrame: {e}", exc_info=True)
+        return None
+
+
+def _df_to_markdown_table(df: pd.DataFrame) -> str:
+    """Turn DataFrame into Markdown table string."""
+    cols = [str(c) for c in df.columns]
+    lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join("---" for _ in cols) + " |"]
+    for _, r in df.iterrows():
+        lines.append("| " + " | ".join(str(v) for v in r) + " |")
+    return "\n".join(lines)
+
+
+def _markdown_with_copy(md: str, key_suffix: str) -> None:
+    """Render markdown and show a Copy block so the user can copy the markdown source."""
+    st.markdown(md)
+    with st.expander(f"📋 Copy markdown ({key_suffix})", expanded=False):
+        st.caption("Use the copy icon in the code block below to copy the markdown.")
+        st.code(md, language="markdown", line_numbers=False)
+
+
+def _wrap_transient_content(items: list[dict]) -> str:
+    """
+    Wrap transient input items (uploads + pastes) as subject-of-analysis, distinct from the knowledge base.
+    Each item: {id, name, content, type: 'file'|'paste'}.
+    """
+    if not items:
+        return ""
+    parts = [
+        "<subject_of_analysis>",
+        "The following are the subject of analysis (transient input). They are distinct from the knowledge base.",
+        "",
+    ]
+    for it in items:
+        name = (it.get("name") or "Untitled").replace('"', "&quot;").replace("\n", " ")
+        content = (it.get("content") or "").strip()
+        typ = it.get("type", "file")
+        parts.append(f'<document title="{name}" type="{typ}">')
+        parts.append(content)
+        parts.append("</document>")
+        parts.append("")
+    parts.append("</subject_of_analysis>")
+    return "\n".join(parts)
+
+
+# -----------------------------------------------------------------------------
+# Banner (full-width across entire screen; component iframe injects into parent)
+# -----------------------------------------------------------------------------
+
+_BANNER_H = 56
+_BANNER_HTML = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+(function() {{
+  var doc = parent.document;
+  if (doc.getElementById("app-banner")) {{
+    var f = window.frameElement;
+    if (f) {{ f.style.setProperty("display", "none", "important"); f.style.setProperty("height", "0", "important"); }}
+    return;
+  }}
+  var style = doc.createElement("style");
+  style.textContent = "[data-testid=\\"stAppViewContainer\\"] {{ padding-top: {_BANNER_H}px !important; }} " +
+    "main .block-container {{ padding-top: 0 !important; }}";
+  doc.head.appendChild(style);
+  var bar = doc.createElement("div");
+  bar.id = "app-banner";
+  bar.style.cssText = "position:fixed;top:0;left:0;right:0;width:100%;height:{_BANNER_H}px;background:#1e3a5f;color:#fff;display:flex;align-items:center;padding:0 1.5rem;box-shadow:0 1px 4px rgba(0,0,0,0.15);font-family:inherit;z-index:999999;";
+  bar.innerHTML = '<span style="font-size:1.2rem;font-weight:600;">🏛️ {APP_NAME}</span><span style="font-size:0.9rem;opacity:0.95;margin-left:0.75rem;">AI-assisted analysis for municipal council workflows</span>';
+  doc.body.insertBefore(bar, doc.body.firstChild);
+  var f = window.frameElement;
+  if (f) {{
+    f.style.setProperty("display", "none", "important");
+    f.style.setProperty("height", "0", "important");
+    var p = f.parentElement;
+    if (p) {{ p.style.setProperty("margin", "0", "important"); p.style.setProperty("padding", "0", "important"); p.style.setProperty("min-height", "0", "important"); }}
+  }}
+}})();
+</script>
+</body>
+</html>
+"""
+components.html(_BANNER_HTML, height=0)
+
+# -----------------------------------------------------------------------------
+# Sidebar
+# -----------------------------------------------------------------------------
+
+# Navigation
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Navigation**")
+run_analysis_clicked = st.sidebar.button("▶️ Run Analysis", key="nav_run", use_container_width=True)
+if run_analysis_clicked:
+    st.session_state["current_page"] = "runner"
+    st.rerun()
+
+if is_admin:
+    open_editor_clicked = st.sidebar.button("✏️ Prompt Editor", key="nav_editor", use_container_width=True)
+    if open_editor_clicked:
+        st.session_state["current_page"] = "edit_prompts"
+        st.rerun()
+
+current_page = st.session_state.get("current_page", "runner")
+if current_page == "edit_prompts" and not is_admin:
+    st.session_state["current_page"] = "runner"
+    st.rerun()
+
+# Model indicator
+st.sidebar.markdown("---")
+st.sidebar.caption("AI model")
+st.sidebar.markdown(f"**{DEFAULT_MODEL}**")
+
+# RAG knowledge base loading (runs once at boot)
+if not st.session_state.get("kb_loading_started") and folder_id:
+    st.session_state["kb_loading_started"] = True
+    logger.info("Starting RAG knowledge base load at boot")
+    kb_status_placeholder = st.sidebar.empty()
+    kb_status_placeholder.info("⏳ Loading knowledge base…")
+    try:
+        with st.spinner("Loading knowledge base…"):
+            def _rag_progress(phase: str, *args):
+                logger.debug(f"RAG progress: {phase} {args}")
+            rag_state = get_cached_rag_state(folder_id, _progress_callback=_rag_progress)
+            st.session_state["rag_state"] = rag_state
+            n_libs = len(rag_state.get("libraries", []))
+            logger.info(f"RAG loaded: Core + {n_libs} libraries")
+            st.session_state["kb_loaded"] = True
+            st.session_state["kb_load_error"] = None
+        kb_status_placeholder.success("✓ Knowledge base loaded")
+    except Exception as e:
+        logger.error(f"Error loading RAG knowledge base at boot: {e}", exc_info=True)
+        st.session_state["kb_load_error"] = str(e)
+        st.session_state["kb_loaded"] = False
+        st.session_state["rag_state"] = None
+        kb_status_placeholder.error(f"⚠ Load error: {str(e)[:60]}…")
+
+# Knowledge base section at bottom (lower priority)
+st.sidebar.markdown("---")
+st.sidebar.caption("Knowledge base")
+folder_info = get_cached_folder_info(folder_id) if folder_id else None
+if folder_info:
+    name = folder_info.get("name", "Drive folder")
+    link = folder_info.get("link", f"https://drive.google.com/drive/folders/{folder_id}")
+    st.sidebar.markdown(f"[**{name}**]({link})")
+else:
+    st.sidebar.caption(f"Folder: `{folder_id[:20]}...`")
+
+if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb", use_container_width=True):
+    logger.info("User clicked Refresh Knowledge Base")
+    try:
+        get_cached_rag_state.clear()
+        get_cached_folder_info.clear()
+        get_cached_file_list.clear()
+        n = clear_disk_cache_for_folder(folder_id)
+        if n:
+            logger.info(f"Cleared {n} RAG index cache file(s)")
+        st.session_state["gemini_cache_name"] = None
+        st.session_state["gemini_cache_folder_id"] = None
+        st.session_state["kb_loading_started"] = False
+        st.session_state["kb_loaded"] = False
+        st.session_state["kb_load_error"] = None
+        st.session_state["rag_state"] = None
+        logger.info("RAG knowledge base cache cleared")
+        msg = "Knowledge base and index cache cleared." if n else "Cache cleared. Reloading…"
+        st.sidebar.success(msg)
+        st.rerun()
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}", exc_info=True)
+        st.sidebar.error(f"Error clearing cache: {e}")
+
+# KB status (loaded / error / loading) below refresh
+if st.session_state.get("kb_loaded"):
+    st.sidebar.caption("✓ Knowledge base loaded")
+elif st.session_state.get("kb_load_error"):
+    st.sidebar.caption(f"⚠ {st.session_state['kb_load_error'][:50]}…")
+elif st.session_state.get("kb_loading_started"):
+    st.sidebar.caption("⏳ Loading knowledge base…")
+
+st.sidebar.markdown("---")
+authenticator.logout(location="sidebar")
+
+# -----------------------------------------------------------------------------
+# Prompt Editor page
+# -----------------------------------------------------------------------------
+
+if current_page == "edit_prompts":
+    st.markdown("## ✏️ Prompt Editor")
+    if st.button("← Back to Run Analysis", key="back_to_runner"):
+        st.session_state["current_page"] = "runner"
+        st.rerun()
+    st.caption("Manage prompt templates. Admin only.")
+    st.markdown("---")
+    crud_prompts = sorted(db.get_all_prompts(), key=lambda p: p.name.casefold())
+    crud_options = ["+ Add new"] + [p.name for p in crud_prompts]
+    crud_select = st.selectbox("Select prompt", crud_options, key="crud_select")
+    existing = next((p for p in crud_prompts if p.name == crud_select), None)
+    
+    # Always sync form values from current selection (fixes checkbox sync and post-save stale state)
+    st.session_state["crud_last_selected"] = existing.id if existing else None
+    if existing:
+        st.session_state["crud_name"] = existing.name
+        st.session_state["crud_template"] = existing.template_text
+        st.session_state["crud_verifier_id"] = existing.verifier_id
+        st.session_state["crud_follow_on_only"] = getattr(existing, "follow_on_only", False)
+    else:
+        st.session_state["crud_name"] = ""
+        st.session_state["crud_template"] = ""
+        st.session_state["crud_verifier_id"] = None
+        st.session_state["crud_follow_on_only"] = False
+
+    with st.form("prompt_form", clear_on_submit=False):
+        name_value = st.session_state.get("crud_name", "")
+        template_value = st.session_state.get("crud_template", "")
+        verifier_id_value = st.session_state.get("crud_verifier_id", None)
+        follow_on_only_value = st.session_state.get("crud_follow_on_only", False)
+        
+        name = st.text_input("Name", value=name_value, placeholder="e.g. MC Analysis, Constituent Reply")
+        template_text = st.text_area("Template", value=template_value, height=200, placeholder="Instructions for the AI. Use {{ content }} for the user's input.")
+        st.caption("Output is always Markdown.")
+        
+        # Follow-on prompt selector (chainable)
+        st.markdown("**Follow-on prompt (optional)**")
+        st.caption("Run another prompt after this one. It receives this prompt's output as {{ previous_output }}. Can be chained.")
+        _followon_candidates = [p for p in crud_prompts if p.id != (existing.id if existing else None)]
+        followon_options = ["— None —"] + [f"{p.id}: {p.name}" for p in _followon_candidates]
+        current_followon_str = None
+        if verifier_id_value:
+            followon_p = db.get_prompt_by_id(verifier_id_value)
+            if followon_p:
+                current_followon_str = f"{followon_p.id}: {followon_p.name}"
+        followon_index = 0
+        if current_followon_str and current_followon_str in followon_options:
+            followon_index = followon_options.index(current_followon_str)
+        selected_followon_str = st.selectbox("Follow-on prompt", followon_options, index=followon_index, key="followon_select")
+        verifier_id = None
+        if selected_followon_str and selected_followon_str != "— None —":
+            try:
+                verifier_id = int(selected_followon_str.split(":")[0])
+                logger.debug(f"Selected follow-on prompt ID: {verifier_id}")
+            except (ValueError, IndexError):
+                logger.warning(f"Could not parse follow-on ID from: {selected_followon_str}")
+                verifier_id = None
+        
+        follow_on_only = st.checkbox(
+            "Follow-on only (exclude from Run Analysis; can only be used as a follow-on)",
+            value=follow_on_only_value,
+            key="crud_follow_on_only",
+        )
+        st.caption("If checked, this prompt will not appear in the Analysis type dropdown.")
+        
+        submitted = st.form_submit_button("Save")
+        if submitted and name and template_text:
+            logger.info(f"Saving prompt: {name} (id: {existing.id if existing else 'new'}, verifier_id: {verifier_id}, follow_on_only: {follow_on_only})")
+            try:
+                db.save_prompt(name, template_text, "markdown", verifier_id=verifier_id, follow_on_only=follow_on_only, id=existing.id if existing else None)
+                logger.info("Prompt saved successfully")
+                st.success("Saved.")
+                st.rerun()
+            except Exception as e:
+                logger.error(f"Error saving prompt: {e}", exc_info=True)
+                st.error(f"Error saving: {e}")
+
+    # Delete prompt (existing only)
+    if existing:
+        st.markdown("---")
+        with st.expander("🗑️ Delete this prompt", expanded=False):
+            st.caption("This cannot be undone. Any prompt that used this as a follow-on will have that link cleared.")
+            confirm_delete = st.checkbox("I want to delete this prompt", key="confirm_delete_prompt")
+            if st.button("Delete prompt", key="delete_prompt_btn", disabled=not confirm_delete, type="secondary"):
+                try:
+                    db.delete_prompt(existing.id)
+                    if "crud_last_selected" in st.session_state:
+                        del st.session_state["crud_last_selected"]
+                    st.session_state["crud_select"] = "+ Add new"
+                    st.success(f"Deleted \"{existing.name}\".")
+                    st.rerun()
+                except Exception as e:
+                    logger.error(f"Error deleting prompt: {e}", exc_info=True)
+                    st.error(f"Error deleting: {e}")
+
+    st.markdown("---")
+
+# -----------------------------------------------------------------------------
+# Run Analysis page
+# -----------------------------------------------------------------------------
+
+if current_page == "runner":
+    try:
+        prompts = sorted(db.get_all_prompts(), key=lambda p: p.name.casefold())
+        runnable = [p for p in prompts if not getattr(p, "follow_on_only", False)]
+        task_options = [p.name for p in runnable]
+    except Exception as e:
+        logger.error(f"Error loading prompts: {e}", exc_info=True)
+        prompts = []
+        task_options = []
+
+    st.markdown("## ▶️ Run Analysis")
+    st.caption("Select a task, add documents or paste text, then run. Results use the council knowledge base.")
+
+    # New Analysis: reset runner state
+    if st.button("🔄 New analysis", key="new_analysis_btn"):
+        st.session_state["transient_items"] = []
+        st.session_state["transient_deleted_file_names"] = []
+        st.session_state["last_result"] = None
+        st.session_state["last_task_name"] = None
+        st.session_state["last_mode"] = None
+        st.session_state["last_chain"] = None
+        st.session_state["last_chain_error"] = None
+        st.session_state["last_rag_retrieval_report"] = None
+        st.session_state["last_run_context_stats"] = None
+        st.session_state["analysis_session_id"] = st.session_state.get("analysis_session_id", 0) + 1
+        logger.info("New Analysis: reset runner state")
+        st.rerun()
+
+    sid = st.session_state.get("analysis_session_id", 0)
+    st.markdown("---")
+
+    st.markdown("### Step 1: Select analysis type")
+    task_select = st.selectbox("Analysis type", options=task_options or ["—"], key="task_select", label_visibility="collapsed")
+    selected = next((p for p in prompts if p.name == task_select), None)
+
+    if selected:
+        template_text = selected.template_text
+        transient_items = list(st.session_state.get("transient_items", []))
+        deleted_names = set(st.session_state.get("transient_deleted_file_names", []))
+
+        st.markdown("### Step 2: Add input")
+        st.caption("Upload PDF/DOCX files or add named pastes. All become the subject of analysis.")
+        files = st.file_uploader("Upload files (PDF, Word)", type=["pdf", "docx", "doc"], accept_multiple_files=True, key=f"file_upload_{sid}", label_visibility="collapsed")
+        # Sync uploaded files -> transient_items
+        current_file_names = [f.name for f in files] if files else []
+        file_names_in_list = {it["name"] for it in transient_items if it.get("type") == "file"}
+        for fn in current_file_names:
+            if fn in deleted_names:
+                continue
+            if fn in file_names_in_list:
+                continue
+            logger.info(f"Adding new file to transient: {fn}")
+            with st.spinner(f"Extracting {fn}…"):
+                raw = _extract_text_from_upload(next(f for f in files if f.name == fn))
+            transient_items.append({
+                "id": str(uuid.uuid4()),
+                "name": fn,
+                "content": raw,
+                "type": "file",
+            })
+            file_names_in_list.add(fn)
+        # Remove files no longer in uploader from transient_items and from deleted
+        still_uploaded = set(current_file_names)
+        new_items = []
+        for it in transient_items:
+            if it.get("type") == "file":
+                n = it.get("name", "")
+                if n not in still_uploaded:
+                    deleted_names.discard(n)
+                    continue
+            new_items.append(it)
+        transient_items = new_items
+        st.session_state["transient_items"] = transient_items
+        st.session_state["transient_deleted_file_names"] = list(deleted_names)
+
+        # Add named paste
+        with st.expander("➕ Add named paste", expanded=False):
+            with st.form("add_paste_form", clear_on_submit=True):
+                paste_name = st.text_input("Name", placeholder="e.g. Priorities, notes")
+                paste_content = st.text_area("Content", height=120, placeholder="Paste text here…")
+                if st.form_submit_button("Add paste"):
+                    if paste_name and paste_content:
+                        transient_items = st.session_state.get("transient_items", [])
+                        transient_items.append({
+                            "id": str(uuid.uuid4()),
+                            "name": paste_name.strip(),
+                            "content": paste_content.strip(),
+                            "type": "paste",
+                        })
+                        st.session_state["transient_items"] = transient_items
+                        st.rerun()
+
+        # List transient items with delete
+        if not transient_items:
+            st.info("Add files and/or named pastes above, then go to **Step 3** to run.")
+        else:
+            for it in transient_items:
+                tid = it["id"]
+                name = it.get("name", "Untitled")
+                typ = it.get("type", "file")
+                content = it.get("content", "")
+                n = len(content)
+                icon = "📄" if typ == "file" else "📝"
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    with st.expander(f"{icon} **{name}** ({n:,} chars) — {typ}", expanded=False):
+                        preview = (content[:5000] + "…") if len(content) > 5000 else (content or "[No content]")
+                        st.markdown(preview)
+                with col2:
+                    if st.button("🗑️ Delete", key=f"del_{tid}"):
+                        st.session_state["transient_items"] = [x for x in st.session_state["transient_items"] if x["id"] != tid]
+                        if typ == "file":
+                            s = set(st.session_state.get("transient_deleted_file_names", [])) | {name}
+                            st.session_state["transient_deleted_file_names"] = list(s)
+                        st.rerun()
+
+        st.markdown("### Step 3: Run")
+        run = st.button("Run analysis", key="run_btn", type="primary")
+
+        if run:
+            logger.info(f"Run button clicked for task: {selected.name}")
+            user_content = _wrap_transient_content(transient_items)
+            can_proceed = True
+            if not folder_id:
+                logger.warning("Run attempted without Drive folder ID")
+                st.error("Drive folder ID is missing.")
+                can_proceed = False
+            elif not transient_items:
+                logger.warning("Run attempted without any input")
+                st.warning("Add at least one file or named paste, then run.")
+                can_proceed = False
+            elif not user_content.strip():
+                logger.warning("Run attempted but all transient items are empty")
+                st.warning("Add content: ensure at least one file or paste has extractable text.")
+                can_proceed = False
+
+            if can_proceed:
+                try:
+                    _rs = st.session_state.get("rag_state")
+                    if _rs is None and folder_id:
+                        _rs = get_cached_rag_state(folder_id, _progress_callback=None)
+                        st.session_state["rag_state"] = _rs
+                    if _rs is None:
+                        if is_admin:
+                            st.error("RAG knowledge base not loaded. Use **Refresh Knowledge Base** and try again.")
+                        else:
+                            st.error("RAG knowledge base not loaded. Ask an administrator to refresh it, then try again.")
+                        st.stop()
+                    logger.info(f"Starting run: folder_id={folder_id}, content_len={len(user_content)}")
+                    status_container = st.status("🔍 Planning retrieval…", expanded=True)
+                    with status_container:
+                        uc_tok = chars_to_tokens(len(user_content))
+                        max_ctx = model_max_context(DEFAULT_MODEL)
+                        status_container.write(f"📊 **User input**: {uc_tok:,} tokens — {format_bible_equivalent(uc_tok)}")
+                        status_container.write(f"📐 **Model**: {DEFAULT_MODEL} (max {max_ctx:,} tokens)")
+                        status_container.write("📋 Deciding which libraries to search and how much to retrieve…")
+                        sel_ids, top_k_map = plan_retrieval(
+                            _rs, selected.name, selected.template_text, user_content
+                        )
+                        id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
+                        if sel_ids:
+                            lines = [f"• **{id_to_name.get(lid, '?')}** (top_k={top_k_map.get(lid, '—')})" for lid in sel_ids]
+                            status_container.write("✅ Using " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) + ".")
+                            for line in lines:
+                                status_container.write(line)
+                        else:
+                            status_container.write("✅ No libraries selected.")
+                        status_container.update(label="✅ Retrieval planned", state="complete")
+                    query = f"{selected.name}\n\n{user_content[:4000]}"
+                    status_container = st.status("🧠 Building context…", expanded=True)
+                    with status_container:
+                        status_container.write("📚 Assembling knowledge base + user content…")
+                        transient_len = len(user_content)
+                        transient_tokens = chars_to_tokens(transient_len)
+                        prompt_wrapper = len(selected.template_text) + 80  # "---\\nSubject...\\n" etc.
+                        prompt_tokens = chars_to_tokens(prompt_wrapper)
+                        
+                        context_xml, retrieval_report = retrieve_and_build_context(_rs, query, sel_ids, top_k_map)
+                        total_len = len(context_xml)
+                        kb_tokens = chars_to_tokens(total_len)
+                        max_ctx = model_max_context(DEFAULT_MODEL)
+                        total_input_tokens = kb_tokens + prompt_tokens + transient_tokens
+                        pct_used = (total_input_tokens / max_ctx * 100) if max_ctx else 0
+                        kb_ratio = (kb_tokens / total_input_tokens * 100) if total_input_tokens else 0
+                        user_ratio = (transient_tokens / total_input_tokens * 100) if total_input_tokens else 0
+                        prompt_ratio = (prompt_tokens / total_input_tokens * 100) if total_input_tokens else 0
+                        
+                        status_container.write(f"📊 **Context (cached KB)**: {kb_tokens:,} tokens (~{total_len:,} chars)")
+                        status_container.write(f"📝 **User data**: {transient_tokens:,} tokens · **Prompt wrapper**: {prompt_tokens:,} tokens")
+                        status_container.write(f"⚙️ **Breakdown**: {kb_ratio:.1f}% KB | {user_ratio:.1f}% user | {prompt_ratio:.1f}% prompt")
+                        status_container.write(f"📐 **Total input**: {total_input_tokens:,} tokens — {format_context_usage(total_input_tokens, max_ctx, DEFAULT_MODEL)}")
+                        status_container.write(f"📖 **Real-world**: {format_bible_equivalent(total_input_tokens)}")
+                        logger.info(f"RAG context built: {total_len:,} chars, {total_input_tokens:,} est. input tokens")
+                        if retrieval_report:
+                            for rec in retrieval_report:
+                                lib_name = rec.get("library_name", "?")
+                                n = rec.get("chunks_retrieved", 0)
+                                k = rec.get("top_k", 0)
+                                srcs = rec.get("sources", [])
+                                if n == 0:
+                                    status_container.write(f"• **{lib_name}**: 0 chunks (top_k={k})")
+                                else:
+                                    file_summary = ", ".join(f"{s['file_name']} ({s['chunk_count']})" for s in srcs[:5])
+                                    if len(srcs) > 5:
+                                        file_summary += f" +{len(srcs) - 5} more"
+                                    status_container.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
+                        status_container.write(f"✅ **Context ready**: {total_input_tokens:,} tokens ({format_bible_equivalent(total_input_tokens)})")
+                        status_container.update(label="✅ Context built", state="complete")
+                    min_size = 16000
+                    if len(context_xml) < min_size:
+                        st.error("Context is too small for the AI cache. Add more core documents or use additional libraries, then try again.")
+                        st.stop()
+                    cache_folder = st.session_state.get("gemini_cache_folder_id")
+                    cache_name = None  # RAG context is query-dependent; always create new cache per run
+                    
+                    if cache_name is None or cache_folder != folder_id:
+                        logger.info("Creating new Gemini cache")
+                        _ctx_tok = chars_to_tokens(len(context_xml))
+                        _max_ctx = model_max_context(DEFAULT_MODEL)
+                        status_container = st.status("⚡ Creating AI context cache…", expanded=True)
+                        cache_created = False
+                        try:
+                            with status_container:
+                                st.write(f"📐 Caching {_ctx_tok:,} tokens ({format_context_usage(_ctx_tok, _max_ctx, DEFAULT_MODEL)})…")
+                                
+                                def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
+                                    """Update UI during retries"""
+                                    status_container.write(f"Attempt {attempt}/{max_attempts} failed. Retrying in {delay:.0f}s…")
+                                    status_container.update(label="Creating cache… (retry)", state="running")
+                                
+                                cache_name = brain.create_gemini_cache(context_xml, progress_callback=retry_progress)
+                                status_container.update(label="✅ Cache ready", state="complete")
+                                cache_created = True
+                        except Exception as cache_error:
+                            status_container.update(label="Cache creation failed", state="error")
+                            logger.error(f"Failed to create cache: {cache_error}", exc_info=True)
+                            error_str = str(cache_error).lower()
+                            error_msg = str(cache_error)
+                            
+                            if "too small" in error_str or "min_total_token_count" in error_str:
+                                st.error(f"**Knowledge base too small for Gemini caching**\n\nError: {cache_error}")
+                                st.info("The knowledge base needs to contain at least ~16KB of text (4096 tokens).")
+                                st.stop()
+                            elif "too large" in error_str or "max_total_token_count" in error_str:
+                                st.error("**Cache Content Too Large**")
+                                st.warning(
+                                    "Your knowledge base is too large to cache. Gemini caching has size limits "
+                                    "that your current content exceeds."
+                                )
+                                st.info("**Solutions:**")
+                                st.markdown("""
+                                1. **Reduce knowledge base size** - Filter or summarize documents in your Drive folder
+                                2. **Split into multiple caches** - Not currently supported, but could be implemented
+                                3. **Check API key permissions** - Ensure your API key has caching enabled in Google Cloud Console
+                                """)
+                                st.error(f"**Technical details:** {error_msg}")
+                                st.stop()
+                            elif "503" in error_str or "unavailable" in error_str or "server" in error_str or "failed to create cache after" in error_str:
+                                st.error("**Gemini API Temporarily Unavailable**")
+                                st.warning(
+                                    f"The Gemini API returned 503 (Service Unavailable) errors on all retry attempts. "
+                                    f"This indicates the API is experiencing temporary issues."
+                                )
+                                st.markdown("""
+                                **What to do:**
+                                1. **Wait a few minutes** - API issues are usually temporary
+                                2. **Check Google Cloud Status**: https://status.cloud.google.com/
+                                3. **Try again** - Click 'Run' again in a few moments
+                                4. **Check your API quota** - Ensure you haven't exceeded rate limits
+                                """)
+                                st.error(f"**Technical details:** {error_msg}")
+                                st.stop()
+                            else:
+                                st.error(f"**Failed to create cache**\n\nError: {cache_error}")
+                                st.stop()
+                        
+                        # Only update session state if cache was successfully created
+                        if cache_created:
+                            st.session_state["gemini_cache_name"] = cache_name
+                            st.session_state["gemini_cache_folder_id"] = folder_id
+                            logger.info(f"Cache created: {cache_name}")
+                    else:
+                        logger.debug(f"Reusing existing cache: {cache_name}")
+                    full_template = template_text + "\n\n---\n\nSubject of analysis (transient input):\n{{ content }}"
+                    logger.debug(f"Rendered template length: {len(full_template)} chars")
+                    
+                    max_retries = 1
+                    for retry_attempt in range(max_retries + 1):
+                        run_label = "🚀 Model thinking…" if retry_attempt == 0 else "Cache expired, recreating and retrying…"
+                        with st.status(run_label, expanded=True) as run_status:
+                            run_status.write(f"📐 **Input**: {total_input_tokens:,} tokens ({format_context_usage(total_input_tokens, max_ctx, DEFAULT_MODEL)})")
+                            run_status.write(f"📖 {format_bible_equivalent(total_input_tokens)}")
+                            run_status.write("⏳ Calling model…")
+                            logger.info(f"Calling brain.run_agent() (attempt {retry_attempt + 1}/{max_retries + 1})")
+                            try:
+                                result = brain.run_agent(
+                                    full_template,
+                                    {"content": user_content},
+                                    cache_name,
+                                    expect_json=False,
+                                )
+                                out_tok = chars_to_tokens(len(str(result)))
+                                run_status.write(f"✅ **Output**: {out_tok:,} tokens (~{format_bible_equivalent(out_tok)})")
+                                run_status.update(label="✅ Analysis complete", state="complete")
+                                break
+                            except CacheExpiredError as cache_expired:
+                                logger.warning(f"Cache expired (attempt {retry_attempt + 1}/{max_retries + 1}): {cache_expired}")
+                                if retry_attempt < max_retries:
+                                    # Clear invalid cache and recreate
+                                    st.info("Cache expired. Recreating…")
+                                    logger.info("Clearing invalid cache from session state")
+                                    st.session_state["gemini_cache_name"] = None
+                                    st.session_state["gemini_cache_folder_id"] = None
+                                    
+                                    # Recreate cache
+                                    logger.info("Recreating Gemini cache after expiration")
+                                    try:
+                                        status_container = st.status("Recreating cache…", expanded=True)
+                                        with status_container:
+                                            st.write("Cache expired. Creating new cache…")
+                                            
+                                            def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
+                                                """Update UI during retries"""
+                                                status_container.write(f"Attempt {attempt}/{max_attempts} failed. Retrying in {delay:.0f}s…")
+                                                status_container.update(label="Creating cache… (retry)", state="running")
+                                            
+                                            cache_name = brain.create_gemini_cache(context_xml, progress_callback=retry_progress)
+                                            status_container.update(label="✅ Cache ready", state="complete")
+                                            
+                                            # Update session state with new cache
+                                            st.session_state["gemini_cache_name"] = cache_name
+                                            st.session_state["gemini_cache_folder_id"] = folder_id
+                                            logger.info(f"Cache recreated: {cache_name}")
+                                    except Exception as recreate_error:
+                                        logger.error(f"Failed to recreate cache: {recreate_error}", exc_info=True)
+                                        st.error(f"**Failed to recreate cache after expiration**\n\n{recreate_error}")
+                                        st.stop()
+                                        raise
+                                else:
+                                    # Max retries reached
+                                    logger.error(f"Cache expired and failed to recreate after {max_retries + 1} attempts")
+                                    st.error("**Cache Expired**")
+                                    st.warning("The cache expired and could not be recreated. Please try again.")
+                                    st.error(f"**Technical details:**\n\n{cache_expired}")
+                                    st.stop()
+                                    raise
+                    
+                    logger.info(f"Agent completed: result type={type(result).__name__}")
+                    output_tokens = chars_to_tokens(len(str(result)))
+                    st.session_state["last_result"] = result
+                    st.session_state["last_mode"] = "markdown"
+                    st.session_state["last_task_name"] = selected.name
+                    st.session_state["last_rag_retrieval_report"] = retrieval_report
+                    st.session_state["last_run_context_stats"] = {
+                        "total_input_tokens": total_input_tokens,
+                        "kb_tokens": kb_tokens,
+                        "transient_tokens": transient_tokens,
+                        "prompt_tokens": prompt_tokens,
+                        "max_context": max_ctx,
+                        "output_tokens": output_tokens,
+                        "model": DEFAULT_MODEL,
+                    }
+                    
+                    # Chained follow-on prompts: run sequentially, concatenating outputs.
+                    # Re-evaluate context (plan + retrieve + cache) before each follow-on.
+                    _sep = "\n\n---\n\n"
+                    accumulated: str = str(result)
+                    chain: list[tuple[str, str]] = [(selected.name, accumulated)]
+                    current = selected
+                    seen: set[int] = {selected.id}
+                    st.session_state["last_chain_error"] = None
+                    last_retrieval_report = retrieval_report
+                    last_kb_tokens = kb_tokens
+                    last_transient_tokens = transient_tokens
+                    last_prompt_tokens = prompt_tokens
+                    last_total_input = total_input_tokens
+                    while current.verifier_id:
+                        fid = current.verifier_id
+                        if fid in seen:
+                            logger.warning(f"Follow-on cycle detected (prompt id={fid}), stopping chain")
+                            break
+                        next_p = db.get_prompt_by_id(fid)
+                        if not next_p:
+                            logger.warning(f"Follow-on prompt id {fid} not found, stopping chain")
+                            break
+                        seen.add(next_p.id)
+                        followon_template = next_p.template_text + "\n\n---\n\nOutput from previous step(s):\n{{ previous_output }}"
+                        step_label = f"Follow-on: {next_p.name}"
+                        try:
+                            with st.status(f"🔍 Re-planning retrieval for {next_p.name}…", expanded=True) as replan_status:
+                                replan_status.write("Deciding libraries and top_k from previous output…")
+                                sel_ids, top_k_map = plan_retrieval(
+                                    _rs, next_p.name, next_p.template_text, accumulated
+                                )
+                                id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
+                                if sel_ids:
+                                    replan_status.write("✅ " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]))
+                                replan_status.update(label="✅ Re-planned", state="complete")
+                            step_query = f"{next_p.name}\n\n{accumulated[:4000]}"
+                            with st.status(f"🧠 Re-building context for {next_p.name}…", expanded=True) as rebuild_status:
+                                rebuild_status.write("Retrieving from selected libraries…")
+                                step_context_xml, step_report = retrieve_and_build_context(
+                                    _rs, step_query, sel_ids, top_k_map
+                                )
+                                last_retrieval_report = step_report
+                                step_kb = chars_to_tokens(len(step_context_xml))
+                                step_transient = chars_to_tokens(len(accumulated))
+                                step_prompt = chars_to_tokens(len(next_p.template_text) + 80)
+                                last_kb_tokens = step_kb
+                                last_transient_tokens = step_transient
+                                last_prompt_tokens = step_prompt
+                                last_total_input = step_kb + step_transient + step_prompt
+                                rebuild_status.write(f"✅ Context: {last_total_input:,} tokens")
+                                rebuild_status.update(label="✅ Context ready", state="complete")
+                            if len(step_context_xml) < min_size:
+                                st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: context too small for cache"
+                                break
+                            with st.status(f"⚡ Creating cache for {next_p.name}…", expanded=True) as cache_status:
+                                cache_status.write("Caching new context…")
+                                step_cache_name = brain.create_gemini_cache(step_context_xml)
+                                cache_status.update(label="✅ Cache ready", state="complete")
+                            with st.spinner(step_label + "…"):
+                                retry = 0
+                                while True:
+                                    try:
+                                        out = brain.run_agent(
+                                            followon_template,
+                                            {"previous_output": accumulated},
+                                            step_cache_name,
+                                            expect_json=False,
+                                        )
+                                        break
+                                    except CacheExpiredError as ce:
+                                        logger.warning(f"Cache expired during {next_p.name} (attempt {retry + 1}): {ce}")
+                                        if retry < 1:
+                                            st.info("Cache expired. Recreating…")
+                                            step_cache_name = brain.create_gemini_cache(step_context_xml)
+                                            retry += 1
+                                        else:
+                                            raise
+                                accumulated = accumulated + _sep + str(out)
+                                chain.append((next_p.name, accumulated))
+                                logger.info(f"Follow-on {next_p.name} completed; accumulated length={len(accumulated)}")
+                                current = next_p
+                        except CacheExpiredError as ce:
+                            logger.error(f"Follow-on {next_p.name} failed: cache could not be recreated", exc_info=True)
+                            st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: cache expired"
+                            break
+                        except Exception as e:
+                            logger.error(f"Error running follow-on {next_p.name}: {e}", exc_info=True)
+                            st.warning(f"⚠️ Follow-on «{next_p.name}» failed: {e}")
+                            st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: {e}"
+                            break
+                    st.session_state["last_result"] = accumulated
+                    st.session_state["last_chain"] = chain
+                    st.session_state["last_rag_retrieval_report"] = last_retrieval_report
+                    stats = st.session_state["last_run_context_stats"]
+                    stats["kb_tokens"] = last_kb_tokens
+                    stats["transient_tokens"] = last_transient_tokens
+                    stats["prompt_tokens"] = last_prompt_tokens
+                    stats["total_input_tokens"] = last_total_input
+                    stats["output_tokens"] = chars_to_tokens(len(accumulated))
+                except RuntimeError as e:
+                    # Handle quota errors and other runtime errors with helpful messages
+                    error_msg = str(e)
+                    if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "Quota Exceeded" in error_msg:
+                        st.error("**⚠️ Quota Exceeded (429)**")
+                        st.warning("You've exceeded your per-minute token limit for the Gemini API.")
+                        st.markdown("""
+                        **What happened:**
+                        - Your request used too many tokens in a 1-minute window
+                        - Limit: 4,000,000 input tokens per minute for gemini-2.0-flash
+                        
+                        **Solutions:**
+                        1. **Wait 1-2 minutes** - Quotas reset every minute
+                        2. **Reduce context size** - Your knowledge base is very large
+                        3. **Request quota increase** - [Google Cloud Console Quotas](https://console.cloud.google.com/apis/api/generativelanguage.googleapis.com/quotas)
+                        4. **Monitor usage** - [Check your rate limits](https://ai.dev/rate-limit)
+                        """)
+                        st.error(f"**Technical details:**\n\n{error_msg}")
+                    else:
+                        st.error(f"**Error running agent:**\n\n{error_msg}")
+                    logger.error(f"Error during run: {e}", exc_info=True)
+                    st.stop()
+                except Exception as e:
+                    logger.error(f"Error during run: {e}", exc_info=True)
+                    st.error(f"**Error running agent:**\n\n{e}")
+                    st.stop()
+
+        # Success path continues to Output section below.
+
+        # -------------------------------------------------------------------------
+        # 4. Review & 5. Export / copy
+        # -------------------------------------------------------------------------
+
+        res = st.session_state.get("last_result")
+        res_task = st.session_state.get("last_task_name")
+        chain_list = st.session_state.get("last_chain")
+        chain_error = st.session_state.get("last_chain_error")
+        rag_report = st.session_state.get("last_rag_retrieval_report")
+
+        if res is not None and res_task == selected.name:
+            st.markdown("### Step 4: Review results")
+            logger.debug(f"Displaying output: type={type(res).__name__}")
+            md = res if isinstance(res, str) else str(res)
+            _markdown_with_copy(md, "result")
+
+            ctx_stats = st.session_state.get("last_run_context_stats")
+            if ctx_stats:
+                with st.expander("📐 Stats for nerds — context & tokens", expanded=False):
+                    tot = ctx_stats.get("total_input_tokens", 0)
+                    kb = ctx_stats.get("kb_tokens", 0)
+                    tr = ctx_stats.get("transient_tokens", 0)
+                    pr = ctx_stats.get("prompt_tokens", 0)
+                    mx = ctx_stats.get("max_context", 0)
+                    out = ctx_stats.get("output_tokens", 0)
+                    model = ctx_stats.get("model", "")
+                    pct = (tot / mx * 100) if mx else 0
+                    st.caption(f"Token estimates (~4 chars/token). Real-world: 1 Bible ≈ {TOKENS_PER_BIBLE:,} tokens.")
+                    st.markdown(f"**Model**: `{model}` · **Max context**: {mx:,} tokens")
+                    st.markdown(f"**Input**")
+                    st.markdown(f"- Knowledge base (cached): **{kb:,}** tokens")
+                    st.markdown(f"- User data (analyzed): **{tr:,}** tokens")
+                    st.markdown(f"- Prompt wrapper: **{pr:,}** tokens")
+                    st.markdown(f"- **Total input**: **{tot:,}** tokens → {format_context_usage(tot, mx, model)}")
+                    st.markdown(f"**Output**: **{out:,}** tokens")
+                    st.markdown(f"**Real-world**: Total input ≈ **{format_bible_equivalent(tot)}** · Output ≈ **{format_bible_equivalent(out)}**")
+
+            if rag_report:
+                with st.expander("📚 Sources used", expanded=False):
+                    st.caption("Knowledge-base libraries and files retrieved for this run.")
+                    for i, rec in enumerate(rag_report):
+                        if i > 0:
+                            st.divider()
+                        lib_name = rec.get("library_name", "?")
+                        n = rec.get("chunks_retrieved", 0)
+                        k = rec.get("top_k", 0)
+                        srcs = rec.get("sources", [])
+                        st.markdown(f"**{lib_name}** — {n} chunks (top_k={k})")
+                        if srcs:
+                            for s in srcs:
+                                fn = s.get("file_name", "?")
+                                link = s.get("link", "")
+                                cnt = s.get("chunk_count", 0)
+                                if link:
+                                    st.markdown(f"  - [{fn}]({link}) — {cnt} chunk(s)")
+                                else:
+                                    st.markdown(f"  - {fn} — {cnt} chunk(s)")
+                        else:
+                            st.caption("  _(no chunks retrieved)_")
+
+            if chain_list and len(chain_list) > 1:
+                with st.expander("📋 Pipeline steps", expanded=False):
+                    st.caption("Cumulative output after each step (each follow‑on appends to the previous).")
+                    for i, (name, step_out) in enumerate(chain_list):
+                        if i > 0:
+                            st.divider()
+                        st.markdown(f"**Step {i + 1}: {name}**")
+                        _markdown_with_copy(step_out, f"chain_{i}")
+            if chain_error:
+                st.markdown("---")
+                st.error(f"⚠️ {chain_error}")
+            elif selected.verifier_id and (not chain_list or len(chain_list) == 1):
+                st.markdown("---")
+                st.info("A follow‑on prompt is configured; run again to see chained results.")
+
+            st.markdown("### Step 5: Export")
+            st.caption("Use the **Copy Markdown** expander above each result to copy the text.")
+    else:
+        if not task_options:
+            if is_admin:
+                st.info("No analysis types yet. Open **Prompt Editor** in the sidebar to add prompts.")
+            else:
+                st.info("No analysis types available. An administrator can add them in the Prompt Editor.")
+        else:
+            st.info("Select an analysis type above to continue.")

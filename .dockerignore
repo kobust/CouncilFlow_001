@@ -1,0 +1,27 @@
+# Dependencies and local dev
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets and local state (never bake into image)
+.streamlit/secrets.toml
+secrets.toml
+*.json
+!package.json
+.env
+.env.*
+
+# App runtime data
+council.db
+.rag_cache/
+
+# Git and IDE
+.git/
+.gitignore
+.dockerignore
+.cursor/
