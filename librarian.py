@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import io
 import logging
+import os
 from typing import Any
 
 import streamlit as st
@@ -32,7 +33,8 @@ def _get_drive_service():
     """Build Drive API service using Service Account credentials from st.secrets."""
     try:
         logger.info("Building Drive API service from secrets")
-        raw = st.secrets["gcp_service_account"]
+        env_sa = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
+        raw = env_sa if env_sa else st.secrets["gcp_service_account"]
         if isinstance(raw, str):
             import json
             logger.debug("Parsing service account credentials from JSON string")

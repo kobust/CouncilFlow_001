@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -86,7 +87,9 @@ def _client() -> genai.Client:
     """Gemini client configured from st.secrets."""
     try:
         logger.debug("Creating Gemini client")
-        api_key = st.secrets["GEMINI_API_KEY"]
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            api_key = st.secrets["GEMINI_API_KEY"]
         if not api_key or not api_key.strip():
             logger.error("GEMINI_API_KEY is empty or missing")
             raise ValueError("GEMINI_API_KEY is required")
