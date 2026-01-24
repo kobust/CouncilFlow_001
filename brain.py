@@ -817,7 +817,7 @@ def run_agent(
     *,
     model: str | None = None,
     expect_json: bool = True,
-    max_retries: int = 3,
+    max_retries: int = 7,
     initial_delay: float = 1.0,
     context_xml: str | None = None,
 ) -> str | dict[str, Any]:
@@ -849,9 +849,13 @@ def run_agent(
     logger.debug(f"Using model: {m}")
     
     # Build content - either use cache or include context directly
+    no_afc = types.AutomaticFunctionCallingConfig(disable=True)
     if cache_name:
         # Use cached content (preferred - faster and cheaper)
-        config = types.GenerateContentConfig(cached_content=cache_name)
+        config = types.GenerateContentConfig(
+            cached_content=cache_name,
+            automatic_function_calling=no_afc,
+        )
         prompt_content = types.Content(
             role="user",
             parts=[_text_part(prompt)],
@@ -864,7 +868,7 @@ def run_agent(
         logger.warning("Running without cache - including full context in prompt (slower and more expensive)")
         # Combine context and prompt
         full_prompt = f"{context_xml}\n\n---\n\n{prompt}"
-        config = types.GenerateContentConfig()
+        config = types.GenerateContentConfig(automatic_function_calling=no_afc)
         prompt_content = types.Content(
             role="user",
             parts=[_text_part(full_prompt)],
@@ -939,31 +943,33 @@ def run_agent(
                     except Exception:
                         pass
                 
-                # Use API-suggested delay or fallback to exponential backoff
+                # Use API-suggested delay or fallback; enforce minimum for per-minute quotas
+                QUOTA_MIN_DELAY = 15.0
+                QUOTA_MAX_DELAY = 60.0
                 if retry_delay is None:
-                    retry_delay = delay
+                    retry_delay = max(delay, QUOTA_MIN_DELAY)
                 else:
-                    # Add a small buffer to the API-suggested delay
-                    retry_delay = max(retry_delay + 1.0, delay)
-                
+                    retry_delay = max(retry_delay + 5.0, delay, QUOTA_MIN_DELAY)
+                retry_delay = min(retry_delay, QUOTA_MAX_DELAY)
+
                 if attempt < max_retries:
                     logger.warning(
                         f"Quota exceeded (429) on attempt {attempt + 1}/{max_retries + 1}. "
-                        f"Retrying in {retry_delay:.1f} seconds (API suggested delay)..."
+                        f"Retrying in {retry_delay:.1f}s (min {QUOTA_MIN_DELAY:.0f}s for per‑minute limits)..."
                     )
                     time.sleep(retry_delay)
-                    delay = retry_delay * 1.5  # Increase delay for next attempt if needed
+                    delay = min(retry_delay * 1.5, QUOTA_MAX_DELAY)
                 else:
                     logger.error(f"Quota exceeded after {max_retries + 1} attempts. Last error: {e}")
-                    # Provide helpful error message
+                    ctx_str = f"{len(context_xml):,} chars" if context_xml else "unknown"
                     quota_msg = (
                         f"**Quota Exceeded (429 RESOURCE_EXHAUSTED)**\n\n"
-                        f"You've exceeded your per-minute token limit for gemini-2.0-flash.\n\n"
+                        f"You've exceeded your per-minute token limit for **{m}**.\n\n"
                         f"**Solutions:**\n"
-                        f"1. **Wait a few minutes** - Quotas reset per minute\n"
-                        f"2. **Reduce context size** - Your knowledge base is very large ({len(context_xml) if context_xml else 'unknown'} chars)\n"
-                        f"3. **Use caching** - Enable cache mode (disable fallback mode) to reduce token usage\n"
-                        f"4. **Request quota increase** - Go to Google Cloud Console → APIs & Services → Quotas\n"
+                        f"1. **Wait 1–2 minutes** – Quotas reset per minute; then try again.\n"
+                        f"2. **Reduce context size** – Your knowledge base is very large ({ctx_str}).\n"
+                        f"3. **Use caching** – You're already using cache; ensure fallback mode is off.\n"
+                        f"4. **Request quota increase** – Google Cloud Console → APIs & Services → Quotas.\n"
                         f"5. **Check usage**: https://ai.dev/rate-limit\n\n"
                         f"**Technical details:** {e}"
                     )
