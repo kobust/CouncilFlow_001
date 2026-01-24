@@ -22,6 +22,7 @@ def _cache_dir() -> Path:
     global _CACHE_DIR
     if _CACHE_DIR is None:
         _CACHE_DIR = data_path(".rag_cache")
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return _CACHE_DIR
 
 
