@@ -61,7 +61,7 @@ import db
 from librarian import get_cached_file_list, get_cached_folder_info
 from rag_cache import clear_disk_cache_for_folder
 from rag_loader import get_cached_rag_state, plan_retrieval, retrieve_and_build_context
-from paths import data_path
+from paths import data_path, repo_path
 
 # Configure logging
 logging.basicConfig(
@@ -99,7 +99,7 @@ st.set_page_config(
 
 try:
     logger.debug("Loading config.yaml")
-    config_path = data_path("config.yaml")
+    config_path = repo_path("config.yaml")
     with open(config_path, encoding="utf-8") as f:
         config = yaml.load(f, Loader=SafeLoader)
     logger.debug("Config loaded successfully")
