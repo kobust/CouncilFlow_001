@@ -40,13 +40,13 @@ def _get_engine():
 
 class PromptTemplate(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
-    
+
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     template_text: str
     output_mode: str  # 'markdown' (legacy: 'table' | 'text')
     verifier_id: Optional[int] = None
-    follow_on_only: bool = False  # if True, exclude from Run Analysis dropdown (follow-on only)
+    follow_on_only: bool = Field(default=False, nullable=False)  # follow-on only
 
 
 # -----------------------------------------------------------------------------
@@ -155,6 +155,7 @@ def save_prompt(
     id: Optional[int] = None,
 ) -> PromptTemplate:
     """Insert or update a prompt template. If id is given, update; else insert."""
+    follow_on_only = bool(follow_on_only)
     logger.info(f"Saving prompt: {name} (id: {id}, mode: {output_mode}, follow_on_only: {follow_on_only})")
     try:
         engine = _get_engine()
