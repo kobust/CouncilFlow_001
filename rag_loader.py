@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 35
 TOP_K_MIN, TOP_K_MAX = 1, 100
-RERANK_ENABLED = True  # Set False to skip LLM re-ranking if it hangs (e.g. AFC/timeouts)
+RERANK_ENABLED = False  # Disabled: slow. We retrieve more chunks instead (RETRIEVE_FACTOR).
 RERANK_FACTOR = 2
+RETRIEVE_FACTOR = 2  # When rerank off: retrieve/take this many more chunks (we have context headroom).
 
 
 def _embed_fn(texts: list[str]):
@@ -245,7 +246,7 @@ def retrieve_and_build_context(
         name = lib["name"]
         idx = lib["index"]
         k = top_k_per_library.get(lib["id"], DEFAULT_TOP_K) if use_map else top_k_per_library
-        retrieve_k = (k * RERANK_FACTOR) if RERANK_ENABLED else k
+        retrieve_k = (k * RERANK_FACTOR) if RERANK_ENABLED else (k * RETRIEVE_FACTOR)
         chunks = retrieve_hybrid(query, idx, retrieve_k, _embed_query_fn)
         chunks = dedupe_chunks(chunks, similarity_threshold=0.95, use_embedding=True)
         if RERANK_ENABLED and len(chunks) > k:
@@ -298,6 +299,8 @@ def retrieve_and_build_context_multi(
         retrieve_k = max(k * 2, k * len(queries))
         if RERANK_ENABLED:
             retrieve_k = max(retrieve_k, k * RERANK_FACTOR)
+        else:
+            retrieve_k = max(retrieve_k, k * RETRIEVE_FACTOR)
         rrf_scores: dict[tuple[Any, ...], float] = {}
         chunk_ref: dict[tuple[Any, ...], dict[str, Any]] = {}
 
@@ -308,7 +311,7 @@ def retrieve_and_build_context_multi(
                 rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (_RRF_K + rank)
                 chunk_ref[key] = c
 
-        take = (k * RERANK_FACTOR) if RERANK_ENABLED else k
+        take = (k * RERANK_FACTOR) if RERANK_ENABLED else (k * RETRIEVE_FACTOR)
         ordered = sorted(chunk_ref.keys(), key=lambda x: -rrf_scores[x])[:take]
         chunks = [chunk_ref[key] for key in ordered]
         chunks = dedupe_chunks(chunks, similarity_threshold=0.95, use_embedding=True)
