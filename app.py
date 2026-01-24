@@ -52,10 +52,9 @@ import brain
 from brain import (
     CacheExpiredError,
     DEFAULT_MODEL,
-    TOKENS_PER_BIBLE,
     chars_to_tokens,
-    format_bible_equivalent,
     format_context_usage,
+    format_reading_equivalent,
     model_max_context,
 )
 import db
@@ -591,7 +590,7 @@ def _wrap_transient_content(items: list[dict]) -> str:
 # Banner (full-width across entire screen; component iframe injects into parent)
 # -----------------------------------------------------------------------------
 
-_BANNER_H = 56
+_BANNER_H = 48
 _BANNER_HTML = f"""
 <!DOCTYPE html>
 <html>
@@ -607,13 +606,23 @@ _BANNER_HTML = f"""
   }}
   var style = doc.createElement("style");
   style.textContent = "[data-testid=\\"stAppViewContainer\\"] {{ padding-top: {_BANNER_H}px !important; }} " +
-    "main .block-container {{ padding-top: 0 !important; }}";
+    "main .block-container {{ padding-top: 0 !important; }}" +
+    "@media (max-width: 768px) {{ " +
+    "[data-testid=\\"stAppViewContainer\\"] .block-container h2 {{ font-size: 1.4rem !important; }} " +
+    "}} " +
+    "@media (min-width: 769px) {{ #app-menu-btn {{ display: none !important; }} }}";
   doc.head.appendChild(style);
   var bar = doc.createElement("div");
   bar.id = "app-banner";
-  bar.style.cssText = "position:fixed;top:0;left:0;right:0;width:100%;height:{_BANNER_H}px;background:#1e3a5f;color:#fff;display:flex;align-items:center;padding:0 1.5rem;box-shadow:0 1px 4px rgba(0,0,0,0.15);font-family:inherit;z-index:999999;";
-  bar.innerHTML = '<span style="font-size:1.2rem;font-weight:600;">🏛️ {APP_NAME}</span><span style="font-size:0.9rem;opacity:0.95;margin-left:0.75rem;">AI-assisted analysis for municipal council workflows</span>';
+  bar.style.cssText = "position:fixed;top:0;left:0;right:0;width:100%;height:{_BANNER_H}px;background:#1e3a5f;color:#fff;display:flex;align-items:center;padding:0 1rem;gap:0.75rem;box-shadow:0 1px 4px rgba(0,0,0,0.15);font-family:inherit;z-index:1000002;";
+  bar.innerHTML = '<button id="app-menu-btn" aria-label="Menu" style="width:32px;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,0.35);background:transparent;color:#fff;font-size:18px;line-height:1;cursor:pointer;">☰</button>' +
+    '<span style="font-size:1rem;font-weight:600;white-space:nowrap;">🏛️ {APP_NAME}</span>' +
+    '<span class="app-banner-subtitle" style="font-size:0.85rem;opacity:0.9;margin-left:0.5rem;">AI-assisted analysis for municipal council workflows</span>';
   doc.body.insertBefore(bar, doc.body.firstChild);
+  var subtitle = bar.querySelector(".app-banner-subtitle");
+  var bannerStyle = doc.createElement("style");
+  bannerStyle.textContent = "@media (max-width: 768px) {{ .app-banner-subtitle {{ display: none; }} }}";
+  doc.head.appendChild(bannerStyle);
   var f = window.frameElement;
   if (f) {{
     f.style.setProperty("display", "none", "important");
@@ -627,6 +636,84 @@ _BANNER_HTML = f"""
 </html>
 """
 components.html(_BANNER_HTML, height=0)
+
+_SIDEBAR_HTML = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+(function() {{
+  var doc = parent.document;
+  var styleId = "mobile-sidebar-style";
+  if (!doc.getElementById(styleId)) {{
+    var style = doc.createElement("style");
+    style.id = styleId;
+    style.textContent = `
+@media (max-width: 768px) {{
+  [data-testid="stSidebar"] {{
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100vh;
+    width: 80vw;
+    max-width: 320px;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    z-index: 1000001;
+    background: var(--background-color, #ffffff);
+  }}
+  body[data-sidebar-open="true"] [data-testid="stSidebar"] {{
+    transform: translateX(0);
+    box-shadow: 2px 0 12px rgba(0,0,0,0.25);
+  }}
+  .mobile-sidebar-backdrop {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.35);
+    z-index: 1000000;
+  }}
+  body[data-sidebar-open="true"] .mobile-sidebar-backdrop {{
+    display: block;
+  }}
+}}
+`;
+    doc.head.appendChild(style);
+  }}
+
+  if (!doc.body.hasAttribute("data-sidebar-open")) {{
+    doc.body.setAttribute("data-sidebar-open", "false");
+  }}
+
+  var backdrop = doc.getElementById("mobile-sidebar-backdrop");
+  if (!backdrop) {{
+    backdrop = doc.createElement("div");
+    backdrop.id = "mobile-sidebar-backdrop";
+    backdrop.className = "mobile-sidebar-backdrop";
+    doc.body.appendChild(backdrop);
+  }}
+  backdrop.onclick = function() {{ doc.body.setAttribute("data-sidebar-open", "false"); }};
+
+  var menuBtn = doc.getElementById("app-menu-btn");
+  if (menuBtn) {{
+    menuBtn.onclick = function() {{
+      var isOpen = doc.body.getAttribute("data-sidebar-open") === "true";
+      doc.body.setAttribute("data-sidebar-open", isOpen ? "false" : "true");
+    }};
+  }}
+
+  var f = window.frameElement;
+  if (f) {{
+    f.style.setProperty("display", "none", "important");
+    f.style.setProperty("height", "0", "important");
+  }}
+}})();
+</script>
+</body>
+</html>
+"""
+components.html(_SIDEBAR_HTML, height=0)
 
 # -----------------------------------------------------------------------------
 # Sidebar
@@ -844,7 +931,7 @@ if current_page == "runner":
         prompts = []
         task_options = []
 
-    st.markdown("## ▶️ Run Analysis")
+    st.markdown("### ▶️ Run Analysis")
     st.caption("Select a task, add documents or paste text, then run. Results use the council knowledge base.")
 
     # New Analysis: reset runner state
@@ -910,11 +997,11 @@ if current_page == "runner":
         st.session_state["transient_deleted_file_names"] = list(deleted_names)
 
         # Add named paste
-        with st.expander("➕ Add named paste", expanded=False):
+        with st.expander("➕ Paste text for analysis", expanded=False):
             with st.form("add_paste_form", clear_on_submit=True):
-                paste_name = st.text_input("Name", placeholder="e.g. Priorities, notes")
+                paste_name = st.text_input("Desciption/Title", placeholder="e.g. Priorities, notes")
                 paste_content = st.text_area("Content", height=120, placeholder="Paste text here…")
-                if st.form_submit_button("Add paste"):
+                if st.form_submit_button("Save"):
                     if paste_name and paste_content:
                         transient_items = st.session_state.get("transient_items", [])
                         transient_items.append({
@@ -988,7 +1075,7 @@ if current_page == "runner":
                     with status_container:
                         uc_tok = chars_to_tokens(len(user_content))
                         max_ctx = model_max_context(DEFAULT_MODEL)
-                        status_container.write(f"📊 **User input**: {uc_tok:,} tokens — {format_bible_equivalent(uc_tok)}")
+                        status_container.write(f"📊 **User input**: {uc_tok:,} tokens — {format_reading_equivalent(uc_tok)}")
                         status_container.write(f"📐 **Model**: {DEFAULT_MODEL} (max {max_ctx:,} tokens)")
                         status_container.write("📋 Deciding which libraries to search and how much to retrieve…")
                         _t0 = time.perf_counter()
@@ -1030,7 +1117,7 @@ if current_page == "runner":
                         status_container.write(f"📝 **User data**: {transient_tokens:,} tokens · **Prompt wrapper**: {prompt_tokens:,} tokens")
                         status_container.write(f"⚙️ **Breakdown**: {kb_ratio:.1f}% KB | {user_ratio:.1f}% user | {prompt_ratio:.1f}% prompt")
                         status_container.write(f"📐 **Total input**: {total_input_tokens:,} tokens — {format_context_usage(total_input_tokens, max_ctx, DEFAULT_MODEL)}")
-                        status_container.write(f"📖 **Real-world**: {format_bible_equivalent(total_input_tokens)}")
+                        status_container.write(f"📖 **Real-world**: {format_reading_equivalent(total_input_tokens)}")
                         logger.info(f"RAG context built: {total_len:,} chars, {total_input_tokens:,} est. input tokens")
                         if retrieval_report:
                             for rec in retrieval_report:
@@ -1046,7 +1133,7 @@ if current_page == "runner":
                                         file_summary += f" +{len(srcs) - 5} more"
                                     status_container.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
                         status_container.write(f"⏱️ Context build time: {timings['build_context_s']:.2f}s")
-                        status_container.write(f"✅ **Context ready**: {total_input_tokens:,} tokens ({format_bible_equivalent(total_input_tokens)})")
+                        status_container.write(f"✅ **Context ready**: {total_input_tokens:,} tokens ({format_reading_equivalent(total_input_tokens)})")
                         status_container.update(label="✅ Context built", state="complete")
                     min_size = 16000
                     if len(context_xml) < min_size:
@@ -1134,7 +1221,7 @@ if current_page == "runner":
                         run_label = "🚀 Model thinking…" if retry_attempt == 0 else "Cache expired, recreating and retrying…"
                         with st.status(run_label, expanded=True) as run_status:
                             run_status.write(f"📐 **Input**: {total_input_tokens:,} tokens ({format_context_usage(total_input_tokens, max_ctx, DEFAULT_MODEL)})")
-                            run_status.write(f"📖 {format_bible_equivalent(total_input_tokens)}")
+                            run_status.write(f"📖 {format_reading_equivalent(total_input_tokens)}")
                             run_status.write("⏳ Calling model…")
                             logger.info(f"Calling brain.run_agent() (attempt {retry_attempt + 1}/{max_retries + 1})")
                             _t0 = time.perf_counter()
@@ -1387,7 +1474,7 @@ if current_page == "runner":
                     model = ctx_stats.get("model", "")
                     timings = ctx_stats.get("timings", {})
                     pct = (tot / mx * 100) if mx else 0
-                    st.caption(f"Token estimates (~4 chars/token). Real-world: 1 Bible ≈ {TOKENS_PER_BIBLE:,} tokens.")
+                    st.caption("Token estimates (~4 chars/token). Real-world equivalents use Harry Potter, pages, and reading hours.")
                     st.markdown(f"**Model**: `{model}` · **Max context**: {mx:,} tokens")
                     st.markdown(f"**Input**")
                     st.markdown(f"- Knowledge base (cached): **{kb:,}** tokens")
@@ -1395,7 +1482,7 @@ if current_page == "runner":
                     st.markdown(f"- Prompt wrapper: **{pr:,}** tokens")
                     st.markdown(f"- **Total input**: **{tot:,}** tokens → {format_context_usage(tot, mx, model)}")
                     st.markdown(f"**Output**: **{out:,}** tokens")
-                    st.markdown(f"**Real-world**: Total input ≈ **{format_bible_equivalent(tot)}** · Output ≈ **{format_bible_equivalent(out)}**")
+                    st.markdown(f"**Real-world**: Total input ≈ **{format_reading_equivalent(tot)}** · Output ≈ **{format_reading_equivalent(out)}**")
                     if timings:
                         st.markdown("**Timings**")
                         st.markdown(f"- Retrieval planning: **{timings.get('plan_retrieval_s', 0):.2f}s**")

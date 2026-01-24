@@ -34,7 +34,11 @@ CACHE_TTL_SECONDS = 3600  # 60 minutes
 
 # Token and context stats (for UI)
 CHARS_PER_TOKEN = 4  # rough: ~4 chars per token for English
-TOKENS_PER_BIBLE = 800_000  # typical Bible ~800k tokens
+CHARS_PER_WORD = 5  # rough average including spaces/punctuation
+WORDS_PER_PAGE = 300  # average book page density
+WORDS_PER_MINUTE = 225  # average silent reading speed
+HP_SERIES_PAGES = 4100  # all 7 Harry Potter books, rough combined total
+HP_BOOK_PAGES = HP_SERIES_PAGES / 7  # average per book
 MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "gemini-2.0-flash": 1_048_576,
     "gemini-2.0-flash-001": 1_048_576,
@@ -61,17 +65,20 @@ def model_max_context(model: str | None) -> int:
     return DEFAULT_MAX_CONTEXT
 
 
-def format_bible_equivalent(tokens: int) -> str:
-    """e.g. '0.12 Bibles' or '~12% of a Bible'."""
+def format_reading_equivalent(tokens: int) -> str:
+    """Return a combined reading equivalent string for UI."""
     if tokens <= 0:
-        return "0 Bibles"
-    ratio = tokens / TOKENS_PER_BIBLE
-    if ratio >= 1:
-        return f"~{ratio:.1f} Bibles"
-    pct = ratio * 100
-    if pct >= 1:
-        return f"~{pct:.0f}% of a Bible"
-    return f"~{pct:.1f}% of a Bible"
+        return "0× Harry Potter book · 0 pages · 0 hours reading"
+    # Convert tokens -> words -> pages/hours
+    words = tokens * (CHARS_PER_TOKEN / CHARS_PER_WORD)
+    pages = words / WORDS_PER_PAGE
+    hours = words / (WORDS_PER_MINUTE * 60)
+    books = pages / HP_BOOK_PAGES if HP_BOOK_PAGES else 0
+    if books >= 1:
+        series_str = f"~{books:.1f}× Harry Potter Books"
+    else:
+        series_str = f"~{books:.2f}× Harry Potter Books"
+    return f"{series_str} · ~{pages:,.0f} pages · ~{hours:,.1f} hours reading"
 
 
 def format_context_usage(tokens: int, max_tokens: int, model: str | None = None) -> str:
