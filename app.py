@@ -629,6 +629,36 @@ _BANNER_HTML = f"""
 components.html(_BANNER_HTML, height=0)
 
 # -----------------------------------------------------------------------------
+# Main-area quick controls (mobile-friendly fallback when sidebar is hidden)
+# -----------------------------------------------------------------------------
+with st.expander("☰ Controls (mobile-friendly)", expanded=False):
+    st.caption("Use these if the sidebar is hidden on mobile.")
+    if st.button("▶️ Run Analysis", key="nav_run_main", use_container_width=True):
+        st.session_state["current_page"] = "runner"
+        st.rerun()
+    if is_admin:
+        if st.button("✏️ Prompt Editor", key="nav_editor_main", use_container_width=True):
+            st.session_state["current_page"] = "edit_prompts"
+            st.rerun()
+        if st.button("🔄 Refresh Knowledge Base", key="refresh_kb_main", use_container_width=True):
+            try:
+                get_cached_rag_state.clear()
+                get_cached_folder_info.clear()
+                get_cached_file_list.clear()
+                n = clear_disk_cache_for_folder(folder_id)
+                if n:
+                    logger.info(f"Cleared {n} RAG index cache file(s)")
+                st.session_state["gemini_cache_name"] = None
+                st.session_state["gemini_cache_folder_id"] = None
+                st.session_state["kb_loaded"] = False
+                st.session_state["kb_loading_started"] = False
+                st.rerun()
+            except Exception as e:
+                logger.error(f"Error clearing cache: {e}", exc_info=True)
+                st.error(f"Error clearing cache: {e}")
+    authenticator.logout("Logout", location="main")
+
+# -----------------------------------------------------------------------------
 # Sidebar
 # -----------------------------------------------------------------------------
 
