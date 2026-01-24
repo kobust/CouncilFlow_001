@@ -10,13 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py brain.py db.py librarian.py rag.py rag_loader.py rag_cache.py .
-COPY docker_secrets.py .
-COPY config.yaml .
-RUN mkdir -p .streamlit && true
+COPY . .
+COPY docker_secrets.py ./
+COPY config.yaml ./
+RUN mkdir -p .streamlit
 COPY .streamlit/config.toml .streamlit/
 
 # Secrets are provided at runtime via env (docker_secrets.py) or mount.

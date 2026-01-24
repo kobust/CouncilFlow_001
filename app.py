@@ -61,6 +61,7 @@ import db
 from librarian import get_cached_file_list, get_cached_folder_info
 from rag_cache import clear_disk_cache_for_folder
 from rag_loader import get_cached_rag_state, plan_retrieval, retrieve_and_build_context
+from paths import data_path
 
 # Configure logging
 logging.basicConfig(
@@ -98,12 +99,13 @@ st.set_page_config(
 
 try:
     logger.debug("Loading config.yaml")
-    with open(Path(__file__).parent / "config.yaml", encoding="utf-8") as f:
+    config_path = data_path("config.yaml")
+    with open(config_path, encoding="utf-8") as f:
         config = yaml.load(f, Loader=SafeLoader)
     logger.debug("Config loaded successfully")
 except FileNotFoundError:
     logger.error("config.yaml not found")
-    st.error("Configuration file (config.yaml) not found. Please create it.")
+    st.error("Configuration file (config.yaml) not found. Place it in the app data folder.")
     st.stop()
 except Exception as e:
     logger.error(f"Error loading config.yaml: {e}", exc_info=True)

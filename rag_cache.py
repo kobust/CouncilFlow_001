@@ -10,6 +10,8 @@ import pickle
 import re
 from pathlib import Path
 
+from paths import data_path
+
 logger = logging.getLogger(__name__)
 
 CACHE_VERSION = 2
@@ -19,8 +21,7 @@ _CACHE_DIR: Path | None = None
 def _cache_dir() -> Path:
     global _CACHE_DIR
     if _CACHE_DIR is None:
-        _CACHE_DIR = Path(__file__).resolve().parent / ".rag_cache"
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _CACHE_DIR = data_path(".rag_cache")
     return _CACHE_DIR
 
 

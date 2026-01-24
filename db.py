@@ -10,13 +10,15 @@ from typing import Optional
 from sqlalchemy import text
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
+from paths import data_path
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
 
-DB_PATH = "council.db"
+DB_PATH = str(data_path("council.db"))
 SQLITE_URL = f"sqlite:///{DB_PATH}"
 
 _engine = None
