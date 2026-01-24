@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -740,18 +741,20 @@ if current_page == "edit_prompts":
     crud_select = st.selectbox("Select prompt", crud_options, key="crud_select")
     existing = next((p for p in crud_prompts if p.name == crud_select), None)
     
-    # Always sync form values from current selection (fixes checkbox sync and post-save stale state)
-    st.session_state["crud_last_selected"] = existing.id if existing else None
-    if existing:
-        st.session_state["crud_name"] = existing.name
-        st.session_state["crud_template"] = existing.template_text
-        st.session_state["crud_verifier_id"] = existing.verifier_id
-        st.session_state["crud_follow_on_only"] = getattr(existing, "follow_on_only", False)
-    else:
-        st.session_state["crud_name"] = ""
-        st.session_state["crud_template"] = ""
-        st.session_state["crud_verifier_id"] = None
-        st.session_state["crud_follow_on_only"] = False
+    # Sync form values only when selection changes (avoid clobbering submitted values)
+    selected_id = existing.id if existing else None
+    if st.session_state.get("crud_last_selected") != selected_id:
+        st.session_state["crud_last_selected"] = selected_id
+        if existing:
+            st.session_state["crud_name"] = existing.name
+            st.session_state["crud_template"] = existing.template_text
+            st.session_state["crud_verifier_id"] = existing.verifier_id
+            st.session_state["crud_follow_on_only"] = getattr(existing, "follow_on_only", False)
+        else:
+            st.session_state["crud_name"] = ""
+            st.session_state["crud_template"] = ""
+            st.session_state["crud_verifier_id"] = None
+            st.session_state["crud_follow_on_only"] = False
 
     with st.form("prompt_form", clear_on_submit=False):
         name_value = st.session_state.get("crud_name", "")
@@ -980,6 +983,7 @@ if current_page == "runner":
                             st.error("RAG knowledge base not loaded. Ask an administrator to refresh it, then try again.")
                         st.stop()
                     logger.info(f"Starting run: folder_id={folder_id}, content_len={len(user_content)}")
+                    timings: dict[str, float] = {}
                     status_container = st.status("🔍 Planning retrieval…", expanded=True)
                     with status_container:
                         uc_tok = chars_to_tokens(len(user_content))
@@ -987,9 +991,11 @@ if current_page == "runner":
                         status_container.write(f"📊 **User input**: {uc_tok:,} tokens — {format_bible_equivalent(uc_tok)}")
                         status_container.write(f"📐 **Model**: {DEFAULT_MODEL} (max {max_ctx:,} tokens)")
                         status_container.write("📋 Deciding which libraries to search and how much to retrieve…")
+                        _t0 = time.perf_counter()
                         sel_ids, top_k_map = plan_retrieval(
                             _rs, selected.name, selected.template_text, user_content
                         )
+                        timings["plan_retrieval_s"] = time.perf_counter() - _t0
                         id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
                         if sel_ids:
                             lines = [f"• **{id_to_name.get(lid, '?')}** (top_k={top_k_map.get(lid, '—')})" for lid in sel_ids]
@@ -998,6 +1004,7 @@ if current_page == "runner":
                                 status_container.write(line)
                         else:
                             status_container.write("✅ No libraries selected.")
+                        status_container.write(f"⏱️ Planning time: {timings['plan_retrieval_s']:.2f}s")
                         status_container.update(label="✅ Retrieval planned", state="complete")
                     query = f"{selected.name}\n\n{user_content[:4000]}"
                     status_container = st.status("🧠 Building context…", expanded=True)
@@ -1007,8 +1014,9 @@ if current_page == "runner":
                         transient_tokens = chars_to_tokens(transient_len)
                         prompt_wrapper = len(selected.template_text) + 80  # "---\\nSubject...\\n" etc.
                         prompt_tokens = chars_to_tokens(prompt_wrapper)
-                        
+                        _t0 = time.perf_counter()
                         context_xml, retrieval_report = retrieve_and_build_context(_rs, query, sel_ids, top_k_map)
+                        timings["build_context_s"] = time.perf_counter() - _t0
                         total_len = len(context_xml)
                         kb_tokens = chars_to_tokens(total_len)
                         max_ctx = model_max_context(DEFAULT_MODEL)
@@ -1037,6 +1045,7 @@ if current_page == "runner":
                                     if len(srcs) > 5:
                                         file_summary += f" +{len(srcs) - 5} more"
                                     status_container.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
+                        status_container.write(f"⏱️ Context build time: {timings['build_context_s']:.2f}s")
                         status_container.write(f"✅ **Context ready**: {total_input_tokens:,} tokens ({format_bible_equivalent(total_input_tokens)})")
                         status_container.update(label="✅ Context built", state="complete")
                     min_size = 16000
@@ -1055,6 +1064,7 @@ if current_page == "runner":
                         try:
                             with status_container:
                                 st.write(f"📐 Caching {_ctx_tok:,} tokens ({format_context_usage(_ctx_tok, _max_ctx, DEFAULT_MODEL)})…")
+                                _t0 = time.perf_counter()
                                 
                                 def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
                                     """Update UI during retries"""
@@ -1062,6 +1072,8 @@ if current_page == "runner":
                                     status_container.update(label="Creating cache… (retry)", state="running")
                                 
                                 cache_name = brain.create_gemini_cache(context_xml, progress_callback=retry_progress)
+                                timings["cache_create_s"] = time.perf_counter() - _t0
+                                status_container.write(f"⏱️ Cache build time: {timings['cache_create_s']:.2f}s")
                                 status_container.update(label="✅ Cache ready", state="complete")
                                 cache_created = True
                         except Exception as cache_error:
@@ -1125,6 +1137,7 @@ if current_page == "runner":
                             run_status.write(f"📖 {format_bible_equivalent(total_input_tokens)}")
                             run_status.write("⏳ Calling model…")
                             logger.info(f"Calling brain.run_agent() (attempt {retry_attempt + 1}/{max_retries + 1})")
+                            _t0 = time.perf_counter()
                             try:
                                 result = brain.run_agent(
                                     full_template,
@@ -1132,7 +1145,9 @@ if current_page == "runner":
                                     cache_name,
                                     expect_json=False,
                                 )
+                                timings["model_run_s"] = time.perf_counter() - _t0
                                 out_tok = chars_to_tokens(len(str(result)))
+                                run_status.write(f"⏱️ Model time: {timings['model_run_s']:.2f}s")
                                 run_status.write(f"✅ **Output**: {out_tok:,} tokens (~{format_bible_equivalent(out_tok)})")
                                 run_status.update(label="✅ Analysis complete", state="complete")
                                 break
@@ -1192,6 +1207,7 @@ if current_page == "runner":
                         "max_context": max_ctx,
                         "output_tokens": output_tokens,
                         "model": DEFAULT_MODEL,
+                        "timings": timings,
                     }
                     
                     # Chained follow-on prompts: run sequentially, concatenating outputs.
@@ -1199,6 +1215,7 @@ if current_page == "runner":
                     _sep = "\n\n---\n\n"
                     accumulated: str = str(result)
                     chain: list[tuple[str, str]] = [(selected.name, accumulated)]
+                    chain_timings: list[dict[str, float]] = []
                     current = selected
                     seen: set[int] = {selected.id}
                     st.session_state["last_chain_error"] = None
@@ -1220,21 +1237,27 @@ if current_page == "runner":
                         followon_template = next_p.template_text + "\n\n---\n\nOutput from previous step(s):\n{{ previous_output }}"
                         step_label = f"Follow-on: {next_p.name}"
                         try:
+                            step_timing: dict[str, float] = {"name": next_p.name}
                             with st.status(f"🔍 Re-planning retrieval for {next_p.name}…", expanded=True) as replan_status:
                                 replan_status.write("Deciding libraries and top_k from previous output…")
+                                _t0 = time.perf_counter()
                                 sel_ids, top_k_map = plan_retrieval(
                                     _rs, next_p.name, next_p.template_text, accumulated
                                 )
+                                step_timing["plan_retrieval_s"] = time.perf_counter() - _t0
                                 id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
                                 if sel_ids:
                                     replan_status.write("✅ " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]))
+                                replan_status.write(f"⏱️ Planning time: {step_timing['plan_retrieval_s']:.2f}s")
                                 replan_status.update(label="✅ Re-planned", state="complete")
                             step_query = f"{next_p.name}\n\n{accumulated[:4000]}"
                             with st.status(f"🧠 Re-building context for {next_p.name}…", expanded=True) as rebuild_status:
                                 rebuild_status.write("Retrieving from selected libraries…")
+                                _t0 = time.perf_counter()
                                 step_context_xml, step_report = retrieve_and_build_context(
                                     _rs, step_query, sel_ids, top_k_map
                                 )
+                                step_timing["build_context_s"] = time.perf_counter() - _t0
                                 last_retrieval_report = step_report
                                 step_kb = chars_to_tokens(len(step_context_xml))
                                 step_transient = chars_to_tokens(len(accumulated))
@@ -1244,24 +1267,30 @@ if current_page == "runner":
                                 last_prompt_tokens = step_prompt
                                 last_total_input = step_kb + step_transient + step_prompt
                                 rebuild_status.write(f"✅ Context: {last_total_input:,} tokens")
+                                rebuild_status.write(f"⏱️ Context build time: {step_timing['build_context_s']:.2f}s")
                                 rebuild_status.update(label="✅ Context ready", state="complete")
                             if len(step_context_xml) < min_size:
                                 st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: context too small for cache"
                                 break
                             with st.status(f"⚡ Creating cache for {next_p.name}…", expanded=True) as cache_status:
                                 cache_status.write("Caching new context…")
+                                _t0 = time.perf_counter()
                                 step_cache_name = brain.create_gemini_cache(step_context_xml)
+                                step_timing["cache_create_s"] = time.perf_counter() - _t0
+                                cache_status.write(f"⏱️ Cache build time: {step_timing['cache_create_s']:.2f}s")
                                 cache_status.update(label="✅ Cache ready", state="complete")
                             with st.spinner(step_label + "…"):
                                 retry = 0
                                 while True:
                                     try:
+                                        _t0 = time.perf_counter()
                                         out = brain.run_agent(
                                             followon_template,
                                             {"previous_output": accumulated},
                                             step_cache_name,
                                             expect_json=False,
                                         )
+                                        step_timing["model_run_s"] = time.perf_counter() - _t0
                                         break
                                     except CacheExpiredError as ce:
                                         logger.warning(f"Cache expired during {next_p.name} (attempt {retry + 1}): {ce}")
@@ -1273,6 +1302,13 @@ if current_page == "runner":
                                             raise
                                 accumulated = accumulated + _sep + str(out)
                                 chain.append((next_p.name, accumulated))
+                                step_timing["total_s"] = (
+                                    step_timing.get("plan_retrieval_s", 0)
+                                    + step_timing.get("build_context_s", 0)
+                                    + step_timing.get("cache_create_s", 0)
+                                    + step_timing.get("model_run_s", 0)
+                                )
+                                chain_timings.append(step_timing)
                                 logger.info(f"Follow-on {next_p.name} completed; accumulated length={len(accumulated)}")
                                 current = next_p
                         except CacheExpiredError as ce:
@@ -1286,6 +1322,7 @@ if current_page == "runner":
                             break
                     st.session_state["last_result"] = accumulated
                     st.session_state["last_chain"] = chain
+                    st.session_state["last_chain_timings"] = chain_timings
                     st.session_state["last_rag_retrieval_report"] = last_retrieval_report
                     stats = st.session_state["last_run_context_stats"]
                     stats["kb_tokens"] = last_kb_tokens
@@ -1348,6 +1385,7 @@ if current_page == "runner":
                     mx = ctx_stats.get("max_context", 0)
                     out = ctx_stats.get("output_tokens", 0)
                     model = ctx_stats.get("model", "")
+                    timings = ctx_stats.get("timings", {})
                     pct = (tot / mx * 100) if mx else 0
                     st.caption(f"Token estimates (~4 chars/token). Real-world: 1 Bible ≈ {TOKENS_PER_BIBLE:,} tokens.")
                     st.markdown(f"**Model**: `{model}` · **Max context**: {mx:,} tokens")
@@ -1358,6 +1396,30 @@ if current_page == "runner":
                     st.markdown(f"- **Total input**: **{tot:,}** tokens → {format_context_usage(tot, mx, model)}")
                     st.markdown(f"**Output**: **{out:,}** tokens")
                     st.markdown(f"**Real-world**: Total input ≈ **{format_bible_equivalent(tot)}** · Output ≈ **{format_bible_equivalent(out)}**")
+                    if timings:
+                        st.markdown("**Timings**")
+                        st.markdown(f"- Retrieval planning: **{timings.get('plan_retrieval_s', 0):.2f}s**")
+                        st.markdown(f"- Context build: **{timings.get('build_context_s', 0):.2f}s**")
+                        st.markdown(f"- Cache create: **{timings.get('cache_create_s', 0):.2f}s**")
+                        st.markdown(f"- Model run: **{timings.get('model_run_s', 0):.2f}s**")
+                        total_t = sum(
+                            float(timings.get(k, 0))
+                            for k in ("plan_retrieval_s", "build_context_s", "cache_create_s", "model_run_s")
+                        )
+                        if total_t > 0:
+                            st.markdown(f"- **Total (timed steps)**: **{total_t:.2f}s**")
+
+            chain_timings = st.session_state.get("last_chain_timings")
+            if chain_timings:
+                with st.expander("⏱️ Timing by follow‑on step", expanded=False):
+                    for i, t in enumerate(chain_timings):
+                        name = t.get("name", f"Step {i + 1}")
+                        st.markdown(f"**{name}**")
+                        st.markdown(f"- Planning: **{t.get('plan_retrieval_s', 0):.2f}s**")
+                        st.markdown(f"- Context: **{t.get('build_context_s', 0):.2f}s**")
+                        st.markdown(f"- Cache: **{t.get('cache_create_s', 0):.2f}s**")
+                        st.markdown(f"- Model: **{t.get('model_run_s', 0):.2f}s**")
+                        st.markdown(f"- **Total**: **{t.get('total_s', 0):.2f}s**")
 
             if rag_report:
                 with st.expander("📚 Sources used", expanded=False):
