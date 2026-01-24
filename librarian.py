@@ -20,6 +20,24 @@ from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
 
+# OCR (optional): used when building KB from scanned/image PDFs
+_OCR_AVAILABLE = False
+_OCR_ERROR_MSG: str | None = None
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    try:
+        pytesseract.get_tesseract_version()
+        _OCR_AVAILABLE = True
+    except Exception as e:
+        _OCR_AVAILABLE = False
+        _OCR_ERROR_MSG = f"Tesseract OCR binary not found: {e}"
+except ImportError as e:
+    _OCR_AVAILABLE = False
+    _OCR_ERROR_MSG = f"OCR libraries not installed: {e}"
+if not _OCR_AVAILABLE and _OCR_ERROR_MSG:
+    logger.debug("OCR not available for KB extraction: %s", _OCR_ERROR_MSG)
+
 # -----------------------------------------------------------------------------
 # Auth
 # -----------------------------------------------------------------------------
@@ -203,6 +221,35 @@ def _escape_xml(s: str) -> str:
     return html.escape(s, quote=True)
 
 
+def _extract_text_with_ocr(pdf_bytes: bytes, name: str) -> str | None:
+    """Extract text from PDF using OCR (for scanned/image-based PDFs). Returns None if OCR unavailable or fails."""
+    if not _OCR_AVAILABLE:
+        logger.debug("OCR not available for %s: %s", name, _OCR_ERROR_MSG or "unavailable")
+        return None
+    try:
+        logger.info("Attempting OCR on %s (KB build)", name)
+        images = convert_from_bytes(pdf_bytes, dpi=300)
+        logger.info("Converted %d pages to images for OCR", len(images))
+        ocr_parts = []
+        for page_num, image in enumerate(images, 1):
+            try:
+                text = pytesseract.image_to_string(image, lang="eng")
+                if text and text.strip():
+                    ocr_parts.append(text)
+                    logger.debug("OCR page %d: %d chars", page_num, len(text))
+            except Exception as e:
+                logger.warning("OCR failed on page %d of %s: %s", page_num, name, e)
+                ocr_parts.append(f"[Page {page_num}: OCR error - {type(e).__name__}]")
+        result = "\n\n".join(ocr_parts)
+        if result.strip():
+            logger.info("OCR extracted %d chars from %s", len(result), name)
+            return result
+        return None
+    except Exception as e:
+        logger.warning("OCR failed for %s: %s", name, e)
+        return None
+
+
 def _extract_text_from_bytes(data: bytes, mime: str, name: str) -> str:
     """Extract plain text from file bytes. Supports PDF, DOCX, and Google Docs (text/plain)."""
     mime = (mime or "").lower()
@@ -225,17 +272,17 @@ def _extract_text_from_bytes(data: bytes, mime: str, name: str) -> str:
             for page_num, p in enumerate(reader.pages, 1):
                 try:
                     t = p.extract_text()
-                    if t:
+                    if t and t.strip():
                         parts.append(t)
                         successful_pages += 1
+                    else:
+                        parts.append(f"[Page {page_num}: No text found]")
                 except (KeyError, AttributeError, ValueError) as page_error:
-                    # Common PDF parsing errors (malformed fonts, missing bbox, etc.)
                     failed_pages.append(page_num)
                     error_type = type(page_error).__name__
                     logger.warning(f"Error extracting text from page {page_num}/{total_pages} of {name}: {error_type} - {str(page_error)[:100]}")
                     parts.append(f"[Page {page_num}: Error extracting text - {error_type}]")
                 except Exception as page_error:
-                    # Other unexpected errors
                     failed_pages.append(page_num)
                     logger.warning(f"Unexpected error extracting text from page {page_num}/{total_pages} of {name}: {page_error}")
                     parts.append(f"[Page {page_num}: Error extracting text - {type(page_error).__name__}]")
@@ -244,6 +291,20 @@ def _extract_text_from_bytes(data: bytes, mime: str, name: str) -> str:
             if failed_pages:
                 logger.info(f"Extracted text from {successful_pages}/{total_pages} pages of {name} (failed pages: {failed_pages})")
             logger.debug(f"Extracted {len(result)} chars from PDF {name} ({successful_pages}/{total_pages} pages successful)")
+            
+            actual_text_parts = [x for x in parts if not (x.startswith("[Page") or x.startswith("[Error"))]
+            actual_text = "\n".join(actual_text_parts)
+            actual_text_len = len(actual_text.strip())
+            if successful_pages == 0 or actual_text_len < 50:
+                logger.info(f"PDF {name} has little/no pypdf text ({actual_text_len} chars). Trying OCR for KB build.")
+                ocr_result = _extract_text_with_ocr(data, name)
+                if ocr_result and len(ocr_result.strip()) > 50:
+                    return ocr_result
+                if ocr_result:
+                    logger.warning(f"OCR for {name} yielded only {len(ocr_result)} chars; using it anyway.")
+                    return ocr_result
+                if not _OCR_AVAILABLE:
+                    logger.warning(f"OCR not available for scanned PDF {name}. KB will use minimal pypdf output.")
             return result
         if "wordprocessingml" in mime or "msword" in mime or mime.endswith("/document"):
             logger.debug(f"Extracting from Word doc: {name}")
