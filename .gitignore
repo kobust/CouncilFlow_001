@@ -5,5 +5,4 @@ __pycache__/
 secrets.toml
 .streamlit/secrets.toml
 service_account.json
-council.db
 .rag_cache/
