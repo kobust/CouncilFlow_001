@@ -1235,7 +1235,7 @@ if current_page == "runner":
                                 timings["model_run_s"] = time.perf_counter() - _t0
                                 out_tok = chars_to_tokens(len(str(result)))
                                 run_status.write(f"⏱️ Model time: {timings['model_run_s']:.2f}s")
-                                run_status.write(f"✅ **Output**: {out_tok:,} tokens (~{format_bible_equivalent(out_tok)})")
+                                run_status.write(f"✅ **Output**: {out_tok:,} tokens (~{format_reading_equivalent(out_tok)})")
                                 run_status.update(label="✅ Analysis complete", state="complete")
                                 break
                             except CacheExpiredError as cache_expired:
