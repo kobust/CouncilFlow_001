@@ -10,6 +10,10 @@ credentials:
       email: user@local
       name: General User
       password: "$2b$12$GWcasgk8vEVYHv2faRl1M.a1hKX52iYh/3loZJgyiQ78m5OG6Kqhe"
+    councilor:
+      email: councilor@local
+      name: Councilor
+      password: "$2b$12$GWcasgk8vEVYHv2faRl1M.a1hKX52iYh/3loZJgyiQ78m5OG6Kqhe"
 cookie:
   name: councilflow_cookie
   key: councilflow_secret_key_change_in_production
