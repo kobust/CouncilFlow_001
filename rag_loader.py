@@ -45,9 +45,9 @@ RERANK_ENABLED = False  # Disabled: slow. We retrieve more chunks instead (RETRI
 RERANK_FACTOR = 2
 RETRIEVE_FACTOR = 2  # When rerank off: retrieve/take this many more chunks (we have context headroom).
 
-# Fewer Gemini calls: skip LLM-based query expansion and retrieval planner when False.
-USE_QUERY_EXPANSION = False
-USE_RETRIEVAL_PLANNER = False
+# LLM-based query expansion and retrieval planner (set False to reduce Gemini calls).
+USE_QUERY_EXPANSION = True
+USE_RETRIEVAL_PLANNER = True
 
 
 def _embed_fn(texts: list[str]):
