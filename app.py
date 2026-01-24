@@ -63,8 +63,12 @@ from librarian import get_cached_file_list, get_cached_folder_info
 from rag_cache import clear_disk_cache_for_folder
 from rag_loader import (
     get_cached_rag_state,
+    get_default_plan,
+    get_fallback_phrases,
     plan_retrieval,
     retrieve_and_build_context_multi,
+    USE_QUERY_EXPANSION,
+    USE_RETRIEVAL_PLANNER,
 )
 from paths import data_path, repo_path
 
@@ -1101,32 +1105,43 @@ if current_page == "runner":
                         max_ctx = model_max_context(DEFAULT_MODEL)
                         status_container.write(f"📊 **User input**: {uc_tok:,} tokens — {format_reading_equivalent(uc_tok)}")
                         status_container.write(f"📐 **Model**: {DEFAULT_MODEL} (max {max_ctx:,} tokens)")
-                        status_container.write("📋 Deciding which libraries to search and how much to retrieve…")
                         _t0 = time.perf_counter()
-                        sel_ids, top_k_map = plan_retrieval(
-                            _rs, selected.name, selected.template_text, user_content
-                        )
-                        timings["plan_retrieval_s"] = time.perf_counter() - _t0
-                        id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
-                        if sel_ids:
-                            lines = [f"• **{id_to_name.get(lid, '?')}** (top_k={top_k_map.get(lid, '—')})" for lid in sel_ids]
-                            status_container.write("✅ Using " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) + ".")
-                            for line in lines:
-                                status_container.write(line)
+                        if USE_RETRIEVAL_PLANNER:
+                            status_container.write("📋 Deciding which libraries to search and how much to retrieve…")
+                            sel_ids, top_k_map = plan_retrieval(
+                                _rs, selected.name, selected.template_text, user_content
+                            )
+                            id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
+                            if sel_ids:
+                                lines = [f"• **{id_to_name.get(lid, '?')}** (top_k={top_k_map.get(lid, '—')})" for lid in sel_ids]
+                                status_container.write("✅ Using " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) + ".")
+                                for line in lines:
+                                    status_container.write(line)
+                            else:
+                                status_container.write("✅ No libraries selected.")
                         else:
-                            status_container.write("✅ No libraries selected.")
+                            sel_ids, top_k_map = get_default_plan(_rs)
+                            status_container.write("✅ Using all libraries (planner disabled).")
+                        timings["plan_retrieval_s"] = time.perf_counter() - _t0
                         status_container.write(f"⏱️ Planning time: {timings['plan_retrieval_s']:.2f}s")
                         status_container.update(label="✅ Retrieval planned", state="complete")
-                    query_phrases = expand_queries(
-                        selected.name, selected.template_text, user_content
-                    )
+                    if USE_QUERY_EXPANSION:
+                        query_phrases = expand_queries(
+                            selected.name, selected.template_text, user_content
+                        )
+                    else:
+                        query_phrases = get_fallback_phrases(
+                            selected.name, selected.template_text, user_content
+                        )
                     status_container = st.status("🧠 Building context…", expanded=True)
                     with status_container:
                         status_container.write("📚 Assembling knowledge base + user content…")
-                        if len(query_phrases) > 1:
+                        if USE_QUERY_EXPANSION and len(query_phrases) > 1:
                             status_container.write(
                                 f"🔍 Query expansion: {len(query_phrases)} search phrases"
                             )
+                        elif not USE_QUERY_EXPANSION:
+                            status_container.write("🔍 Single search phrase (expansion disabled).")
                         transient_len = len(user_content)
                         transient_tokens = chars_to_tokens(transient_len)
                         prompt_wrapper = len(selected.template_text) + 80  # "---\\nSubject...\\n" etc.
@@ -1358,20 +1373,29 @@ if current_page == "runner":
                         try:
                             step_timing: dict[str, float] = {"name": next_p.name}
                             with st.status(f"🔍 Re-planning retrieval for {next_p.name}…", expanded=True) as replan_status:
-                                replan_status.write("Deciding libraries and top_k from previous output…")
                                 _t0 = time.perf_counter()
-                                sel_ids, top_k_map = plan_retrieval(
-                                    _rs, next_p.name, next_p.template_text, accumulated
-                                )
+                                if USE_RETRIEVAL_PLANNER:
+                                    replan_status.write("Deciding libraries and top_k from previous output…")
+                                    sel_ids, top_k_map = plan_retrieval(
+                                        _rs, next_p.name, next_p.template_text, accumulated
+                                    )
+                                    id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
+                                    if sel_ids:
+                                        replan_status.write("✅ " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]))
+                                else:
+                                    sel_ids, top_k_map = get_default_plan(_rs)
+                                    replan_status.write("✅ Using all libraries (planner disabled).")
                                 step_timing["plan_retrieval_s"] = time.perf_counter() - _t0
-                                id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
-                                if sel_ids:
-                                    replan_status.write("✅ " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]))
                                 replan_status.write(f"⏱️ Planning time: {step_timing['plan_retrieval_s']:.2f}s")
                                 replan_status.update(label="✅ Re-planned", state="complete")
-                            step_phrases = expand_queries(
-                                next_p.name, next_p.template_text, accumulated
-                            )
+                            if USE_QUERY_EXPANSION:
+                                step_phrases = expand_queries(
+                                    next_p.name, next_p.template_text, accumulated
+                                )
+                            else:
+                                step_phrases = get_fallback_phrases(
+                                    next_p.name, next_p.template_text, accumulated
+                                )
                             with st.status(f"🧠 Re-building context for {next_p.name}…", expanded=True) as rebuild_status:
                                 rebuild_status.write("Retrieving from selected libraries…")
                                 _t0 = time.perf_counter()

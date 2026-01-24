@@ -285,10 +285,12 @@ def retrieve_hybrid(
     top_k: int,
     embed_query_fn: callable,
     alpha: float = 0.5,
+    *,
+    query_embedding: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Hybrid retrieval: BM25 + semantic. Merge via RRF, return top_k chunks.
-    embed_query_fn: callable(str) -> list[float].
+    embed_query_fn: callable(str) -> list[float]. Skip call if query_embedding provided.
     """
     chunks = library_index.get("chunks", [])
     bm25 = library_index.get("bm25")
@@ -297,7 +299,7 @@ def retrieve_hybrid(
         return []
 
     q_tok = _tokenize_bm25(query)
-    q_emb = embed_query_fn(query)
+    q_emb = query_embedding if query_embedding is not None else embed_query_fn(query)
 
     # BM25 scores
     if bm25 and tokenized and q_tok:

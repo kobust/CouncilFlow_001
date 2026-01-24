@@ -45,6 +45,10 @@ RERANK_ENABLED = False  # Disabled: slow. We retrieve more chunks instead (RETRI
 RERANK_FACTOR = 2
 RETRIEVE_FACTOR = 2  # When rerank off: retrieve/take this many more chunks (we have context headroom).
 
+# Fewer Gemini calls: skip LLM-based query expansion and retrieval planner when False.
+USE_QUERY_EXPANSION = False
+USE_RETRIEVAL_PLANNER = False
+
 
 def _embed_fn(texts: list[str]):
     from brain import embed_documents
@@ -219,6 +223,20 @@ def plan_retrieval(
     return selected, top_k_map
 
 
+def get_fallback_phrases(task_name: str, template_text: str, user_content: str) -> list[str]:
+    """Single search phrase (no LLM). Use when USE_QUERY_EXPANSION is False."""
+    excerpt = (user_content or "")[:2000]
+    return [f"{(task_name or '').strip()}\n\n{excerpt}".strip() or "search"]
+
+
+def get_default_plan(rag_state: dict[str, Any]) -> tuple[list[str], dict[str, int]]:
+    """All libraries, DEFAULT_TOP_K each. Use when USE_RETRIEVAL_PLANNER is False."""
+    libs = rag_state.get("libraries", [])
+    ids = [L["id"] for L in libs]
+    top_k_map = {L["id"]: DEFAULT_TOP_K for L in libs}
+    return ids, top_k_map
+
+
 def retrieve_and_build_context(
     rag_state: dict[str, Any],
     query: str,
@@ -285,11 +303,18 @@ def retrieve_and_build_context_multi(
     """
     Multi-query retrieval: run hybrid retrieval per query, merge via RRF per library,
     dedupe, then build context = Core + retrieved.
+    Embeds each phrase once and reuses across libraries to reduce API calls.
     """
     core = rag_state["core_xml"]
     parts = [core]
     report: list[dict[str, Any]] = []
     use_map = isinstance(top_k_per_library, dict)
+
+    query_embeddings: list[list[float]] = []
+    for q in queries:
+        query_embeddings.append(_embed_query_fn(q))
+    logger.info("pre-embedded %d query phrase(s), reusing across libraries", len(query_embeddings))
+
     for lib in rag_state["libraries"]:
         if lib["id"] not in selected_library_ids:
             continue
@@ -304,8 +329,12 @@ def retrieve_and_build_context_multi(
         rrf_scores: dict[tuple[Any, ...], float] = {}
         chunk_ref: dict[tuple[Any, ...], dict[str, Any]] = {}
 
-        for q in queries:
-            run = retrieve_hybrid(q, idx, retrieve_k, _embed_query_fn)
+        for qi, q in enumerate(queries):
+            q_emb = query_embeddings[qi] if qi < len(query_embeddings) else None
+            run = retrieve_hybrid(
+                q, idx, retrieve_k, _embed_query_fn,
+                query_embedding=q_emb,
+            )
             for rank, c in enumerate(run, 1):
                 key = (c.get("chunk_id"), c.get("file_id"))
                 rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (_RRF_K + rank)
