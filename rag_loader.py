@@ -46,7 +46,7 @@ RERANK_FACTOR = 2
 RETRIEVE_FACTOR = 2  # When rerank off: retrieve/take this many more chunks (we have context headroom).
 
 # LLM-based query expansion and retrieval planner (set False to reduce Gemini calls).
-USE_QUERY_EXPANSION = True
+USE_QUERY_EXPANSION = False
 USE_RETRIEVAL_PLANNER = True
 
 

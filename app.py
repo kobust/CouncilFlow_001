@@ -1104,29 +1104,20 @@ if current_page == "runner":
                     timings: dict[str, float] = {}
                     status_container = st.status("🔍 Planning retrieval…", expanded=True)
                     with status_container:
-                        uc_tok = chars_to_tokens(len(user_content))
                         max_ctx = model_max_context(EFFECTIVE_MODEL)
-                        status_container.write(f"📊 **User input**: {uc_tok:,} tokens — {format_reading_equivalent(uc_tok)}")
-                        status_container.write(f"📐 **Model**: {EFFECTIVE_MODEL} (max {max_ctx:,} tokens)")
                         _t0 = time.perf_counter()
                         if USE_RETRIEVAL_PLANNER:
-                            status_container.write("📋 Deciding which libraries to search and how much to retrieve…")
                             sel_ids, top_k_map = plan_retrieval(
                                 _rs, selected.name, selected.template_text, user_content
                             )
                             id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
-                            if sel_ids:
-                                lines = [f"• **{id_to_name.get(lid, '?')}** (top_k={top_k_map.get(lid, '—')})" for lid in sel_ids]
-                                status_container.write("✅ Using " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) + ".")
-                                for line in lines:
-                                    status_container.write(line)
-                            else:
-                                status_container.write("✅ No libraries selected.")
+                            libs_str = ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) if sel_ids else "none"
+                            status_container.write(f"✅ **{libs_str}** · top_k per library")
                         else:
                             sel_ids, top_k_map = get_default_plan(_rs)
                             status_container.write("✅ Using all libraries.")
                         timings["plan_retrieval_s"] = time.perf_counter() - _t0
-                        status_container.write(f"⏱️ Planning time: {timings['plan_retrieval_s']:.2f}s")
+                        status_container.write(f"⏱️ {timings['plan_retrieval_s']:.2f}s")
                         status_container.update(label="✅ Retrieval planned", state="complete")
                     if USE_QUERY_EXPANSION:
                         query_phrases = expand_queries(
@@ -1136,18 +1127,27 @@ if current_page == "runner":
                         query_phrases = get_fallback_phrases(
                             selected.name, selected.template_text, user_content
                         )
-                    status_container = st.status("🧠 Building context…", expanded=True)
+                    cache_folder = st.session_state.get("gemini_cache_folder_id")
+                    cache_name = None
+                    cache_reused = False
+                    _run_cache_key = hashlib.sha256(
+                        f"{folder_id}|{selected.id}|{(user_content or '')}".encode()
+                    ).hexdigest()[:32]
+                    _last_run_key = st.session_state.get("run_cache_key")
+                    _last_cache_name = st.session_state.get("gemini_cache_name")
+                    _reuse_cache = (
+                        _last_run_key == _run_cache_key
+                        and _last_cache_name
+                        and cache_folder == folder_id
+                    )
+
+                    status_container = st.status("🧠 Building context + cache…", expanded=True)
                     with status_container:
-                        status_container.write("📚 Assembling knowledge base + user content…")
                         if USE_QUERY_EXPANSION and len(query_phrases) > 1:
-                            status_container.write(
-                                f"🔍 Query expansion: {len(query_phrases)} search phrases"
-                            )
-                        elif not USE_QUERY_EXPANSION:
-                            status_container.write("🔍 Single search phrase (expansion disabled).")
+                            status_container.write(f"🔍 {len(query_phrases)} search phrases")
                         transient_len = len(user_content)
                         transient_tokens = chars_to_tokens(transient_len)
-                        prompt_wrapper = len(selected.template_text) + 80  # "---\\nSubject...\\n" etc.
+                        prompt_wrapper = len(selected.template_text) + 80
                         prompt_tokens = chars_to_tokens(prompt_wrapper)
                         _t0 = time.perf_counter()
                         context_xml, retrieval_report = retrieve_and_build_context_multi(
@@ -1158,125 +1158,80 @@ if current_page == "runner":
                         kb_tokens = chars_to_tokens(total_len)
                         max_ctx = model_max_context(EFFECTIVE_MODEL)
                         total_input_tokens = kb_tokens + prompt_tokens + transient_tokens
-                        pct_used = (total_input_tokens / max_ctx * 100) if max_ctx else 0
                         kb_ratio = (kb_tokens / total_input_tokens * 100) if total_input_tokens else 0
                         user_ratio = (transient_tokens / total_input_tokens * 100) if total_input_tokens else 0
-                        prompt_ratio = (prompt_tokens / total_input_tokens * 100) if total_input_tokens else 0
-                        
-                        status_container.write(f"📊 **Context (cached KB)**: {kb_tokens:,} tokens (~{total_len:,} chars)")
-                        status_container.write(f"📝 **User data**: {transient_tokens:,} tokens · **Prompt wrapper**: {prompt_tokens:,} tokens")
-                        status_container.write(f"⚙️ **Breakdown**: {kb_ratio:.1f}% KB | {user_ratio:.1f}% user | {prompt_ratio:.1f}% prompt")
-                        status_container.write(f"📐 **Total input**: {total_input_tokens:,} tokens — {format_context_usage(total_input_tokens, max_ctx, EFFECTIVE_MODEL)}")
-                        status_container.write(f"📖 **Real-world**: {format_reading_equivalent(total_input_tokens)}")
                         logger.info(f"RAG context built: {total_len:,} chars, {total_input_tokens:,} est. input tokens")
+                        lib_bits = []
                         if retrieval_report:
                             for rec in retrieval_report:
-                                lib_name = rec.get("library_name", "?")
                                 n = rec.get("chunks_retrieved", 0)
-                                k = rec.get("top_k", 0)
-                                srcs = rec.get("sources", [])
-                                if n == 0:
-                                    status_container.write(f"• **{lib_name}**: 0 chunks (top_k={k})")
-                                else:
-                                    file_summary = ", ".join(f"{s['file_name']} ({s['chunk_count']})" for s in srcs[:5])
-                                    if len(srcs) > 5:
-                                        file_summary += f" +{len(srcs) - 5} more"
-                                    status_container.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
-                        status_container.write(f"⏱️ Context build time: {timings['build_context_s']:.2f}s")
-                        status_container.write(f"✅ **Context ready**: {total_input_tokens:,} tokens ({format_reading_equivalent(total_input_tokens)})")
-                        status_container.update(label="✅ Context built", state="complete")
-                    min_size = 16000
-                    if len(context_xml) < min_size:
-                        st.error("Context is too small for the AI cache. Add more core documents or use additional libraries, then try again.")
-                        st.stop()
-                    cache_folder = st.session_state.get("gemini_cache_folder_id")
-                    cache_name = None
-                    cache_reused = False
+                                lib_bits.append(f"{rec.get('library_name', '?')}: {n}")
+                        summary = " · ".join(lib_bits) if lib_bits else "—"
+                        status_container.write(
+                            f"📊 **Context**: {total_input_tokens:,} tokens ({kb_ratio:.0f}% KB, {user_ratio:.0f}% user) · {summary}"
+                        )
+                        status_container.write(f"⏱️ Retrieval: {timings['build_context_s']:.2f}s")
 
-                    # Reuse Gemini cache when same folder + task + user input (context identical)
-                    _run_cache_key = hashlib.sha256(
-                        f"{folder_id}|{selected.id}|{(user_content or '')}".encode()
-                    ).hexdigest()[:32]
-                    _last_run_key = st.session_state.get("run_cache_key")
-                    _last_cache_name = st.session_state.get("gemini_cache_name")
-                    if _last_run_key == _run_cache_key and _last_cache_name and cache_folder == folder_id:
-                        cache_name = _last_cache_name
-                        timings["cache_create_s"] = 0.0
-                        cache_reused = True
-                        logger.info("Reusing Gemini cache (same task + input)")
+                        min_size = 16000
+                        if len(context_xml) < min_size:
+                            status_container.update(label="Context too small", state="error")
+                            st.error("Context is too small for the AI cache. Add more core documents or use additional libraries, then try again.")
+                            st.stop()
 
-                    if cache_name is None or cache_folder != folder_id:
-                        logger.info("Creating new Gemini cache")
-                        _ctx_tok = chars_to_tokens(len(context_xml))
-                        _max_ctx = model_max_context(EFFECTIVE_MODEL)
-                        status_container = st.status("⚡ Creating AI context cache…", expanded=True)
-                        cache_created = False
-                        try:
-                            with status_container:
-                                st.write(f"📐 Caching {_ctx_tok:,} tokens ({format_context_usage(_ctx_tok, _max_ctx, EFFECTIVE_MODEL)})…")
+                        if _reuse_cache:
+                            cache_name = _last_cache_name
+                            timings["cache_create_s"] = 0.0
+                            cache_reused = True
+                            logger.info("Reusing Gemini cache (same task + input)")
+                            status_container.write("✓ **Reused cache** (same task + input)")
+                            status_container.update(label="✅ Context + cache ready", state="complete")
+                        else:
+                            cache_created = False
+                            try:
+                                _ctx_tok = chars_to_tokens(len(context_xml))
+                                status_container.write(f"📐 Caching {_ctx_tok:,} tokens…")
                                 _t0 = time.perf_counter()
-                                
+
                                 def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
-                                    """Update UI during retries"""
                                     status_container.write(f"Attempt {attempt}/{max_attempts} failed. Retrying in {delay:.0f}s…")
-                                    status_container.update(label="Creating cache… (retry)", state="running")
-                                
+                                    status_container.update(label="Building context + cache… (retry)", state="running")
+
                                 cache_name = brain.create_gemini_cache(context_xml, progress_callback=retry_progress)
                                 timings["cache_create_s"] = time.perf_counter() - _t0
-                                status_container.write(f"⏱️ Cache build time: {timings['cache_create_s']:.2f}s")
-                                status_container.update(label="✅ Cache ready", state="complete")
+                                status_container.write(f"⏱️ Cache: {timings['cache_create_s']:.2f}s")
+                                status_container.update(label="✅ Context + cache ready", state="complete")
                                 cache_created = True
-                        except Exception as cache_error:
-                            status_container.update(label="Cache creation failed", state="error")
-                            logger.error(f"Failed to create cache: {cache_error}", exc_info=True)
-                            error_str = str(cache_error).lower()
-                            error_msg = str(cache_error)
-                            
-                            if "too small" in error_str or "min_total_token_count" in error_str:
-                                st.error(f"**Knowledge base too small for Gemini caching**\n\nError: {cache_error}")
-                                st.info("The knowledge base needs to contain at least ~16KB of text (4096 tokens).")
-                                st.stop()
-                            elif "too large" in error_str or "max_total_token_count" in error_str:
-                                st.error("**Cache Content Too Large**")
-                                st.warning(
-                                    "Your knowledge base is too large to cache. Gemini caching has size limits "
-                                    "that your current content exceeds."
-                                )
-                                st.info("**Solutions:**")
-                                st.markdown("""
-                                1. **Reduce knowledge base size** - Filter or summarize documents in your Drive folder
-                                2. **Split into multiple caches** - Not currently supported, but could be implemented
-                                3. **Check API key permissions** - Ensure your API key has caching enabled in Google Cloud Console
-                                """)
-                                st.error(f"**Technical details:** {error_msg}")
-                                st.stop()
-                            elif "503" in error_str or "unavailable" in error_str or "server" in error_str or "failed to create cache after" in error_str:
-                                st.error("**Gemini API Temporarily Unavailable**")
-                                st.warning(
-                                    f"The Gemini API returned 503 (Service Unavailable) errors on all retry attempts. "
-                                    f"This indicates the API is experiencing temporary issues."
-                                )
-                                st.markdown("""
-                                **What to do:**
-                                1. **Wait a few minutes** - API issues are usually temporary
-                                2. **Check Google Cloud Status**: https://status.cloud.google.com/
-                                3. **Try again** - Click 'Run' again in a few moments
-                                4. **Check your API quota** - Ensure you haven't exceeded rate limits
-                                """)
-                                st.error(f"**Technical details:** {error_msg}")
-                                st.stop()
-                            else:
-                                st.error(f"**Failed to create cache**\n\nError: {cache_error}")
-                                st.stop()
-                        
-                        # Only update session state if cache was successfully created
-                        if cache_created:
-                            st.session_state["gemini_cache_name"] = cache_name
-                            st.session_state["gemini_cache_folder_id"] = folder_id
-                            st.session_state["run_cache_key"] = _run_cache_key
-                            logger.info(f"Cache created: {cache_name}")
-                    else:
-                        logger.debug(f"Reusing existing cache: {cache_name}")
+                            except Exception as cache_error:
+                                status_container.update(label="Context + cache failed", state="error")
+                                logger.error(f"Failed to create cache: {cache_error}", exc_info=True)
+                                error_str = str(cache_error).lower()
+                                error_msg = str(cache_error)
+                                if "too small" in error_str or "min_total_token_count" in error_str:
+                                    st.error(f"**Knowledge base too small for Gemini caching**\n\nError: {cache_error}")
+                                    st.info("The knowledge base needs to contain at least ~16KB of text (4096 tokens).")
+                                    st.stop()
+                                elif "too large" in error_str or "max_total_token_count" in error_str:
+                                    st.error("**Cache Content Too Large**")
+                                    st.warning(
+                                        "Your knowledge base is too large to cache. Gemini caching has size limits "
+                                        "that your current content exceeds."
+                                    )
+                                    st.info("**Solutions:**\n1. **Reduce knowledge base size** – Filter or summarize documents in your Drive folder\n2. **Check API key permissions** – Ensure your API key has caching enabled in Google Cloud Console")
+                                    st.error(f"**Technical details:** {error_msg}")
+                                    st.stop()
+                                elif "503" in error_str or "unavailable" in error_str or "server" in error_str or "failed to create cache after" in error_str:
+                                    st.error("**Gemini API Temporarily Unavailable**")
+                                    st.warning("The Gemini API returned 503. Wait a few minutes, check https://status.cloud.google.com/, then try again.")
+                                    st.error(f"**Technical details:** {error_msg}")
+                                    st.stop()
+                                else:
+                                    st.error(f"**Failed to create cache**\n\nError: {cache_error}")
+                                    st.stop()
+                            if cache_created:
+                                st.session_state["gemini_cache_name"] = cache_name
+                                st.session_state["gemini_cache_folder_id"] = folder_id
+                                st.session_state["run_cache_key"] = _run_cache_key
+                                logger.info(f"Cache created: {cache_name}")
                     full_template = template_text + "\n\n---\n\nSubject of analysis (transient input):\n{{ content }}"
                     logger.debug(f"Rendered template length: {len(full_template)} chars")
                     
@@ -1284,12 +1239,9 @@ if current_page == "runner":
                     for retry_attempt in range(max_retries + 1):
                         run_label = "🚀 Model thinking…" if retry_attempt == 0 else "Cache expired, recreating and retrying…"
                         with st.status(run_label, expanded=True) as run_status:
-                            run_status.write(f"📐 **Input**: {total_input_tokens:,} tokens ({format_context_usage(total_input_tokens, max_ctx, EFFECTIVE_MODEL)})")
-                            run_status.write(f"📖 {format_reading_equivalent(total_input_tokens)}")
-                            if cache_reused:
-                                run_status.write("✓ **Reused existing cache** (same task + input)")
+                            run_status.write(f"📐 **Input**: {total_input_tokens:,} tokens" + (" · ✓ Reused cache" if cache_reused else ""))
                             if GEMINI_PACE_DELAY_SECONDS > 0:
-                                run_status.write(f"⏳ Pacing {GEMINI_PACE_DELAY_SECONDS}s to avoid rate limits…")
+                                run_status.write(f"⏳ Pacing {GEMINI_PACE_DELAY_SECONDS}s…")
                                 time.sleep(GEMINI_PACE_DELAY_SECONDS)
                             run_status.write("⏳ Calling model…")
                             logger.info(f"Calling brain.run_agent() (attempt {retry_attempt + 1}/{max_retries + 1})")
@@ -1303,8 +1255,7 @@ if current_page == "runner":
                                 )
                                 timings["model_run_s"] = time.perf_counter() - _t0
                                 out_tok = chars_to_tokens(len(str(result)))
-                                run_status.write(f"⏱️ Model time: {timings['model_run_s']:.2f}s")
-                                run_status.write(f"✅ **Output**: {out_tok:,} tokens (~{format_reading_equivalent(out_tok)})")
+                                run_status.write(f"⏱️ {timings['model_run_s']:.2f}s · ✅ **Output**: {out_tok:,} tokens")
                                 run_status.update(label="✅ Analysis complete", state="complete")
                                 break
                             except CacheExpiredError as cache_expired:
@@ -1319,15 +1270,11 @@ if current_page == "runner":
                                     # Recreate cache
                                     logger.info("Recreating Gemini cache after expiration")
                                     try:
-                                        status_container = st.status("Recreating cache…", expanded=True)
+                                        status_container = st.status("Recreating cache…", expanded=False)
                                         with status_container:
-                                            st.write("Cache expired. Creating new cache…")
-                                            
                                             def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
-                                                """Update UI during retries"""
-                                                status_container.write(f"Attempt {attempt}/{max_attempts} failed. Retrying in {delay:.0f}s…")
-                                                status_container.update(label="Creating cache… (retry)", state="running")
-                                            
+                                                status_container.write(f"Retry {attempt}/{max_attempts} in {delay:.0f}s…")
+                                                status_container.update(label="Recreating cache… (retry)", state="running")
                                             cache_name = brain.create_gemini_cache(context_xml, progress_callback=retry_progress)
                                             status_container.update(label="✅ Cache ready", state="complete")
                                             
@@ -1402,18 +1349,17 @@ if current_page == "runner":
                             with st.status(plan_status_title, expanded=True) as replan_status:
                                 _t0 = time.perf_counter()
                                 if USE_RETRIEVAL_PLANNER:
-                                    replan_status.write("Deciding libraries and top_k from previous output…")
                                     sel_ids, top_k_map = plan_retrieval(
                                         _rs, next_p.name, next_p.template_text, accumulated
                                     )
                                     id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
-                                    if sel_ids:
-                                        replan_status.write("✅ " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]))
+                                    libs_str = ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) if sel_ids else "none"
+                                    replan_status.write(f"✅ **{libs_str}**")
                                 else:
                                     sel_ids, top_k_map = get_default_plan(_rs)
                                     replan_status.write("✅ Using all libraries.")
                                 step_timing["plan_retrieval_s"] = time.perf_counter() - _t0
-                                replan_status.write(f"⏱️ Setup time: {step_timing['plan_retrieval_s']:.2f}s")
+                                replan_status.write(f"⏱️ {step_timing['plan_retrieval_s']:.2f}s")
                                 replan_status.update(
                                     label="✅ Re-planned" if USE_RETRIEVAL_PLANNER else "✅ Ready",
                                     state="complete",
@@ -1426,8 +1372,8 @@ if current_page == "runner":
                                 step_phrases = get_fallback_phrases(
                                     next_p.name, next_p.template_text, accumulated
                                 )
-                            with st.status(f"🧠 Re-building context for {next_p.name}…", expanded=True) as rebuild_status:
-                                rebuild_status.write("Retrieving from selected libraries…")
+                            with st.status(f"🧠 Context + cache for {next_p.name}…", expanded=True) as step_ctx_status:
+                                step_ctx_status.write("Retrieving…")
                                 _t0 = time.perf_counter()
                                 step_context_xml, step_report = retrieve_and_build_context_multi(
                                     _rs, step_phrases, sel_ids, top_k_map
@@ -1441,19 +1387,17 @@ if current_page == "runner":
                                 last_transient_tokens = step_transient
                                 last_prompt_tokens = step_prompt
                                 last_total_input = step_kb + step_transient + step_prompt
-                                rebuild_status.write(f"✅ Context: {last_total_input:,} tokens")
-                                rebuild_status.write(f"⏱️ Context build time: {step_timing['build_context_s']:.2f}s")
-                                rebuild_status.update(label="✅ Context ready", state="complete")
-                            if len(step_context_xml) < min_size:
-                                st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: context too small for cache"
-                                break
-                            with st.status(f"⚡ Creating cache for {next_p.name}…", expanded=True) as cache_status:
-                                cache_status.write("Caching new context…")
+                                step_ctx_status.write(f"📊 {last_total_input:,} tokens · ⏱️ Retrieval: {step_timing['build_context_s']:.2f}s")
+                                if len(step_context_xml) < min_size:
+                                    step_ctx_status.update(label="Context too small", state="error")
+                                    st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: context too small for cache"
+                                    break
+                                step_ctx_status.write("Caching…")
                                 _t0 = time.perf_counter()
                                 step_cache_name = brain.create_gemini_cache(step_context_xml)
                                 step_timing["cache_create_s"] = time.perf_counter() - _t0
-                                cache_status.write(f"⏱️ Cache build time: {step_timing['cache_create_s']:.2f}s")
-                                cache_status.update(label="✅ Cache ready", state="complete")
+                                step_ctx_status.write(f"⏱️ Cache: {step_timing['cache_create_s']:.2f}s")
+                                step_ctx_status.update(label="✅ Context + cache ready", state="complete")
                             with st.spinner(step_label + "…"):
                                 if GEMINI_PACE_DELAY_SECONDS > 0:
                                     time.sleep(GEMINI_PACE_DELAY_SECONDS)
