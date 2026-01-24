@@ -773,6 +773,8 @@ if current_page == "edit_prompts":
             followon_p = db.get_prompt_by_id(verifier_id_value)
             if followon_p:
                 current_followon_str = f"{followon_p.id}: {followon_p.name}"
+        # Ensure widget sync when switching prompts
+        st.session_state["followon_select"] = current_followon_str or "— None —"
         followon_index = 0
         if current_followon_str and current_followon_str in followon_options:
             followon_index = followon_options.index(current_followon_str)
