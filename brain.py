@@ -32,6 +32,25 @@ class CacheExpiredError(RuntimeError):
 DEFAULT_MODEL = "gemini-3-flash-preview"
 CACHE_TTL_SECONDS = 3600  # 60 minutes
 
+# Override via env to reduce quota issues (e.g. GEMINI_MODEL=gemini-2.0-flash).
+def _effective_model() -> str:
+    v = (os.environ.get("GEMINI_MODEL") or "").strip()
+    return v if v else DEFAULT_MODEL
+
+
+EFFECTIVE_MODEL = _effective_model()
+
+# Optional delay (seconds) before generateContent to spread API burst; helps per-minute quotas.
+def _pace_delay_seconds() -> int:
+    try:
+        v = os.environ.get("GEMINI_PACE_DELAY_SECONDS", "0") or "0"
+        return max(0, int(v))
+    except Exception:
+        return 0
+
+
+GEMINI_PACE_DELAY_SECONDS = _pace_delay_seconds()
+
 # Token and context stats (for UI)
 CHARS_PER_TOKEN = 4  # rough: ~4 chars per token for English
 CHARS_PER_WORD = 5  # rough average including spaces/punctuation
@@ -257,7 +276,8 @@ def create_gemini_cache(context_xml: str, max_retries: int = 5, initial_delay: f
     logger.info(f"Creating Gemini cache (context size: {len(context_xml)} chars, TTL: {CACHE_TTL_SECONDS}s)")
     client = _client()
     ttl = f"{CACHE_TTL_SECONDS}s"
-    logger.debug(f"Building cache config with model {DEFAULT_MODEL}")
+    m = EFFECTIVE_MODEL
+    logger.debug(f"Building cache config with model {m}")
     config = types.CreateCachedContentConfig(
         contents=[
             types.Content(
@@ -276,7 +296,7 @@ def create_gemini_cache(context_xml: str, max_retries: int = 5, initial_delay: f
     for attempt in range(max_retries + 1):
         try:
             logger.debug(f"Calling client.caches.create() (attempt {attempt + 1}/{max_retries + 1})")
-            cache = client.caches.create(model=DEFAULT_MODEL, config=config)
+            cache = client.caches.create(model=m, config=config)
             logger.info(f"Cache created successfully: {cache.name} (after {attempt + 1} attempt(s))")
             return cache.name
         except errors.ServerError as e:
@@ -845,7 +865,7 @@ def run_agent(
         logger.error("Template error occurred at (around) char %d or later.\n%s", min(1312, len(prompt_template)), prompt_template[1300:1360])
         raise RuntimeError("Invalid template syntax in prompt. Check template text for backslashes or other special characters that may need escaping.") from e
     logger.debug(f"Rendered prompt length: {len(prompt)} chars")
-    m = model or DEFAULT_MODEL
+    m = model or EFFECTIVE_MODEL
     logger.debug(f"Using model: {m}")
     
     # Build content - either use cache or include context directly
@@ -967,10 +987,11 @@ def run_agent(
                         f"You've exceeded your per-minute token limit for **{m}**.\n\n"
                         f"**Solutions:**\n"
                         f"1. **Wait 1–2 minutes** – Quotas reset per minute; then try again.\n"
-                        f"2. **Reduce context size** – Your knowledge base is very large ({ctx_str}).\n"
-                        f"3. **Use caching** – You're already using cache; ensure fallback mode is off.\n"
-                        f"4. **Request quota increase** – Google Cloud Console → APIs & Services → Quotas.\n"
-                        f"5. **Check usage**: https://ai.dev/rate-limit\n\n"
+                        f"2. **Try another model** – Set env `GEMINI_MODEL=gemini-2.0-flash` (often higher quotas), then restart.\n"
+                        f"3. **Add pace delay** – Set env `GEMINI_PACE_DELAY_SECONDS=30` to wait before each generate call; helps spread usage.\n"
+                        f"4. **Reduce context size** – Your knowledge base is very large ({ctx_str}).\n"
+                        f"5. **Request quota increase** – Google Cloud Console → APIs & Services → Quotas.\n"
+                        f"6. **Check usage**: https://ai.dev/rate-limit\n\n"
                         f"**Technical details:** {e}"
                     )
                     raise RuntimeError(quota_msg) from e

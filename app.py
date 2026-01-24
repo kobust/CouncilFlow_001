@@ -4,6 +4,7 @@ Attleboro Council Agent: auth, Drive-backed knowledge base, prompt tasks, Gemini
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -51,7 +52,8 @@ except ImportError as import_err:
 import brain
 from brain import (
     CacheExpiredError,
-    DEFAULT_MODEL,
+    EFFECTIVE_MODEL,
+    GEMINI_PACE_DELAY_SECONDS,
     chars_to_tokens,
     expand_queries,
     format_context_usage,
@@ -769,7 +771,7 @@ if current_page == "edit_prompts" and not is_admin:
 # Model indicator
 st.sidebar.markdown("---")
 st.sidebar.caption("AI model")
-st.sidebar.markdown(f"**{DEFAULT_MODEL}**")
+st.sidebar.markdown(f"**{EFFECTIVE_MODEL}**")
 
 # RAG knowledge base loading (runs once at boot)
 if not st.session_state.get("kb_loading_started") and folder_id:
@@ -817,6 +819,7 @@ if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb
             logger.info(f"Cleared {n} RAG index cache file(s)")
         st.session_state["gemini_cache_name"] = None
         st.session_state["gemini_cache_folder_id"] = None
+        st.session_state["run_cache_key"] = None
         st.session_state["kb_loading_started"] = False
         st.session_state["kb_loaded"] = False
         st.session_state["kb_load_error"] = None
@@ -1102,9 +1105,9 @@ if current_page == "runner":
                     status_container = st.status("🔍 Planning retrieval…", expanded=True)
                     with status_container:
                         uc_tok = chars_to_tokens(len(user_content))
-                        max_ctx = model_max_context(DEFAULT_MODEL)
+                        max_ctx = model_max_context(EFFECTIVE_MODEL)
                         status_container.write(f"📊 **User input**: {uc_tok:,} tokens — {format_reading_equivalent(uc_tok)}")
-                        status_container.write(f"📐 **Model**: {DEFAULT_MODEL} (max {max_ctx:,} tokens)")
+                        status_container.write(f"📐 **Model**: {EFFECTIVE_MODEL} (max {max_ctx:,} tokens)")
                         _t0 = time.perf_counter()
                         if USE_RETRIEVAL_PLANNER:
                             status_container.write("📋 Deciding which libraries to search and how much to retrieve…")
@@ -1121,7 +1124,7 @@ if current_page == "runner":
                                 status_container.write("✅ No libraries selected.")
                         else:
                             sel_ids, top_k_map = get_default_plan(_rs)
-                            status_container.write("✅ Using all libraries (planner disabled).")
+                            status_container.write("✅ Using all libraries.")
                         timings["plan_retrieval_s"] = time.perf_counter() - _t0
                         status_container.write(f"⏱️ Planning time: {timings['plan_retrieval_s']:.2f}s")
                         status_container.update(label="✅ Retrieval planned", state="complete")
@@ -1153,7 +1156,7 @@ if current_page == "runner":
                         timings["build_context_s"] = time.perf_counter() - _t0
                         total_len = len(context_xml)
                         kb_tokens = chars_to_tokens(total_len)
-                        max_ctx = model_max_context(DEFAULT_MODEL)
+                        max_ctx = model_max_context(EFFECTIVE_MODEL)
                         total_input_tokens = kb_tokens + prompt_tokens + transient_tokens
                         pct_used = (total_input_tokens / max_ctx * 100) if max_ctx else 0
                         kb_ratio = (kb_tokens / total_input_tokens * 100) if total_input_tokens else 0
@@ -1163,7 +1166,7 @@ if current_page == "runner":
                         status_container.write(f"📊 **Context (cached KB)**: {kb_tokens:,} tokens (~{total_len:,} chars)")
                         status_container.write(f"📝 **User data**: {transient_tokens:,} tokens · **Prompt wrapper**: {prompt_tokens:,} tokens")
                         status_container.write(f"⚙️ **Breakdown**: {kb_ratio:.1f}% KB | {user_ratio:.1f}% user | {prompt_ratio:.1f}% prompt")
-                        status_container.write(f"📐 **Total input**: {total_input_tokens:,} tokens — {format_context_usage(total_input_tokens, max_ctx, DEFAULT_MODEL)}")
+                        status_container.write(f"📐 **Total input**: {total_input_tokens:,} tokens — {format_context_usage(total_input_tokens, max_ctx, EFFECTIVE_MODEL)}")
                         status_container.write(f"📖 **Real-world**: {format_reading_equivalent(total_input_tokens)}")
                         logger.info(f"RAG context built: {total_len:,} chars, {total_input_tokens:,} est. input tokens")
                         if retrieval_report:
@@ -1187,17 +1190,30 @@ if current_page == "runner":
                         st.error("Context is too small for the AI cache. Add more core documents or use additional libraries, then try again.")
                         st.stop()
                     cache_folder = st.session_state.get("gemini_cache_folder_id")
-                    cache_name = None  # RAG context is query-dependent; always create new cache per run
-                    
+                    cache_name = None
+                    cache_reused = False
+
+                    # Reuse Gemini cache when same folder + task + user input (context identical)
+                    _run_cache_key = hashlib.sha256(
+                        f"{folder_id}|{selected.id}|{(user_content or '')}".encode()
+                    ).hexdigest()[:32]
+                    _last_run_key = st.session_state.get("run_cache_key")
+                    _last_cache_name = st.session_state.get("gemini_cache_name")
+                    if _last_run_key == _run_cache_key and _last_cache_name and cache_folder == folder_id:
+                        cache_name = _last_cache_name
+                        timings["cache_create_s"] = 0.0
+                        cache_reused = True
+                        logger.info("Reusing Gemini cache (same task + input)")
+
                     if cache_name is None or cache_folder != folder_id:
                         logger.info("Creating new Gemini cache")
                         _ctx_tok = chars_to_tokens(len(context_xml))
-                        _max_ctx = model_max_context(DEFAULT_MODEL)
+                        _max_ctx = model_max_context(EFFECTIVE_MODEL)
                         status_container = st.status("⚡ Creating AI context cache…", expanded=True)
                         cache_created = False
                         try:
                             with status_container:
-                                st.write(f"📐 Caching {_ctx_tok:,} tokens ({format_context_usage(_ctx_tok, _max_ctx, DEFAULT_MODEL)})…")
+                                st.write(f"📐 Caching {_ctx_tok:,} tokens ({format_context_usage(_ctx_tok, _max_ctx, EFFECTIVE_MODEL)})…")
                                 _t0 = time.perf_counter()
                                 
                                 def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
@@ -1257,6 +1273,7 @@ if current_page == "runner":
                         if cache_created:
                             st.session_state["gemini_cache_name"] = cache_name
                             st.session_state["gemini_cache_folder_id"] = folder_id
+                            st.session_state["run_cache_key"] = _run_cache_key
                             logger.info(f"Cache created: {cache_name}")
                     else:
                         logger.debug(f"Reusing existing cache: {cache_name}")
@@ -1267,8 +1284,13 @@ if current_page == "runner":
                     for retry_attempt in range(max_retries + 1):
                         run_label = "🚀 Model thinking…" if retry_attempt == 0 else "Cache expired, recreating and retrying…"
                         with st.status(run_label, expanded=True) as run_status:
-                            run_status.write(f"📐 **Input**: {total_input_tokens:,} tokens ({format_context_usage(total_input_tokens, max_ctx, DEFAULT_MODEL)})")
+                            run_status.write(f"📐 **Input**: {total_input_tokens:,} tokens ({format_context_usage(total_input_tokens, max_ctx, EFFECTIVE_MODEL)})")
                             run_status.write(f"📖 {format_reading_equivalent(total_input_tokens)}")
+                            if cache_reused:
+                                run_status.write("✓ **Reused existing cache** (same task + input)")
+                            if GEMINI_PACE_DELAY_SECONDS > 0:
+                                run_status.write(f"⏳ Pacing {GEMINI_PACE_DELAY_SECONDS}s to avoid rate limits…")
+                                time.sleep(GEMINI_PACE_DELAY_SECONDS)
                             run_status.write("⏳ Calling model…")
                             logger.info(f"Calling brain.run_agent() (attempt {retry_attempt + 1}/{max_retries + 1})")
                             _t0 = time.perf_counter()
@@ -1340,7 +1362,7 @@ if current_page == "runner":
                         "prompt_tokens": prompt_tokens,
                         "max_context": max_ctx,
                         "output_tokens": output_tokens,
-                        "model": DEFAULT_MODEL,
+                        "model": EFFECTIVE_MODEL,
                         "timings": timings,
                     }
                     
@@ -1372,7 +1394,12 @@ if current_page == "runner":
                         step_label = f"Follow-on: {next_p.name}"
                         try:
                             step_timing: dict[str, float] = {"name": next_p.name}
-                            with st.status(f"🔍 Re-planning retrieval for {next_p.name}…", expanded=True) as replan_status:
+                            plan_status_title = (
+                                f"🔍 Re-planning retrieval for {next_p.name}…"
+                                if USE_RETRIEVAL_PLANNER
+                                else f"🔍 Preparing retrieval for {next_p.name}…"
+                            )
+                            with st.status(plan_status_title, expanded=True) as replan_status:
                                 _t0 = time.perf_counter()
                                 if USE_RETRIEVAL_PLANNER:
                                     replan_status.write("Deciding libraries and top_k from previous output…")
@@ -1384,10 +1411,13 @@ if current_page == "runner":
                                         replan_status.write("✅ " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]))
                                 else:
                                     sel_ids, top_k_map = get_default_plan(_rs)
-                                    replan_status.write("✅ Using all libraries (planner disabled).")
+                                    replan_status.write("✅ Using all libraries.")
                                 step_timing["plan_retrieval_s"] = time.perf_counter() - _t0
-                                replan_status.write(f"⏱️ Planning time: {step_timing['plan_retrieval_s']:.2f}s")
-                                replan_status.update(label="✅ Re-planned", state="complete")
+                                replan_status.write(f"⏱️ Setup time: {step_timing['plan_retrieval_s']:.2f}s")
+                                replan_status.update(
+                                    label="✅ Re-planned" if USE_RETRIEVAL_PLANNER else "✅ Ready",
+                                    state="complete",
+                                )
                             if USE_QUERY_EXPANSION:
                                 step_phrases = expand_queries(
                                     next_p.name, next_p.template_text, accumulated
@@ -1425,6 +1455,8 @@ if current_page == "runner":
                                 cache_status.write(f"⏱️ Cache build time: {step_timing['cache_create_s']:.2f}s")
                                 cache_status.update(label="✅ Cache ready", state="complete")
                             with st.spinner(step_label + "…"):
+                                if GEMINI_PACE_DELAY_SECONDS > 0:
+                                    time.sleep(GEMINI_PACE_DELAY_SECONDS)
                                 retry = 0
                                 while True:
                                     try:

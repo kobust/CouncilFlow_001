@@ -23,7 +23,7 @@ from brain import (
     rerank_chunks_llm,
     run_retrieval_planner,
 )
-from brain import DEFAULT_MODEL as _PLANNER_MODEL
+from brain import EFFECTIVE_MODEL as _EFFECTIVE_MODEL
 from rag import (
     CHUNK_MAX_CHARS,
     build_library_index,
@@ -172,7 +172,7 @@ def plan_retrieval(
         })
 
     # Context budget: reserve tokens for user content, prompt, output margin; use rest for KB chunks
-    max_ctx = model_max_context(_PLANNER_MODEL)
+    max_ctx = model_max_context(_EFFECTIVE_MODEL)
     user_tokens = chars_to_tokens(len(user_content or ""))
     prompt_tokens = chars_to_tokens(len(template_text or "") + 80)
     margin = int(0.10 * max_ctx)
@@ -193,6 +193,7 @@ def plan_retrieval(
         user_content=user_content,
         library_metadata=library_metadata,
         context_budget_section=context_budget_section,
+        model=_EFFECTIVE_MODEL,
     )
 
     selected: list[str] = []
