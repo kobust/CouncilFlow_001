@@ -14,7 +14,7 @@ from paths import data_path
 
 logger = logging.getLogger(__name__)
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 _CACHE_DIR: Path | None = None
 
 

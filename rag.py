@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 CHUNK_MAX_CHARS = 1800
-CHUNK_OVERLAP = 150
+CHUNK_OVERLAP = 220  # larger overlap improves context continuity across chunk boundaries
 
 
 def chunk_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -82,9 +82,29 @@ def chunk_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK
     return chunks
 
 
+_BM25_STEMMER = None
+
+
+def _get_bm25_stemmer():
+    """Lazy-init Snowball stemmer for BM25 tokenization."""
+    global _BM25_STEMMER
+    if _BM25_STEMMER is None:
+        try:
+            from nltk.stem import SnowballStemmer
+            _BM25_STEMMER = SnowballStemmer("english")
+        except Exception as e:
+            logger.warning("BM25 stemming unavailable (%s), using raw tokens", e)
+            _BM25_STEMMER = False  # type: ignore[assignment]
+    return _BM25_STEMMER
+
+
 def _tokenize_bm25(text: str) -> list[str]:
-    """Simple tokenization for BM25: lowercase, alphanumeric tokens."""
-    return re.findall(r"\w+", text.lower())
+    """Tokenization for BM25: lowercase, alphanumeric tokens, optional stemming."""
+    tokens = re.findall(r"\w+", text.lower())
+    stemmer = _get_bm25_stemmer()
+    if stemmer is False:
+        return tokens
+    return [stemmer.stem(t) for t in tokens]
 
 
 # -----------------------------------------------------------------------------
@@ -205,6 +225,53 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     if n == 0:
         return 0.0
     return float(np.dot(ax, bx) / n)
+
+
+def dedupe_chunks(
+    chunks: list[dict[str, Any]],
+    *,
+    similarity_threshold: float = 0.95,
+    use_embedding: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Deduplicate chunks by similarity, preserving order (RRF relevance).
+    Iterate in order; skip a chunk if too similar to any already selected.
+    """
+    if not chunks:
+        return []
+    selected: list[dict[str, Any]] = []
+    for c in chunks:
+        emb = c.get("embedding") or []
+        if use_embedding and emb:
+            too_similar = False
+            for s in selected:
+                other = s.get("embedding") or []
+                if other and _cosine_sim(emb, other) >= similarity_threshold:
+                    too_similar = True
+                    break
+            if too_similar:
+                continue
+        else:
+            # Lexical fallback: Jaccard on tokenized text
+            tok = set(re.findall(r"\w+", (c.get("text") or "").lower()))
+            if not tok:
+                selected.append(c)
+                continue
+            too_similar = False
+            for s in selected:
+                stok = set(re.findall(r"\w+", (s.get("text") or "").lower()))
+                if not stok:
+                    continue
+                inter = len(tok & stok)
+                union = len(tok | stok)
+                jaccard = inter / union if union else 0.0
+                if jaccard >= similarity_threshold:
+                    too_similar = True
+                    break
+            if too_similar:
+                continue
+        selected.append(c)
+    return selected
 
 
 def _rrf_score(ranks: list[int], k: int = 60) -> float:

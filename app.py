@@ -53,6 +53,7 @@ from brain import (
     CacheExpiredError,
     DEFAULT_MODEL,
     chars_to_tokens,
+    expand_queries,
     format_context_usage,
     format_reading_equivalent,
     model_max_context,
@@ -60,7 +61,11 @@ from brain import (
 import db
 from librarian import get_cached_file_list, get_cached_folder_info
 from rag_cache import clear_disk_cache_for_folder
-from rag_loader import get_cached_rag_state, plan_retrieval, retrieve_and_build_context
+from rag_loader import (
+    get_cached_rag_state,
+    plan_retrieval,
+    retrieve_and_build_context_multi,
+)
 from paths import data_path, repo_path
 
 # Configure logging
@@ -1112,16 +1117,24 @@ if current_page == "runner":
                             status_container.write("✅ No libraries selected.")
                         status_container.write(f"⏱️ Planning time: {timings['plan_retrieval_s']:.2f}s")
                         status_container.update(label="✅ Retrieval planned", state="complete")
-                    query = f"{selected.name}\n\n{user_content[:4000]}"
+                    query_phrases = expand_queries(
+                        selected.name, selected.template_text, user_content
+                    )
                     status_container = st.status("🧠 Building context…", expanded=True)
                     with status_container:
                         status_container.write("📚 Assembling knowledge base + user content…")
+                        if len(query_phrases) > 1:
+                            status_container.write(
+                                f"🔍 Query expansion: {len(query_phrases)} search phrases"
+                            )
                         transient_len = len(user_content)
                         transient_tokens = chars_to_tokens(transient_len)
                         prompt_wrapper = len(selected.template_text) + 80  # "---\\nSubject...\\n" etc.
                         prompt_tokens = chars_to_tokens(prompt_wrapper)
                         _t0 = time.perf_counter()
-                        context_xml, retrieval_report = retrieve_and_build_context(_rs, query, sel_ids, top_k_map)
+                        context_xml, retrieval_report = retrieve_and_build_context_multi(
+                            _rs, query_phrases, sel_ids, top_k_map
+                        )
                         timings["build_context_s"] = time.perf_counter() - _t0
                         total_len = len(context_xml)
                         kb_tokens = chars_to_tokens(total_len)
@@ -1356,12 +1369,14 @@ if current_page == "runner":
                                     replan_status.write("✅ " + ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]))
                                 replan_status.write(f"⏱️ Planning time: {step_timing['plan_retrieval_s']:.2f}s")
                                 replan_status.update(label="✅ Re-planned", state="complete")
-                            step_query = f"{next_p.name}\n\n{accumulated[:4000]}"
+                            step_phrases = expand_queries(
+                                next_p.name, next_p.template_text, accumulated
+                            )
                             with st.status(f"🧠 Re-building context for {next_p.name}…", expanded=True) as rebuild_status:
                                 rebuild_status.write("Retrieving from selected libraries…")
                                 _t0 = time.perf_counter()
-                                step_context_xml, step_report = retrieve_and_build_context(
-                                    _rs, step_query, sel_ids, top_k_map
+                                step_context_xml, step_report = retrieve_and_build_context_multi(
+                                    _rs, step_phrases, sel_ids, top_k_map
                                 )
                                 step_timing["build_context_s"] = time.perf_counter() - _t0
                                 last_retrieval_report = step_report

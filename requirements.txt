@@ -17,3 +17,4 @@ pillow
 html2text
 rank-bm25
 numpy
+nltk

@@ -16,8 +16,21 @@ from librarian import (
     fetch_and_extract_files,
     list_core_and_libraries,
 )
-from brain import run_retrieval_planner
-from rag import build_library_index, build_retrieved_xml, retrieve_hybrid
+from brain import (
+    chars_to_tokens,
+    expand_queries,
+    model_max_context,
+    rerank_chunks_llm,
+    run_retrieval_planner,
+)
+from brain import DEFAULT_MODEL as _PLANNER_MODEL
+from rag import (
+    CHUNK_MAX_CHARS,
+    build_library_index,
+    build_retrieved_xml,
+    dedupe_chunks,
+    retrieve_hybrid,
+)
 from rag_cache import (
     clear_disk_cache_for_folder,
     load_library_index_from_disk,
@@ -28,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 35
 TOP_K_MIN, TOP_K_MAX = 1, 100
+RERANK_ENABLED = True
+RERANK_FACTOR = 2
 
 
 def _embed_fn(texts: list[str]):
@@ -151,11 +166,28 @@ def plan_retrieval(
             "file_descriptors": idx.get("file_descriptors", []),
         })
 
+    # Context budget: reserve tokens for user content, prompt, output margin; use rest for KB chunks
+    max_ctx = model_max_context(_PLANNER_MODEL)
+    user_tokens = chars_to_tokens(len(user_content or ""))
+    prompt_tokens = chars_to_tokens(len(template_text or "") + 80)
+    margin = int(0.10 * max_ctx)
+    kb_budget_tokens = max(0, max_ctx - user_tokens - prompt_tokens - margin)
+    tokens_per_chunk = chars_to_tokens(CHUNK_MAX_CHARS)
+    budget_chunks = (kb_budget_tokens // tokens_per_chunk) if tokens_per_chunk else 500
+    context_budget_section = (
+        "Context budget:\n"
+        f"- Model context limit: {max_ctx:,} tokens.\n"
+        f"- Reserve {user_tokens:,} for user content, {prompt_tokens:,} for prompt.\n"
+        f"- Use approximately {kb_budget_tokens:,} tokens for retrieved KB chunks (~{budget_chunks} chunks).\n"
+        "- Select libraries and top_k so total retrieved chunks stay within this budget. Prefer staying under; do not exceed."
+    )
+
     plan = run_retrieval_planner(
         task_name=task_name,
         task_description=template_text,
         user_content=user_content,
         library_metadata=library_metadata,
+        context_budget_section=context_budget_section,
     )
 
     selected: list[str] = []
@@ -213,7 +245,11 @@ def retrieve_and_build_context(
         name = lib["name"]
         idx = lib["index"]
         k = top_k_per_library.get(lib["id"], DEFAULT_TOP_K) if use_map else top_k_per_library
-        chunks = retrieve_hybrid(query, idx, k, _embed_query_fn)
+        retrieve_k = (k * RERANK_FACTOR) if RERANK_ENABLED else k
+        chunks = retrieve_hybrid(query, idx, retrieve_k, _embed_query_fn)
+        chunks = dedupe_chunks(chunks, similarity_threshold=0.95, use_embedding=True)
+        if RERANK_ENABLED and len(chunks) > k:
+            chunks = rerank_chunks_llm(query, chunks, k)
         if chunks:
             parts.append(build_retrieved_xml(name, chunks))
         # Build per-library report: aggregate chunks by (file_name, link)
@@ -223,6 +259,69 @@ def retrieve_and_build_context(
             link = c.get("link") or ""
             key = (fn, link)
             by_file[key] = by_file.get(key, 0) + 1
+        sources = [
+            {"file_name": fn, "link": link, "chunk_count": cnt}
+            for (fn, link), cnt in sorted(by_file.items(), key=lambda x: -x[1])
+        ]
+        report.append({
+            "library_name": name,
+            "top_k": k,
+            "chunks_retrieved": len(chunks),
+            "sources": sources,
+        })
+    return "\n\n".join(parts), report
+
+
+_RRF_K = 60
+
+
+def retrieve_and_build_context_multi(
+    rag_state: dict[str, Any],
+    queries: list[str],
+    selected_library_ids: list[str],
+    top_k_per_library: int | dict[str, int],
+) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Multi-query retrieval: run hybrid retrieval per query, merge via RRF per library,
+    dedupe, then build context = Core + retrieved.
+    """
+    core = rag_state["core_xml"]
+    parts = [core]
+    report: list[dict[str, Any]] = []
+    use_map = isinstance(top_k_per_library, dict)
+    for lib in rag_state["libraries"]:
+        if lib["id"] not in selected_library_ids:
+            continue
+        name = lib["name"]
+        idx = lib["index"]
+        k = top_k_per_library.get(lib["id"], DEFAULT_TOP_K) if use_map else top_k_per_library
+        retrieve_k = max(k * 2, k * len(queries))
+        if RERANK_ENABLED:
+            retrieve_k = max(retrieve_k, k * RERANK_FACTOR)
+        rrf_scores: dict[tuple[Any, ...], float] = {}
+        chunk_ref: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+        for q in queries:
+            run = retrieve_hybrid(q, idx, retrieve_k, _embed_query_fn)
+            for rank, c in enumerate(run, 1):
+                key = (c.get("chunk_id"), c.get("file_id"))
+                rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (_RRF_K + rank)
+                chunk_ref[key] = c
+
+        take = (k * RERANK_FACTOR) if RERANK_ENABLED else k
+        ordered = sorted(chunk_ref.keys(), key=lambda x: -rrf_scores[x])[:take]
+        chunks = [chunk_ref[key] for key in ordered]
+        chunks = dedupe_chunks(chunks, similarity_threshold=0.95, use_embedding=True)
+        if RERANK_ENABLED and len(chunks) > k:
+            main_query = queries[0] if queries else ""
+            chunks = rerank_chunks_llm(main_query, chunks, k)
+        if chunks:
+            parts.append(build_retrieved_xml(name, chunks))
+        by_file: dict[tuple[str, str], int] = {}
+        for c in chunks:
+            fn = c.get("file_name") or "?"
+            link = c.get("link") or ""
+            by_file[(fn, link)] = by_file.get((fn, link), 0) + 1
         sources = [
             {"file_name": fn, "link": link, "chunk_count": cnt}
             for (fn, link), cnt in sorted(by_file.items(), key=lambda x: -x[1])

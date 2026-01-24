@@ -486,6 +486,8 @@ RETRIEVAL_PLANNER_PROMPT = """You are a retrieval planner for a RAG system. Give
 
 {{ library_catalog }}
 
+{{ context_budget }}
+
 Analysis task name: {{ task_name }}
 
 Task description or instructions (excerpt):
@@ -504,6 +506,7 @@ Rules:
 - If the task or documents clearly need legal/statutory material, prioritize libraries that contain law (e.g. MGL) and use larger top_k (50–100).
 - Prefer being inclusive: include 2–4 relevant libraries when applicable, with top_k 30–80 each for important ones.
 - Total chunks across all libraries should typically be 80–300 (or more when the task clearly needs broad context). Use the context budget aggressively.
+- Never exceed the chunk budget above. Stay at or under the approximate chunk limit. Prioritize libraries that clearly matter for the task.
 """
 
 PLANNER_MAX_FILES_PER_LIB = 25
@@ -542,10 +545,12 @@ def run_retrieval_planner(
     *,
     model: str | None = None,
     max_retries: int = 2,
+    context_budget_section: str | None = None,
 ) -> dict[str, Any] | None:
     """
     LLM call (no KB cache) to decide which libraries to search and top_k per library.
     library_metadata: list of {name, library_description?, file_descriptors?: [{name, summary}]}.
+    context_budget_section: optional paragraph describing token/chunk budget for retrieved KB.
     Returns {"libraries": [{"name": str, "top_k": int}, ...]} or None on failure.
     """
     if not library_metadata:
@@ -554,9 +559,11 @@ def run_retrieval_planner(
     client = _client()
     m = model or DEFAULT_MODEL
     catalog = _build_library_catalog(library_metadata)
+    budget_text = (context_budget_section or "").strip() or "No explicit context budget; use judgment to stay within model limits."
     prompt = (
         RETRIEVAL_PLANNER_PROMPT.strip()
         .replace("{{ library_catalog }}", catalog)
+        .replace("{{ context_budget }}", budget_text)
         .replace("{{ task_name }}", task_name)
         .replace("{{ task_description }}", (task_description or "")[:2500])
         .replace("{{ user_content }}", (user_content or "")[:3500])
@@ -590,6 +597,144 @@ def run_retrieval_planner(
             logger.warning(f"Planner error: {e}")
             return None
     return None
+
+
+# -----------------------------------------------------------------------------
+# Query expansion (LLM-generated search phrases)
+# -----------------------------------------------------------------------------
+
+EXPAND_QUERIES_PROMPT = """Given the analysis task and user-provided content below, produce 3–5 short search phrases (each a few words to a short sentence) that would help retrieve relevant passages from a document corpus. Focus on key concepts, entities, and legal or policy terms.
+
+Task: {{ task_name }}
+
+Task description (excerpt): {{ task_description }}
+
+User content (excerpt): {{ user_content }}
+
+Respond with valid JSON only, no other text. Use this exact structure:
+{"phrases": ["phrase one", "phrase two", "phrase three", ...]}"""
+
+
+def expand_queries(
+    task_name: str,
+    template_text: str,
+    user_content: str,
+    *,
+    model: str | None = None,
+) -> list[str]:
+    """
+    Generate 3–5 search phrases from task + user content via LLM.
+    Returns list of phrases, or fallback [task_name + user_content excerpt] on failure.
+    """
+    fallback = [f"{task_name}\n\n{(user_content or '')[:2000]}"]
+    try:
+        client = _client()
+        m = model or DEFAULT_MODEL
+        prompt = (
+            EXPAND_QUERIES_PROMPT.strip()
+            .replace("{{ task_name }}", (task_name or "")[:500])
+            .replace("{{ task_description }}", (template_text or "")[:1500])
+            .replace("{{ user_content }}", (user_content or "")[:2500])
+        )
+        config = types.GenerateContentConfig()
+        contents = [types.Content(role="user", parts=[_text_part(prompt)])]
+        r = client.models.generate_content(model=m, contents=contents, config=config)
+        text = (r.text or "").strip()
+        parsed = _parse_json_robust(text)
+        if not parsed or not isinstance(parsed.get("phrases"), list):
+            logger.warning("expand_queries: invalid or missing phrases, using fallback")
+            return fallback
+        phrases = [str(p).strip() for p in parsed["phrases"] if p]
+        if not phrases:
+            return fallback
+        # Dedupe and cap length
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in phrases:
+            key = p[:200]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+            if len(out) >= 5:
+                break
+        logger.info("expand_queries: %d phrases", len(out))
+        return out
+    except Exception as e:
+        logger.warning("expand_queries failed: %s, using fallback", e)
+        return fallback
+
+
+# -----------------------------------------------------------------------------
+# Re-ranking (LLM-based)
+# -----------------------------------------------------------------------------
+
+RERANK_BATCH_SIZE = 15
+RERANK_MAX_CHUNK_CHARS = 800
+
+
+def rerank_chunks_llm(
+    query: str,
+    chunks: list[dict[str, Any]],
+    top_k: int,
+    *,
+    model: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Re-rank chunks by LLM relevance scoring (1–5). Returns top_k chunks in descending
+    relevance order. On parse failure, treats score as 1. Falls back to original order
+    if all batches fail.
+    """
+    if not chunks or top_k <= 0:
+        return chunks[:top_k]
+    if len(chunks) <= top_k:
+        return chunks
+
+    client = _client()
+    m = model or DEFAULT_MODEL
+    scored: list[tuple[float, dict[str, Any]]] = []
+    prompt_tpl = (
+        "Rate each passage's relevance to the query from 1 (irrelevant) to 5 (highly relevant). "
+        "Reply with valid JSON only: {\"scores\": [n1, n2, ...]} in the same order as the passages.\n\n"
+        "Query: {{ query }}\n\nPassages:\n{{ passages }}"
+    )
+
+    for start in range(0, len(chunks), RERANK_BATCH_SIZE):
+        batch = chunks[start : start + RERANK_BATCH_SIZE]
+        passages = []
+        for i, c in enumerate(batch, 1):
+            t = (c.get("text") or "")[:RERANK_MAX_CHUNK_CHARS]
+            if len((c.get("text") or "")) > RERANK_MAX_CHUNK_CHARS:
+                t += "..."
+            passages.append(f"{i}. {t}")
+        q = (query or "")[:1500]
+        prompt = prompt_tpl.replace("{{ query }}", q).replace(
+            "{{ passages }}", "\n\n".join(passages)
+        )
+        config = types.GenerateContentConfig()
+        contents = [types.Content(role="user", parts=[_text_part(prompt)])]
+        try:
+            r = client.models.generate_content(model=m, contents=contents, config=config)
+            text = (r.text or "").strip()
+            parsed = _parse_json_robust(text)
+            scores = parsed.get("scores") if isinstance(parsed, dict) else None
+            if isinstance(scores, list) and len(scores) >= len(batch):
+                for i, c in enumerate(batch):
+                    try:
+                        sc = int(scores[i])
+                    except (TypeError, ValueError):
+                        sc = 1
+                    scored.append((min(5, max(1, sc)), c))
+            else:
+                for c in batch:
+                    scored.append((1.0, c))
+        except Exception as e:
+            logger.warning("rerank batch failed: %s, using score 1", e)
+            for c in batch:
+                scored.append((1.0, c))
+
+    scored.sort(key=lambda x: -x[0])
+    return [c for _, c in scored[:top_k]]
 
 
 # -----------------------------------------------------------------------------
