@@ -65,6 +65,78 @@ def _pace_delay_seconds() -> int:
 
 GEMINI_PACE_DELAY_SECONDS = _pace_delay_seconds()
 
+# Rate limiting: track requests per minute to avoid 429 errors
+# Gemini typically allows 15-60 requests per minute depending on model and tier
+# IMPORTANT: Rate limits are PER API KEY, not per process!
+# If running multiple instances (dev + prod), they share the same quota.
+# Solution: Use different API keys or reduce GEMINI_RATE_LIMIT_RPM proportionally.
+_last_request_times: list[float] = []
+_RATE_LIMIT_REQUESTS_PER_MINUTE = 15  # Conservative default (can be overridden)
+_RATE_LIMIT_WINDOW_SECONDS = 60
+_rate_limit_warning_shown = False
+
+
+def _apply_rate_limit() -> None:
+    """
+    Apply rate limiting before GenerateContent calls to avoid 429 errors.
+    Tracks requests per minute and adds delays if needed.
+    
+    WARNING: This rate limiter is PER-PROCESS. If you're running multiple
+    instances (e.g., local dev + production) with the same API key, they will
+    share the same quota. You should either:
+    1. Use different API keys for each instance, OR
+    2. Set GEMINI_RATE_LIMIT_RPM to (total_limit / num_instances)
+    """
+    import time
+    
+    # Warn once about multi-instance usage
+    global _rate_limit_warning_shown
+    if not _rate_limit_warning_shown:
+        num_instances = os.environ.get("COUNCILFLOW_INSTANCE_COUNT", "")
+        if num_instances:
+            try:
+                count = int(num_instances)
+                if count > 1:
+                    logger.warning(
+                        f"⚠️  MULTI-INSTANCE RATE LIMITING: {count} instances detected. "
+                        f"Rate limits are PER API KEY, not per process. "
+                        f"Consider setting GEMINI_RATE_LIMIT_RPM to (total_limit / {count}) "
+                        f"or use different API keys for each instance."
+                    )
+            except ValueError:
+                pass
+        _rate_limit_warning_shown = True
+    
+    # Get configured rate limit (default conservative)
+    # If multiple instances, this should be set to (total_limit / num_instances)
+    rate_limit = int(os.environ.get("GEMINI_RATE_LIMIT_RPM", str(_RATE_LIMIT_REQUESTS_PER_MINUTE)) or str(_RATE_LIMIT_REQUESTS_PER_MINUTE))
+    
+    now = time.time()
+    global _last_request_times
+    
+    # Remove requests older than 1 minute
+    _last_request_times = [t for t in _last_request_times if now - t < _RATE_LIMIT_WINDOW_SECONDS]
+    
+    # If we're at the limit, wait until the oldest request is 1 minute old
+    if len(_last_request_times) >= rate_limit:
+        oldest_time = min(_last_request_times)
+        wait_time = _RATE_LIMIT_WINDOW_SECONDS - (now - oldest_time) + 0.5  # Add 0.5s buffer
+        if wait_time > 0:
+            logger.debug(f"Rate limit: {len(_last_request_times)}/{rate_limit} requests in last minute, waiting {wait_time:.1f}s")
+            time.sleep(wait_time)
+            # Clean up again after waiting
+            now = time.time()
+            _last_request_times = [t for t in _last_request_times if now - t < _RATE_LIMIT_WINDOW_SECONDS]
+    
+    # Apply pace delay if configured
+    if GEMINI_PACE_DELAY_SECONDS > 0:
+        logger.debug(f"Applying pace delay: {GEMINI_PACE_DELAY_SECONDS}s")
+        time.sleep(GEMINI_PACE_DELAY_SECONDS)
+    
+    # Record this request
+    _last_request_times.append(time.time())
+
+
 # Token and context stats (for UI)
 CHARS_PER_TOKEN = 4  # rough: ~4 chars per token for English
 CHARS_PER_WORD = 5  # rough average including spaces/punctuation
@@ -715,6 +787,9 @@ def summarize_files_batch(
         batch_summaries: list[str] = []
         for attempt in range(3):
             try:
+                # Apply rate limiting before GenerateContent call
+                _apply_rate_limit()
+                
                 r = client.models.generate_content(model=m, contents=contents, config=config)
                 text = (r.text or "").strip()
                 parsed = _parse_json_robust(text)
@@ -836,6 +911,9 @@ def describe_library(
     )
     contents = [types.Content(role="user", parts=[_text_part(prompt)])]
     try:
+        # Apply rate limiting before GenerateContent call
+        _apply_rate_limit()
+        
         r = client.models.generate_content(model=DEFAULT_MODEL, contents=contents, config=config)
         description = (r.text or "").strip() or f"Library '{library_name}' with {len(file_descriptors)} files."
         
@@ -990,6 +1068,9 @@ def run_retrieval_planner(
     delay = 1.0
     for attempt in range(max_retries + 1):
         try:
+            # Apply rate limiting before GenerateContent call
+            _apply_rate_limit()
+            
             logger.info(f"Running retrieval planner (attempt {attempt + 1}/{max_retries + 1})")
             r = client.models.generate_content(model=m, contents=contents, config=config)
             text = (r.text or "").strip()
@@ -1101,6 +1182,10 @@ def expand_queries(
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
         contents = [types.Content(role="user", parts=[_text_part(prompt)])]
+        
+        # Apply rate limiting before GenerateContent call
+        _apply_rate_limit()
+        
         r = client.models.generate_content(model=m, contents=contents, config=config)
         text = (r.text or "").strip()
         parsed = _parse_json_robust(text)
@@ -1195,6 +1280,9 @@ def rerank_chunks_llm(
         )
         contents = [types.Content(role="user", parts=[_text_part(prompt)])]
         try:
+            # Apply rate limiting before GenerateContent call
+            _apply_rate_limit()
+            
             r = client.models.generate_content(model=m, contents=contents, config=rerank_config)
             text = (r.text or "").strip()
             parsed = _parse_json_robust(text)
@@ -1434,6 +1522,9 @@ def run_agent(
     
     for attempt in range(max_retries + 1):
         try:
+            # Apply rate limiting before each GenerateContent call
+            _apply_rate_limit()
+            
             logger.debug(f"Calling client.models.generate_content() (attempt {attempt + 1}/{max_retries + 1})")
             response = client.models.generate_content(
                 model=m,

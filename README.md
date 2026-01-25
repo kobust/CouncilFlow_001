@@ -81,6 +81,8 @@ Open the URL shown in the terminal. Log in with a user from `config.yaml`, conne
 | `GEMINI_MODEL` | Main model for the agent (default: `gemini-3-flash-preview`). e.g. `gemini-2.0-flash` |
 | `GEMINI_PLANNER_MODEL` | Model for the retrieval planner (default: `gemini-2.0-flash`) |
 | `GEMINI_PACE_DELAY_SECONDS` | Seconds to wait before each GenerateContent call; helps with rate limits (default: `0`) |
+| `GEMINI_RATE_LIMIT_RPM` | Requests per minute limit for rate limiting (default: `15`). **If running multiple instances with same API key, set to `total_limit / num_instances`** |
+| `COUNCILFLOW_INSTANCE_COUNT` | Number of instances sharing the API key (for rate limit warnings, optional) |
 | `COUNCILFLOW_DATA_DIR` | Data directory on Linux/Docker (default: `/app/data`) |
 
 ---
