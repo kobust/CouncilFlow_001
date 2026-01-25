@@ -790,6 +790,93 @@ def rerank_chunks_llm(
 # -----------------------------------------------------------------------------
 
 
+def extract_legal_questions(output: str) -> tuple[str, list[str]]:
+    """
+    Extract legal questions from prompt output and return (main_content, legal_questions).
+    
+    The output should contain a markdown section with the exact title:
+    "## Legal Questions Requiring Expert Review"
+    
+    We look for this specific section title and extract bullet-pointed questions below it.
+    
+    Returns (main_content, legal_questions_list).
+    If no legal questions found, returns (original_output, []).
+    """
+    import re
+    
+    if not output or not output.strip():
+        return output, []
+    
+    # Look for the specific markdown section title: "## Legal Questions Requiring Expert Review"
+    # This is case-insensitive and allows for variations in spacing
+    md_pattern = r'(?i)##\s*Legal\s+Questions\s+Requiring\s+Expert\s+Review\s*\n(.*?)(?=\n##|\Z)'
+    match = re.search(md_pattern, output, re.DOTALL)
+    
+    if match:
+        questions_text = match.group(1).strip()
+        questions = []
+        
+        # Extract questions from bullet points or numbered lists
+        for line in questions_text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Remove markdown list markers: -, *, •, or numbered lists
+            line = re.sub(r'^[-*•]\s+', '', line)
+            line = re.sub(r'^\d+[.)]\s+', '', line)
+            line = line.strip()
+            
+            # Only include lines that look like questions (minimum length, ends with ? or is substantial)
+            if line and len(line) > 10 and (line.endswith('?') or len(line) > 20):
+                questions.append(line)
+        
+        if questions:
+            # Extract main content (everything before the legal questions section)
+            main = output[:match.start()].strip()
+            logger.info(f"Extracted {len(questions)} legal questions from 'Legal Questions Requiring Expert Review' section")
+            return main, questions
+    
+    # Fallback: Try other formats for backwards compatibility
+    # Try JSON format
+    try:
+        parsed = _parse_json_robust(output)
+        if parsed and isinstance(parsed, dict):
+            questions = parsed.get("legal_questions")
+            main = parsed.get("main_content", output)
+            if isinstance(questions, list) and questions:
+                valid_questions = [q.strip() for q in questions if q and str(q).strip()]
+                if valid_questions:
+                    logger.info(f"Extracted {len(valid_questions)} legal questions from JSON format (fallback)")
+                    return str(main).strip() or output, valid_questions
+    except Exception:
+        pass
+    
+    # Try generic "## Legal Questions" section (backwards compatibility)
+    try:
+        md_pattern_generic = r'(?i)##\s*Legal\s+Questions?\s*\n(.*?)(?=\n##|\Z)'
+        match = re.search(md_pattern_generic, output, re.DOTALL)
+        if match:
+            questions_text = match.group(1).strip()
+            questions = []
+            for line in questions_text.split('\n'):
+                line = line.strip()
+                line = re.sub(r'^[-*•]\s+', '', line)
+                line = re.sub(r'^\d+[.)]\s+', '', line)
+                if line and len(line) > 10:
+                    questions.append(line)
+            
+            if questions:
+                main = output[:match.start()].strip()
+                logger.info(f"Extracted {len(questions)} legal questions from generic Legal Questions section (fallback)")
+                return main, questions
+    except Exception:
+        pass
+    
+    # No legal questions found
+    return output, []
+
+
 def _parse_json_robust(raw: str) -> dict[str, Any] | None:
     """
     Try to extract and parse JSON from model output. Handles markdown fences,

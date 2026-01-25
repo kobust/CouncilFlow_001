@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -58,6 +59,7 @@ from brain import (
     GEMINI_PACE_DELAY_SECONDS,
     chars_to_tokens,
     expand_queries,
+    extract_legal_questions,
     format_context_usage,
     format_reading_equivalent,
     model_max_context,
@@ -634,6 +636,69 @@ def _markdown_with_copy(md: str, key_suffix: str) -> None:
         st.code(md, language="markdown", line_numbers=False)
 
 
+def _build_prompt_variables(username: str = "", user_name: str = "") -> str:
+    """
+    Build a variables section to inject into all prompts.
+    Includes date/time, user info, and other contextual information.
+    """
+    now = datetime.now()
+    current_date = now.strftime("%B %d, %Y")  # e.g., "January 25, 2026"
+    current_time = now.strftime("%I:%M %p")  # e.g., "02:30 PM"
+    current_datetime = now.strftime("%B %d, %Y at %I:%M %p")  # e.g., "January 25, 2026 at 02:30 PM"
+    current_year = now.year
+    current_month = now.strftime("%B")  # e.g., "January"
+    current_day = now.day
+    
+    # Determine if Eastern Daylight Time (EDT) or Eastern Standard Time (EST)
+    # Use time.tzname to get the actual timezone abbreviation
+    # This works on Windows and Unix systems
+    try:
+        # Get local timezone info
+        if time.daylight:
+            # Check if DST is currently active
+            local_time = time.localtime()
+            is_dst = local_time.tm_isdst
+            timezone_str = "Eastern Daylight Time (EDT)" if is_dst else "Eastern Standard Time (EST)"
+        else:
+            timezone_str = "Eastern Standard Time (EST)"
+    except Exception:
+        # Fallback: use simple month-based detection
+        # DST typically: second Sunday in March to first Sunday in November
+        is_dst = 3 <= now.month <= 10 or (now.month == 11 and now.day <= 7) or (now.month == 3 and now.day >= 8)
+        timezone_str = "Eastern Daylight Time (EDT)" if is_dst else "Eastern Standard Time (EST)"
+    
+    # Calculate fiscal year (assuming July 1 - June 30, common for municipalities)
+    fiscal_year_start = current_year if now.month >= 7 else current_year - 1
+    fiscal_year_end = fiscal_year_start + 1
+    fiscal_year = f"FY{fiscal_year_start}-{fiscal_year_end}"
+    
+    # Build variables section
+    variables = f"""
+---
+
+**Context Variables**
+
+- **Municipality Name**: City of Attleboro
+- **Time Zone**: {timezone_str}
+- **Current Date**: {current_date}
+- **Current Time**: {current_time}
+- **Current Date & Time**: {current_datetime}
+- **Current Year**: {current_year}
+- **Current Month**: {current_month}
+- **Fiscal Year**: {fiscal_year} (July 1, {fiscal_year_start} - June 30, {fiscal_year_end})
+"""
+    
+    if user_name and user_name != "unknown":
+        variables += f"- **Analysis Performed By**: {user_name}"
+        if username:
+            variables += f" ({username})"
+        variables += "\n"
+    
+    variables += "\nUse these variables as needed in your analysis. When referencing dates, use the current date/time provided above.\n"
+    
+    return variables
+
+
 def _wrap_transient_content(items: list[dict]) -> str:
     """
     Wrap transient input items (uploads + pastes) as subject-of-analysis, distinct from the knowledge base.
@@ -1092,21 +1157,41 @@ if current_page == "edit_prompts":
             st.session_state["crud_template"] = existing.template_text
             st.session_state["crud_verifier_id"] = existing.verifier_id
             st.session_state["crud_follow_on_only"] = getattr(existing, "follow_on_only", False)
+            st.session_state["crud_legal_expert_prompt_id"] = getattr(existing, "legal_expert_prompt_id", None)
         else:
             st.session_state["crud_name"] = ""
             st.session_state["crud_template"] = ""
             st.session_state["crud_verifier_id"] = None
             st.session_state["crud_follow_on_only"] = False
+            st.session_state["crud_legal_expert_prompt_id"] = None
 
     with st.form("prompt_form", clear_on_submit=False):
         name_value = st.session_state.get("crud_name", "")
         template_value = st.session_state.get("crud_template", "")
         verifier_id_value = st.session_state.get("crud_verifier_id", None)
         follow_on_only_value = st.session_state.get("crud_follow_on_only", False)
+        legal_expert_prompt_id_value = st.session_state.get("crud_legal_expert_prompt_id", None)
         
         name = st.text_input("Name", value=name_value, placeholder="e.g. MC Analysis, Constituent Reply")
         template_text = st.text_area("Template", value=template_value, height=200, placeholder="Instructions for the AI. Use {{ content }} for the user's input.")
         st.caption("Output is always Markdown.")
+        with st.expander("💡 Tip: Available Variables", expanded=False):
+            st.markdown("""
+            **Automatic Variables:**
+            
+            The following context variables are automatically injected into all prompts:
+            - **Municipality Name**: City of Attleboro
+            - **Time Zone**: Eastern Standard Time (EST) or Eastern Daylight Time (EDT), depending on the season
+            - **Current Date**: Full date (e.g., "January 25, 2026")
+            - **Current Time**: Time of day (e.g., "02:30 PM")
+            - **Current Date & Time**: Combined (e.g., "January 25, 2026 at 02:30 PM")
+            - **Current Year**: Year (e.g., 2026)
+            - **Current Month**: Month name (e.g., "January")
+            - **Fiscal Year**: Calculated fiscal year (e.g., "FY2025-2026" for July 1, 2025 - June 30, 2026)
+            - **Analysis Performed By**: Name of the user running the analysis
+            
+            These are provided in a "Context Variables" section at the start of every prompt. You can reference them in your analysis.
+            """)
         
         # Follow-on prompt selector (chainable)
         st.markdown("**Follow-on prompt (optional)**")
@@ -1143,11 +1228,38 @@ if current_page == "edit_prompts":
         )
         st.caption("If checked, this prompt will not appear in the Analysis type dropdown.")
         
+        # Legal expert prompt selector
+        st.markdown("**Legal expert prompt (optional)**")
+        st.caption("If this prompt detects legal questions in its output, it will automatically consult the selected legal expert prompt. The legal expert will perform a separate knowledge base search and integrate its findings into the original output.")
+        _legal_expert_candidates = [p for p in crud_prompts if p.id != (existing.id if existing else None)]
+        legal_expert_options = ["— None —"] + [f"{p.id}: {p.name}" for p in _legal_expert_candidates]
+        current_legal_expert_str = None
+        if legal_expert_prompt_id_value:
+            legal_expert_p = db.get_prompt_by_id(legal_expert_prompt_id_value)
+            if legal_expert_p:
+                current_legal_expert_str = f"{legal_expert_p.id}: {legal_expert_p.name}"
+        legal_expert_key = f"legal_expert_select_{selected_id}"
+        if legal_expert_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
+            st.session_state[legal_expert_key] = current_legal_expert_str or "— None —"
+        legal_expert_index = 0
+        current_legal_expert_selection = st.session_state.get(legal_expert_key, current_legal_expert_str or "— None —")
+        if current_legal_expert_selection and current_legal_expert_selection in legal_expert_options:
+            legal_expert_index = legal_expert_options.index(current_legal_expert_selection)
+        selected_legal_expert_str = st.selectbox("Legal expert prompt", legal_expert_options, index=legal_expert_index, key=legal_expert_key)
+        legal_expert_prompt_id = None
+        if selected_legal_expert_str and selected_legal_expert_str != "— None —":
+            try:
+                legal_expert_prompt_id = int(selected_legal_expert_str.split(":")[0])
+                logger.debug(f"Selected legal expert prompt ID: {legal_expert_prompt_id}")
+            except (ValueError, IndexError):
+                logger.warning(f"Could not parse legal expert ID from: {selected_legal_expert_str}")
+                legal_expert_prompt_id = None
+        
         submitted = st.form_submit_button("Save")
         if submitted and name and template_text:
-            logger.info(f"Saving prompt: {name} (id: {existing.id if existing else 'new'}, verifier_id: {verifier_id}, follow_on_only: {follow_on_only})")
+            logger.info(f"Saving prompt: {name} (id: {existing.id if existing else 'new'}, verifier_id: {verifier_id}, follow_on_only: {follow_on_only}, legal_expert: {legal_expert_prompt_id})")
             try:
-                db.save_prompt(name, template_text, "markdown", verifier_id=verifier_id, follow_on_only=follow_on_only, id=existing.id if existing else None)
+                db.save_prompt(name, template_text, "markdown", verifier_id=verifier_id, follow_on_only=follow_on_only, legal_expert_prompt_id=legal_expert_prompt_id, id=existing.id if existing else None)
                 logger.info("Prompt saved successfully")
                 st.success("Saved.")
                 st.rerun()
@@ -1466,8 +1578,45 @@ if current_page == "runner":
                                 st.session_state["gemini_cache_folder_id"] = folder_id
                                 st.session_state["run_cache_key"] = _run_cache_key
                                 logger.info(f"Cache created: {cache_name}")
-                    full_template = template_text + "\n\n---\n\nSubject of analysis (transient input):\n{{ content }}"
-                    logger.debug(f"Rendered template length: {len(full_template)} chars")
+                    # Build prompt variables (date/time, user info, etc.) to inject into all prompts
+                    prompt_variables = _build_prompt_variables(
+                        username=_username,
+                        user_name=st.session_state.get("name", "unknown")
+                    )
+                    
+                    # If legal expert prompt is configured, inject instructions to track unresolved legal questions
+                    legal_question_tracking_instructions = ""
+                    if getattr(selected, "legal_expert_prompt_id", None):
+                        legal_question_tracking_instructions = """
+
+---
+
+**IMPORTANT - Legal Question Tracking:** 
+
+You must actively and aggressively review this analysis for unresolved legal questions, compliance issues, statutory requirements, regulatory concerns, or any matters requiring expert legal review. 
+
+As you complete your analysis, carefully consider:
+- Are there any laws, regulations, or ordinances that need interpretation?
+- Are there compliance obligations, deadlines, or procedural requirements?
+- Are there potential legal risks, liabilities, or areas of concern?
+- Do any statutory citations or legal procedures need clarification?
+
+**Output Format:** At the very end of your response, if you identified ANY legal questions, add a section with this exact title:
+
+## Legal Questions Requiring Expert Review
+
+Then list each question as a bullet point:
+- [Your first legal question?]
+- [Your second legal question?]
+
+If you found NO legal questions requiring expert review, do NOT include this section. Simply end your analysis normally.
+
+Legal questions will be automatically forwarded to a legal expert for consultation.
+"""
+                        logger.info("Legal expert prompt configured - injecting legal question tracking instructions")
+                    
+                    full_template = prompt_variables + template_text + legal_question_tracking_instructions + "\n\n---\n\nSubject of analysis (transient input):\n{{ content }}"
+                    logger.debug(f"Rendered template length: {len(full_template)} chars (with variables and legal tracking)")
                     
                     max_retries = 1
                     for retry_attempt in range(max_retries + 1):
@@ -1532,10 +1681,137 @@ if current_page == "runner":
                     
                     logger.info(f"Agent completed: result type={type(result).__name__}")
                     output_tokens = chars_to_tokens(len(str(result)))
-                    st.session_state["last_result"] = result
+                    
+                    # Extract legal questions from output (if any)
+                    main_content, legal_questions = extract_legal_questions(str(result))
+                    legal_expert_output = None
+                    legal_expert_report = None
+                    final_output = main_content  # Initialize with main content
+                    
+                    # If legal questions exist and a legal expert prompt is configured, consult it
+                    if legal_questions and getattr(selected, "legal_expert_prompt_id", None):
+                        legal_expert_prompt_id = selected.legal_expert_prompt_id
+                        legal_expert_p = db.get_prompt_by_id(legal_expert_prompt_id)
+                        if legal_expert_p:
+                            logger.info(f"Legal questions detected ({len(legal_questions)}). Consulting legal expert: {legal_expert_p.name}")
+                            with st.status("⚖️ Consulting legal expert…", expanded=True) as legal_status:
+                                legal_status.write(f"Found {len(legal_questions)} legal question(s). Performing separate knowledge base search…")
+                                
+                                # Build legal expert query from questions
+                                legal_query_text = "\n\n".join([f"Q{i+1}: {q}" for i, q in enumerate(legal_questions)])
+                                
+                                # Plan retrieval for legal expert (separate search)
+                                if USE_RETRIEVAL_PLANNER:
+                                    _t0 = time.perf_counter()
+                                    legal_sel_ids, legal_top_k_map = plan_retrieval(
+                                        _rs, legal_expert_p.name, legal_expert_p.template_text, legal_query_text
+                                    )
+                                    legal_plan_time = time.perf_counter() - _t0
+                                    legal_status.write(f"⏱️ Legal retrieval planning: {legal_plan_time:.2f}s")
+                                else:
+                                    legal_sel_ids, legal_top_k_map = get_default_plan(_rs)
+                                
+                                # Query expansion for legal expert
+                                if USE_QUERY_EXPANSION:
+                                    legal_query_phrases = expand_queries(
+                                        legal_expert_p.name, legal_expert_p.template_text, legal_query_text
+                                    )
+                                else:
+                                    legal_query_phrases = get_fallback_phrases(
+                                        legal_expert_p.name, legal_expert_p.template_text, legal_query_text
+                                    )
+                                
+                                # Build context for legal expert (separate RAG search)
+                                legal_status.write("Retrieving legal context…")
+                                _t0 = time.perf_counter()
+                                legal_context_xml, legal_expert_report = retrieve_and_build_context_multi(
+                                    _rs, legal_query_phrases, legal_sel_ids, legal_top_k_map
+                                )
+                                legal_retrieval_time = time.perf_counter() - _t0
+                                legal_status.write(f"⏱️ Legal retrieval: {legal_retrieval_time:.2f}s")
+                                
+                                # Create cache for legal expert
+                                if len(legal_context_xml) >= min_size:
+                                    legal_status.write("Caching legal context…")
+                                    _t0 = time.perf_counter()
+                                    legal_cache_name = brain.create_gemini_cache(legal_context_xml)
+                                    legal_cache_time = time.perf_counter() - _t0
+                                    legal_status.write(f"⏱️ Legal cache: {legal_cache_time:.2f}s")
+                                else:
+                                    legal_status.update(label="Legal context too small", state="error")
+                                    st.warning("Legal expert context is too small. Proceeding without legal consultation.")
+                                    legal_cache_name = None
+                                
+                                # Run legal expert prompt
+                                if legal_cache_name:
+                                    # Inject variables into legal expert prompt too
+                                    legal_expert_variables = _build_prompt_variables(
+                                        username=_username,
+                                        user_name=st.session_state.get("name", "unknown")
+                                    )
+                                    legal_expert_template = legal_expert_variables + legal_expert_p.template_text + "\n\n---\n\nLegal questions to answer:\n{{ legal_questions }}\n\n---\n\nOriginal analysis context:\n{{ original_output }}"
+                                    legal_status.write("Running legal expert analysis…")
+                                    if GEMINI_PACE_DELAY_SECONDS > 0:
+                                        time.sleep(GEMINI_PACE_DELAY_SECONDS)
+                                    _t0 = time.perf_counter()
+                                    try:
+                                        legal_expert_output = brain.run_agent(
+                                            legal_expert_template,
+                                            {
+                                                "legal_questions": legal_query_text,
+                                                "original_output": main_content,
+                                            },
+                                            legal_cache_name,
+                                            expect_json=False,
+                                        )
+                                        legal_expert_time = time.perf_counter() - _t0
+                                        legal_status.write(f"⏱️ Legal expert: {legal_expert_time:.2f}s")
+                                        legal_status.update(label="✅ Legal consultation complete", state="complete")
+                                        logger.info(f"Legal expert consultation completed: {len(str(legal_expert_output))} chars")
+                                    except Exception as legal_err:
+                                        logger.error(f"Legal expert consultation failed: {legal_err}", exc_info=True)
+                                        legal_status.update(label="Legal consultation failed", state="error")
+                                        st.warning(f"Legal expert consultation failed: {legal_err}")
+                                        legal_expert_output = None
+                        else:
+                            logger.warning(f"Legal expert prompt {legal_expert_prompt_id} not found")
+                    
+                    # Integrate legal expertise into main output
+                    if legal_expert_output:
+                        # Append legal expertise as a section without modifying main content significantly
+                        final_output = f"{main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(legal_expert_output)}"
+                        logger.info("Integrated legal expertise into output")
+                    else:
+                        final_output = main_content
+                    
+                    st.session_state["last_result"] = final_output
                     st.session_state["last_mode"] = "markdown"
                     st.session_state["last_task_name"] = selected.name
                     st.session_state["last_rag_retrieval_report"] = retrieval_report
+                    # Track legal questions per step (for display)
+                    legal_questions_by_step = []
+                    if legal_questions:
+                        legal_questions_by_step.append({
+                            "step_name": selected.name,
+                            "questions": legal_questions,
+                            "expert_output": legal_expert_output,
+                            "expert_report": legal_expert_report,
+                            "has_legal_expert": bool(getattr(selected, "legal_expert_prompt_id", None))
+                        })
+                    elif getattr(selected, "legal_expert_prompt_id", None):
+                        # Legal expert configured but no questions found
+                        legal_questions_by_step.append({
+                            "step_name": selected.name,
+                            "questions": None,
+                            "expert_output": None,
+                            "expert_report": None,
+                            "has_legal_expert": True
+                        })
+                    
+                    st.session_state["last_legal_questions"] = legal_questions if legal_questions else None
+                    st.session_state["last_legal_expert_output"] = legal_expert_output if legal_expert_output else None
+                    st.session_state["last_legal_expert_report"] = legal_expert_report if legal_expert_report else None
+                    st.session_state["legal_questions_by_step"] = legal_questions_by_step
                     st.session_state["last_run_context_stats"] = {
                         "total_input_tokens": total_input_tokens,
                         "kb_tokens": kb_tokens,
@@ -1549,9 +1825,32 @@ if current_page == "runner":
                     
                     # Chained follow-on prompts: run sequentially, concatenating outputs.
                     # Re-evaluate context (plan + retrieve + cache) before each follow-on.
+                    # Legal expert consultation (if any) should appear as a separate step BEFORE follow-on prompts.
                     _sep = "\n\n---\n\n"
-                    accumulated: str = str(result)
+                    accumulated: str = main_content  # Start with main content only (legal expert will be added as separate step)
                     chain: list[tuple[str, str]] = [(selected.name, accumulated)]
+                    
+                    # Store step results for progressive display
+                    if "pipeline_step_results" not in st.session_state:
+                        st.session_state["pipeline_step_results"] = []
+                    
+                    # Store first step result for progressive display
+                    first_step_result = main_content
+                    if legal_expert_output:
+                        first_step_result = f"{main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(legal_expert_output)}"
+                        chain.append(("Legal Expert Consultation", first_step_result))
+                        accumulated = first_step_result
+                    
+                    # Initialize pipeline step results storage
+                    st.session_state["pipeline_step_results"] = [{
+                        "step_number": 1,
+                        "step_name": selected.name,
+                        "output": main_content,
+                        "has_legal_expert": bool(legal_expert_output),
+                        "legal_expert_output": str(legal_expert_output) if legal_expert_output else None,
+                        "full_output": first_step_result
+                    }]
+                    
                     chain_timings: list[dict[str, float]] = []
                     current = selected
                     seen: set[int] = {selected.id}
@@ -1571,7 +1870,44 @@ if current_page == "runner":
                             logger.warning(f"Follow-on prompt id {fid} not found, stopping chain")
                             break
                         seen.add(next_p.id)
-                        followon_template = next_p.template_text + "\n\n---\n\nOutput from previous step(s):\n{{ previous_output }}"
+                        # Inject variables into follow-on prompts too
+                        followon_variables = _build_prompt_variables(
+                            username=_username,
+                            user_name=st.session_state.get("name", "unknown")
+                        )
+                        
+                        # If this follow-on prompt has legal expert configured, inject legal question tracking instructions
+                        followon_legal_tracking = ""
+                        if getattr(next_p, "legal_expert_prompt_id", None):
+                            followon_legal_tracking = """
+
+---
+
+**IMPORTANT - Legal Question Tracking:** 
+
+You must actively and aggressively review this analysis for unresolved legal questions, compliance issues, statutory requirements, regulatory concerns, or any matters requiring expert legal review. 
+
+As you complete your analysis, carefully consider:
+- Are there any laws, regulations, or ordinances that need interpretation?
+- Are there compliance obligations, deadlines, or procedural requirements?
+- Are there potential legal risks, liabilities, or areas of concern?
+- Do any statutory citations or legal procedures need clarification?
+
+**Output Format:** At the very end of your response, if you identified ANY legal questions, add a section with this exact title:
+
+## Legal Questions Requiring Expert Review
+
+Then list each question as a bullet point:
+- [Your first legal question?]
+- [Your second legal question?]
+
+If you found NO legal questions requiring expert review, do NOT include this section. Simply end your analysis normally.
+
+Legal questions will be automatically forwarded to a legal expert for consultation.
+"""
+                            logger.info(f"Legal expert prompt configured for {next_p.name} - injecting legal question tracking instructions")
+                        
+                        followon_template = followon_variables + next_p.template_text + followon_legal_tracking + "\n\n---\n\nOutput from previous step(s):\n{{ previous_output }}"
                         step_label = f"Follow-on: {next_p.name}"
                         try:
                             step_timing: dict[str, float] = {"name": next_p.name}
@@ -1661,8 +1997,150 @@ if current_page == "runner":
                                             retry += 1
                                         else:
                                             raise
-                                accumulated = accumulated + _sep + str(out)
+                                
+                                # Extract legal questions from follow-on prompt output
+                                step_main_content, step_legal_questions = extract_legal_questions(str(out))
+                                step_legal_expert_output = None
+                                step_legal_expert_report = None
+                                
+                                # If this follow-on prompt has legal expert configured and questions were found, consult it
+                                if step_legal_questions and getattr(next_p, "legal_expert_prompt_id", None):
+                                    step_legal_expert_prompt_id = next_p.legal_expert_prompt_id
+                                    step_legal_expert_p = db.get_prompt_by_id(step_legal_expert_prompt_id)
+                                    if step_legal_expert_p:
+                                        logger.info(f"Legal questions detected in {next_p.name} ({len(step_legal_questions)}). Consulting legal expert: {step_legal_expert_p.name}")
+                                        with st.status(f"⚖️ Legal consultation for {next_p.name}…", expanded=True) as step_legal_status:
+                                            step_legal_status.write(f"Found {len(step_legal_questions)} legal question(s). Performing separate knowledge base search…")
+                                            
+                                            # Build legal expert query from questions
+                                            step_legal_query_text = "\n\n".join([f"Q{i+1}: {q}" for i, q in enumerate(step_legal_questions)])
+                                            
+                                            # Plan retrieval for legal expert
+                                            if USE_RETRIEVAL_PLANNER:
+                                                _t0 = time.perf_counter()
+                                                step_legal_sel_ids, step_legal_top_k_map = plan_retrieval(
+                                                    _rs, step_legal_expert_p.name, step_legal_expert_p.template_text, step_legal_query_text
+                                                )
+                                                step_legal_plan_time = time.perf_counter() - _t0
+                                                step_legal_status.write(f"⏱️ Legal retrieval planning: {step_legal_plan_time:.2f}s")
+                                            else:
+                                                step_legal_sel_ids, step_legal_top_k_map = get_default_plan(_rs)
+                                            
+                                            # Query expansion for legal expert
+                                            if USE_QUERY_EXPANSION:
+                                                step_legal_query_phrases = expand_queries(
+                                                    step_legal_expert_p.name, step_legal_expert_p.template_text, step_legal_query_text
+                                                )
+                                            else:
+                                                step_legal_query_phrases = get_fallback_phrases(
+                                                    step_legal_expert_p.name, step_legal_expert_p.template_text, step_legal_query_text
+                                                )
+                                            
+                                            # Build context for legal expert
+                                            step_legal_status.write("Retrieving legal context…")
+                                            _t0 = time.perf_counter()
+                                            step_legal_context_xml, step_legal_expert_report = retrieve_and_build_context_multi(
+                                                _rs, step_legal_query_phrases, step_legal_sel_ids, step_legal_top_k_map
+                                            )
+                                            step_legal_retrieval_time = time.perf_counter() - _t0
+                                            step_legal_status.write(f"⏱️ Legal retrieval: {step_legal_retrieval_time:.2f}s")
+                                            
+                                            # Create cache for legal expert
+                                            if len(step_legal_context_xml) >= min_size:
+                                                step_legal_status.write("Caching legal context…")
+                                                _t0 = time.perf_counter()
+                                                step_legal_cache_name = brain.create_gemini_cache(step_legal_context_xml)
+                                                step_legal_cache_time = time.perf_counter() - _t0
+                                                step_legal_status.write(f"⏱️ Legal cache: {step_legal_cache_time:.2f}s")
+                                            else:
+                                                step_legal_status.update(label="Legal context too small", state="error")
+                                                st.warning(f"Legal expert context for {next_p.name} is too small. Proceeding without legal consultation.")
+                                                step_legal_cache_name = None
+                                            
+                                            # Run legal expert prompt
+                                            if step_legal_cache_name:
+                                                step_legal_expert_variables = _build_prompt_variables(
+                                                    username=_username,
+                                                    user_name=st.session_state.get("name", "unknown")
+                                                )
+                                                step_legal_expert_template = step_legal_expert_variables + step_legal_expert_p.template_text + "\n\n---\n\nLegal questions to answer:\n{{ legal_questions }}\n\n---\n\nOriginal analysis context:\n{{ original_output }}"
+                                                step_legal_status.write("Running legal expert analysis…")
+                                                if GEMINI_PACE_DELAY_SECONDS > 0:
+                                                    time.sleep(GEMINI_PACE_DELAY_SECONDS)
+                                                _t0 = time.perf_counter()
+                                                try:
+                                                    step_legal_expert_output = brain.run_agent(
+                                                        step_legal_expert_template,
+                                                        {
+                                                            "legal_questions": step_legal_query_text,
+                                                            "original_output": step_main_content,
+                                                        },
+                                                        step_legal_cache_name,
+                                                        expect_json=False,
+                                                    )
+                                                    step_legal_expert_time = time.perf_counter() - _t0
+                                                    step_legal_status.write(f"⏱️ Legal expert: {step_legal_expert_time:.2f}s")
+                                                    step_legal_status.update(label="✅ Legal consultation complete", state="complete")
+                                                    logger.info(f"Legal expert consultation for {next_p.name} completed: {len(str(step_legal_expert_output))} chars")
+                                                except Exception as step_legal_err:
+                                                    logger.error(f"Legal expert consultation for {next_p.name} failed: {step_legal_err}", exc_info=True)
+                                                    step_legal_status.update(label="Legal consultation failed", state="error")
+                                                    st.warning(f"Legal expert consultation for {next_p.name} failed: {step_legal_err}")
+                                                    step_legal_expert_output = None
+                                    else:
+                                        logger.warning(f"Legal expert prompt {step_legal_expert_prompt_id} not found for {next_p.name}")
+                                
+                                # Integrate legal expertise into follow-on output if present
+                                if step_legal_expert_output:
+                                    step_output_with_legal = f"{step_main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(step_legal_expert_output)}"
+                                    logger.info(f"Integrated legal expertise into {next_p.name} output")
+                                else:
+                                    step_output_with_legal = step_main_content
+                                
+                                # Add follow-on prompt output to chain
+                                accumulated = accumulated + _sep + step_output_with_legal
                                 chain.append((next_p.name, accumulated))
+                                
+                                # Add legal expert consultation as separate step if it happened
+                                if step_legal_expert_output:
+                                    step_legal_expert_step_output = f"{accumulated}"
+                                    chain.append((f"Legal Expert Consultation ({next_p.name})", step_legal_expert_step_output))
+                                    accumulated = step_legal_expert_step_output
+                                
+                                # Store this step's result for progressive display
+                                step_num = len(st.session_state.get("pipeline_step_results", [])) + 1
+                                step_results = st.session_state.get("pipeline_step_results", [])
+                                step_results.append({
+                                    "step_number": step_num,
+                                    "step_name": next_p.name,
+                                    "output": step_main_content,
+                                    "has_legal_expert": bool(step_legal_expert_output),
+                                    "legal_expert_output": str(step_legal_expert_output) if step_legal_expert_output else None,
+                                    "full_output": step_output_with_legal
+                                })
+                                st.session_state["pipeline_step_results"] = step_results
+                                
+                                # Track legal questions for this follow-on step
+                                if step_legal_questions:
+                                    legal_questions_by_step.append({
+                                        "step_name": next_p.name,
+                                        "questions": step_legal_questions,
+                                        "expert_output": step_legal_expert_output,
+                                        "expert_report": step_legal_expert_report,
+                                        "has_legal_expert": bool(getattr(next_p, "legal_expert_prompt_id", None))
+                                    })
+                                elif getattr(next_p, "legal_expert_prompt_id", None):
+                                    # Legal expert configured but no questions found
+                                    legal_questions_by_step.append({
+                                        "step_name": next_p.name,
+                                        "questions": None,
+                                        "expert_output": None,
+                                        "expert_report": None,
+                                        "has_legal_expert": True
+                                    })
+                                
+                                # Update session state with latest legal questions tracking
+                                st.session_state["legal_questions_by_step"] = legal_questions_by_step
                                 step_timing["total_s"] = (
                                     step_timing.get("plan_retrieval_s", 0)
                                     + step_timing.get("build_context_s", 0)
@@ -1733,6 +2211,31 @@ if current_page == "runner":
         if res is not None and res_task == selected.name:
             st.markdown("#### Step 4: Review results")
             logger.debug(f"Displaying output: type={type(res).__name__}")
+            
+            # Display progressive results for each step in the pipeline
+            pipeline_step_results = st.session_state.get("pipeline_step_results", [])
+            if pipeline_step_results and len(pipeline_step_results) > 0:
+                st.markdown("**Pipeline Results (by step):**")
+                st.caption("Each step's results are shown below. You can review them while subsequent steps are processing.")
+                
+                for step_result in pipeline_step_results:
+                    step_num = step_result.get("step_number", 0)
+                    step_name = step_result.get("step_name", "Unknown")
+                    full_output = step_result.get("full_output", step_result.get("output", ""))
+                    has_legal = step_result.get("has_legal_expert", False)
+                    legal_output = step_result.get("legal_expert_output")
+                    
+                    with st.expander(f"Step {step_num}: {step_name}", expanded=(step_num == 1)):
+                        _markdown_with_copy(full_output, f"step_{step_num}_{step_name}")
+                        
+                        if has_legal and legal_output:
+                            st.markdown("**Legal Expert Consultation:**")
+                            _markdown_with_copy(legal_output, f"legal_{step_num}_{step_name}")
+                
+                st.markdown("---")
+                st.markdown("**Final Combined Result (all steps):**")
+            
+            # Show the final combined result
             md = res if isinstance(res, str) else str(res)
             _markdown_with_copy(md, "result")
 
@@ -1805,13 +2308,57 @@ if current_page == "runner":
                         else:
                             st.caption("  _(no chunks retrieved)_")
 
+            # Show legal questions status for each step
+            legal_questions_by_step = st.session_state.get("legal_questions_by_step", [])
+            
+            if legal_questions_by_step:
+                st.markdown("---")
+                with st.expander("⚖️ Legal Review Status by Step", expanded=True):
+                    for step_info in legal_questions_by_step:
+                        step_name = step_info.get("step_name", "Unknown")
+                        questions = step_info.get("questions")
+                        expert_output = step_info.get("expert_output")
+                        expert_report = step_info.get("expert_report")
+                        has_legal_expert = step_info.get("has_legal_expert", False)
+                        
+                        if has_legal_expert:
+                            if questions:
+                                st.markdown(f"**{step_name}**: ✅ Legal questions detected ({len(questions)})")
+                                for i, q in enumerate(questions, 1):
+                                    st.markdown(f"  - Q{i}: {q}")
+                                if expert_output:
+                                    st.caption("✅ Legal expert consultation completed")
+                                    if expert_report:
+                                        st.caption("**Legal expert sources:**")
+                                        for rec in expert_report:
+                                            lib_name = rec.get("library_name", "?")
+                                            n = rec.get("chunks_retrieved", 0)
+                                            srcs = rec.get("sources", [])
+                                            if n > 0:
+                                                file_summary = ", ".join(f"{s['file_name']} ({s['chunk_count']})" for s in srcs[:3])
+                                                if len(srcs) > 3:
+                                                    file_summary += f" +{len(srcs) - 3} more"
+                                                st.caption(f"  • **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
+                                else:
+                                    st.caption("⚠️ Legal expert consultation was attempted but did not complete")
+                            else:
+                                st.markdown(f"**{step_name}**: ℹ️ No legal questions identified (legal review not required)")
+                        else:
+                            st.markdown(f"**{step_name}**: — Legal expert not configured")
+                        if step_info != legal_questions_by_step[-1]:
+                            st.divider()
+            
             if chain_list and len(chain_list) > 1:
                 with st.expander("📋 Pipeline steps", expanded=False):
-                    st.caption("Cumulative output after each step (each follow‑on appends to the previous).")
+                    st.caption("Cumulative output after each step. Legal expert consultation (if any) appears before follow-on prompts.")
                     for i, (name, step_out) in enumerate(chain_list):
                         if i > 0:
                             st.divider()
-                        st.markdown(f"**Step {i + 1}: {name}**")
+                        # Special styling for legal expert step
+                        if name == "Legal Expert Consultation":
+                            st.markdown(f"**Step {i + 1}: ⚖️ {name}**")
+                        else:
+                            st.markdown(f"**Step {i + 1}: {name}**")
                         _markdown_with_copy(step_out, f"chain_{i}")
             if chain_error:
                 st.markdown("---")

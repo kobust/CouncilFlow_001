@@ -47,6 +47,7 @@ class PromptTemplate(SQLModel, table=True):
     output_mode: str  # 'markdown' (legacy: 'table' | 'text')
     verifier_id: Optional[int] = None
     follow_on_only: bool = Field(default=False, nullable=False)  # follow-on only
+    legal_expert_prompt_id: Optional[int] = None  # prompt to use for legal questions
 
 
 # -----------------------------------------------------------------------------
@@ -70,6 +71,22 @@ def _migrate_follow_on_only() -> None:
         logger.warning(f"Migration follow_on_only: {e}")
 
 
+def _migrate_legal_expert_prompt_id() -> None:
+    """Add legal_expert_prompt_id column if missing (existing DBs)."""
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(prompttemplate)")).fetchall()
+        columns = [r[1] for r in rows] if rows else []
+        if "legal_expert_prompt_id" not in columns:
+            logger.info("Adding legal_expert_prompt_id column to prompttemplate")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN legal_expert_prompt_id INTEGER"))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration legal_expert_prompt_id: {e}")
+
+
 def init_db() -> None:
     """Create tables and seed default prompt templates."""
     logger.info("Initializing database")
@@ -78,6 +95,7 @@ def init_db() -> None:
         logger.debug("Creating database tables")
         SQLModel.metadata.create_all(engine)
         _migrate_follow_on_only()
+        _migrate_legal_expert_prompt_id()
         with Session(engine) as s:
             existing = s.exec(select(PromptTemplate)).first()
             if existing is not None:
@@ -151,12 +169,13 @@ def save_prompt(
     output_mode: str,
     verifier_id: Optional[int] = None,
     follow_on_only: bool = False,
+    legal_expert_prompt_id: Optional[int] = None,
     *,
     id: Optional[int] = None,
 ) -> PromptTemplate:
     """Insert or update a prompt template. If id is given, update; else insert."""
     follow_on_only = bool(follow_on_only)
-    logger.info(f"Saving prompt: {name} (id: {id}, mode: {output_mode}, follow_on_only: {follow_on_only})")
+    logger.info(f"Saving prompt: {name} (id: {id}, mode: {output_mode}, follow_on_only: {follow_on_only}, legal_expert: {legal_expert_prompt_id})")
     try:
         engine = _get_engine()
         with Session(engine) as s:
@@ -171,6 +190,7 @@ def save_prompt(
                         output_mode=output_mode,
                         verifier_id=verifier_id,
                         follow_on_only=follow_on_only,
+                        legal_expert_prompt_id=legal_expert_prompt_id,
                     )
                     s.add(p)
                 else:
@@ -180,6 +200,7 @@ def save_prompt(
                     existing.output_mode = output_mode
                     existing.verifier_id = verifier_id
                     existing.follow_on_only = follow_on_only
+                    existing.legal_expert_prompt_id = legal_expert_prompt_id
                     p = existing
             else:
                 logger.debug("Creating new prompt")
@@ -189,6 +210,7 @@ def save_prompt(
                     output_mode=output_mode,
                     verifier_id=verifier_id,
                     follow_on_only=follow_on_only,
+                    legal_expert_prompt_id=legal_expert_prompt_id,
                 )
                 s.add(p)
             s.commit()
