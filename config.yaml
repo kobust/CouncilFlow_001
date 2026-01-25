@@ -1,5 +1,6 @@
 # CouncilFlow auth: admin (full access) and user (Run Analysis only).
-# Regenerate hash: python -c "import streamlit_authenticator as stauth; print(stauth.Hasher.hash('YOUR_PASSWORD'))"
+# IMPORTANT: Change all passwords and cookie.key before production use.
+# Regenerate password hash: python -c "import streamlit_authenticator as stauth; print(stauth.Hasher.hash('YOUR_PASSWORD'))"
 credentials:
   usernames:
     admin:
@@ -16,5 +17,5 @@ credentials:
       password: "$2b$12$GWcasgk8vEVYHv2faRl1M.a1hKX52iYh/3loZJgyiQ78m5OG6Kqhe"
 cookie:
   name: councilflow_cookie
-  key: councilflow_secret_key_change_in_production
+  key: councilflow_secret_key_change_in_production  # Change in production
   expiry_days: 30

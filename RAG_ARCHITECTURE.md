@@ -6,7 +6,7 @@ This document describes how the CouncilFlow **Retrieval-Augmented Generation (RA
 
 ## 1. Overview
 
-CouncilFlow uses a **hybrid RAG** pipeline: **BM25** (lexical) + **embedding-based semantic search**, merged via **Reciprocal Rank Fusion (RRF)**. The knowledge base is split into **Core** (always fully loaded) and **Libraries** (chunked, indexed, and selectively retrieved at query time). An **LLM retrieval planner** chooses which libraries to search and how many chunks to fetch; **query expansion** and **LLM re-ranking** improve recall and precision.
+CouncilFlow uses a **hybrid RAG** pipeline: **BM25** (lexical) + **embedding-based semantic search**, merged via **Reciprocal Rank Fusion (RRF)**. The knowledge base is split into **Core** (always fully loaded) and **Libraries** (chunked, indexed, and selectively retrieved at query time). An **LLM retrieval planner** (optional) chooses which libraries to search and how many chunks to fetch; **query expansion** (optional) and **LLM re-ranking** (optional) improve recall and precision. Planner, expansion, and re-ranking can be toggled in `rag_loader` to reduce API usage.
 
 **Key modules:**
 
@@ -81,11 +81,11 @@ When the user runs an analysis (e.g. “Run Analysis”):
 - **User content** (uploaded docs, pasted text, etc.)
 - **RAG state**: Core XML + list of `{id, name, index}` per library.
 
-### 4.2 Step 1: Retrieval planning
+### 4.2 Step 1: Retrieval planning (optional)
 
 **Goal:** Decide **which libraries** to search and **how many chunks** (`top_k`) to retrieve per library.
 
-- **`rag_loader.plan_retrieval`** calls **`brain.run_retrieval_planner`** with:
+- When **`USE_RETRIEVAL_PLANNER`** is `True`, **`rag_loader.plan_retrieval`** calls **`brain.run_retrieval_planner`** with:
   - Task name, task description, user content.
   - **Library metadata**: for each library, `library_description` and `file_descriptors` (name + summary).
   - **Context budget**: model context limit, reserved tokens for user + prompt, and an approximate **chunk budget** for retrieved KB content. The planner is instructed to keep total chunks at or under this budget.
@@ -97,14 +97,14 @@ When the user runs an analysis (e.g. “Run Analysis”):
 - Rules include: `name` must match a library exactly; choose libraries relevant to the task and documents; set `top_k` between 1–100 (often 25–80 for important libraries); prefer 2–4 libraries when relevant; stay within the chunk budget.
 
 - **Output**: `(selected_library_ids, top_k_per_library)`. If the planner fails, all libraries are selected with a default `top_k` (e.g. 35).
+- When **`USE_RETRIEVAL_PLANNER`** is `False`, the planning step is skipped; **`get_default_plan`** selects all libraries with **`DEFAULT_TOP_K`** each. No planner UI or LLM call.
 
-### 4.3 Step 2: Query expansion
+### 4.3 Step 2: Query expansion (optional)
 
 **Goal:** Turn the task + user content into **multiple search phrases** to improve recall.
 
-- **`brain.expand_queries`** is called with task name, template text, and user content.
-- An LLM prompt asks for **3–5 short search phrases** (keywords, entities, legal/policy terms) in JSON: `{"phrases": ["...", ...]}`.
-- **Output**: list of phrases (or fallback `[task_name + user_content excerpt]` on failure).
+- When **`USE_QUERY_EXPANSION`** is `True`, **`brain.expand_queries`** is called with task name, template text, and user content. An LLM prompt asks for **3–5 short search phrases** (keywords, entities, legal/policy terms) in JSON: `{"phrases": ["...", ...]}`. **Output**: list of phrases (or fallback `[task_name + user_content excerpt]` on failure).
+- When **`USE_QUERY_EXPANSION`** is `False`, **`get_fallback_phrases`** returns a single phrase (`[task_name + user_content excerpt]`). No LLM call.
 
 ### 4.4 Step 3: Hybrid retrieval (per library, per phrase)
 
@@ -201,6 +201,8 @@ User runs analysis (task + user content)
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+Steps 1 (plan) and 2 (expand) are optional: when `USE_RETRIEVAL_PLANNER` or `USE_QUERY_EXPANSION` is `False`, the corresponding step is skipped and no planner/expansion UI or LLM call is made. Step 5 (re-rank) is skipped when `RERANK_ENABLED` is `False`.
+
 ---
 
 ## 6. Configuration and Tunables
@@ -211,8 +213,11 @@ User runs analysis (task + user content)
 | `CHUNK_OVERLAP` | `rag` | 220 | Overlap between consecutive chunks |
 | `DEFAULT_TOP_K` | `rag_loader` | 35 | Default chunks per library when planner falls back |
 | `TOP_K_MIN` / `TOP_K_MAX` | `rag_loader` | 1–100 | Bounds for planner `top_k` |
-| `RERANK_ENABLED` | `rag_loader` | True | Use LLM re-ranking |
-| `RERANK_FACTOR` | `rag_loader` | 2 | Over-fetch factor before re-rank (retrieve 2×, then keep top_k) |
+| `USE_RETRIEVAL_PLANNER` | `rag_loader` | False | Use LLM to select libraries + top_k; if False, use all libraries with `DEFAULT_TOP_K` |
+| `USE_QUERY_EXPANSION` | `rag_loader` | True | Use LLM to generate 3–5 search phrases; if False, single fallback phrase |
+| `RERANK_ENABLED` | `rag_loader` | False | Use LLM re-ranking; when False, retrieve more chunks (`RETRIEVE_FACTOR`) instead |
+| `RERANK_FACTOR` / `RETRIEVE_FACTOR` | `rag_loader` | 2 | Over-fetch factor before re-rank, or when re-rank disabled |
+| `PLANNER_MODEL` / `GEMINI_PLANNER_MODEL` | `brain` | `gemini-2.0-flash` | Model used for retrieval planner (env override) |
 | RRF `k` | `rag` | 60 | RRF denominator offset: `1 / (k + rank)` |
 | Embedding model | `brain` | `gemini-embedding-001` | 768‑dim, document/query‑specific task types |
 

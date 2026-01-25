@@ -9,7 +9,9 @@ import io
 import json
 import logging
 import os
+import platform
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -93,6 +95,45 @@ if not HTML2MD_AVAILABLE:
     logger.warning("html2text library not available. HTML to Markdown conversion will be disabled.")
 
 APP_NAME = "Attleboro Council Agent"
+COUNCILFLOW_VERSION = "1.0.0"
+
+
+def get_git_version() -> str:
+    """Get version string from git commit hash."""
+    try:
+        # Try to get short commit hash
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=repo_path(),
+        )
+        if result.returncode == 0:
+            commit_hash = result.stdout.strip()
+            # Try to get tag if available
+            tag_result = subprocess.run(
+                ["git", "describe", "--tags", "--exact-match", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=repo_path(),
+            )
+            if tag_result.returncode == 0:
+                return tag_result.stdout.strip()
+            # Try to get branch name
+            branch_result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=repo_path(),
+            )
+            branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
+            return f"{COUNCILFLOW_VERSION}-{commit_hash[:7]} ({branch})"
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        logger.debug(f"Could not get git version: {e}")
+    return COUNCILFLOW_VERSION
 
 # -----------------------------------------------------------------------------
 # Auth
@@ -695,6 +736,12 @@ _SIDEBAR_HTML = f"""
     display: none !important;
   }}
 }}
+/* Remove horizontal bar above Navigation */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:first-of-type hr,
+[data-testid="stSidebar"] > div:first-child hr,
+[data-testid="stSidebar"] hr:first-of-type {{
+  display: none !important;
+}}
 `;
     doc.head.appendChild(style);
   }}
@@ -749,8 +796,7 @@ components.html(_SIDEBAR_HTML, height=0)
 # Sidebar
 # -----------------------------------------------------------------------------
 
-# Navigation
-st.sidebar.markdown("---")
+# Navigation (no divider above)
 st.sidebar.markdown("**Navigation**")
 run_analysis_clicked = st.sidebar.button("▶️ Run Analysis", key="nav_run", use_container_width=True)
 if run_analysis_clicked:
@@ -768,10 +814,20 @@ if current_page == "edit_prompts" and not is_admin:
     st.session_state["current_page"] = "runner"
     st.rerun()
 
-# Model indicator
+# About
 st.sidebar.markdown("---")
-st.sidebar.caption("AI model")
-st.sidebar.markdown(f"**{EFFECTIVE_MODEL}**")
+st.sidebar.caption("About")
+st.sidebar.markdown(
+    f"**{APP_NAME}**  \n"
+    "RAG-powered LLM analysis tooling with hybrid retrieval (BM25 + semantic) and Gemini context caching to empower municipal decision making."
+)
+st.sidebar.markdown(
+    'Developed by **[Todd Kobus](https://www.facebook.com/kobusforattleboro)**'
+)
+
+# Knowledge base section
+st.sidebar.markdown("---")
+st.sidebar.caption("Knowledge base")
 
 # RAG knowledge base loading (runs once at boot)
 if not st.session_state.get("kb_loading_started") and folder_id:
@@ -797,9 +853,6 @@ if not st.session_state.get("kb_loading_started") and folder_id:
         st.session_state["rag_state"] = None
         kb_status_placeholder.error(f"⚠ Load error: {str(e)[:60]}…")
 
-# Knowledge base section at bottom (lower priority)
-st.sidebar.markdown("---")
-st.sidebar.caption("Knowledge base")
 folder_info = get_cached_folder_info(folder_id) if folder_id else None
 if folder_info:
     name = folder_info.get("name", "Drive folder")
@@ -807,6 +860,14 @@ if folder_info:
     st.sidebar.markdown(f"[**{name}**]({link})")
 else:
     st.sidebar.caption(f"Folder: `{folder_id[:20]}...`")
+
+# KB status (loaded / error / loading) - show in knowledge base area
+if st.session_state.get("kb_loaded"):
+    st.sidebar.caption("✓ Knowledge base loaded")
+elif st.session_state.get("kb_load_error"):
+    st.sidebar.caption(f"⚠ {st.session_state['kb_load_error'][:50]}…")
+elif st.session_state.get("kb_loading_started"):
+    st.sidebar.caption("⏳ Loading knowledge base…")
 
 if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb", use_container_width=True):
     logger.info("User clicked Refresh Knowledge Base")
@@ -832,14 +893,44 @@ if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb
         logger.error(f"Error clearing cache: {e}", exc_info=True)
         st.sidebar.error(f"Error clearing cache: {e}")
 
-# KB status (loaded / error / loading) below refresh
-if st.session_state.get("kb_loaded"):
-    st.sidebar.caption("✓ Knowledge base loaded")
-elif st.session_state.get("kb_load_error"):
-    st.sidebar.caption(f"⚠ {st.session_state['kb_load_error'][:50]}…")
-elif st.session_state.get("kb_loading_started"):
-    st.sidebar.caption("⏳ Loading knowledge base…")
+# Model & pipeline
+st.sidebar.markdown("---")
+st.sidebar.caption("Model & pipeline")
+app_version = get_git_version()
+st.sidebar.caption(f"App version: `{app_version}`")
+st.sidebar.caption(f"Model: `{EFFECTIVE_MODEL}`")
+max_ctx = model_max_context(EFFECTIVE_MODEL)
+st.sidebar.caption(f"Context window: {max_ctx:,} tokens")
+st.sidebar.caption(
+    "RAG pipeline: Hybrid retrieval (BM25 + semantic embeddings), reciprocal rank fusion (RRF), "
+    "deduplication, optional query expansion & retrieval planner. "
+    "Context cached via Gemini CachedContent; library indexes on disk."
+)
 
+# Debug info section
+st.sidebar.markdown("---")
+st.sidebar.caption("System info")
+python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+st.sidebar.caption(f"Python: `{python_version}`")
+st.sidebar.caption(f"Platform: `{platform.system()} {platform.release()}`")
+st.sidebar.caption(f"Streamlit: `{st.__version__}`")
+try:
+    try:
+        from google import genai
+        sdk_version = getattr(genai, "__version__", "unknown")
+    except ImportError:
+        import google.generativeai as genai
+        sdk_version = getattr(genai, "__version__", "unknown")
+    if sdk_version != "unknown":
+        st.sidebar.caption(f"Gemini SDK: `{sdk_version}`")
+except (ImportError, AttributeError):
+    pass
+if hasattr(st.session_state, "rag_state") and st.session_state.get("rag_state"):
+    rag_state = st.session_state["rag_state"]
+    n_libs = len(rag_state.get("libraries", []))
+    st.sidebar.caption(f"Libraries loaded: `{n_libs}`")
+if folder_id:
+    st.sidebar.caption(f"KB folder: `{folder_id[:12]}...`")
 st.sidebar.markdown("---")
 authenticator.logout(location="sidebar")
 
@@ -1102,23 +1193,22 @@ if current_page == "runner":
                         st.stop()
                     logger.info(f"Starting run: folder_id={folder_id}, content_len={len(user_content)}")
                     timings: dict[str, float] = {}
-                    status_container = st.status("🔍 Planning retrieval…", expanded=True)
-                    with status_container:
-                        max_ctx = model_max_context(EFFECTIVE_MODEL)
-                        _t0 = time.perf_counter()
-                        if USE_RETRIEVAL_PLANNER:
+                    if USE_RETRIEVAL_PLANNER:
+                        status_container = st.status("🔍 Planning retrieval…", expanded=True)
+                        with status_container:
+                            _t0 = time.perf_counter()
                             sel_ids, top_k_map = plan_retrieval(
                                 _rs, selected.name, selected.template_text, user_content
                             )
                             id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
                             libs_str = ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) if sel_ids else "none"
                             status_container.write(f"✅ **{libs_str}** · top_k per library")
-                        else:
-                            sel_ids, top_k_map = get_default_plan(_rs)
-                            status_container.write("✅ Using all libraries.")
-                        timings["plan_retrieval_s"] = time.perf_counter() - _t0
-                        status_container.write(f"⏱️ {timings['plan_retrieval_s']:.2f}s")
-                        status_container.update(label="✅ Retrieval planned", state="complete")
+                            timings["plan_retrieval_s"] = time.perf_counter() - _t0
+                            status_container.write(f"⏱️ {timings['plan_retrieval_s']:.2f}s")
+                            status_container.update(label="✅ Retrieval planned", state="complete")
+                    else:
+                        sel_ids, top_k_map = get_default_plan(_rs)
+                        timings["plan_retrieval_s"] = 0.0
                     if USE_QUERY_EXPANSION:
                         query_phrases = expand_queries(
                             selected.name, selected.template_text, user_content
@@ -1161,15 +1251,23 @@ if current_page == "runner":
                         kb_ratio = (kb_tokens / total_input_tokens * 100) if total_input_tokens else 0
                         user_ratio = (transient_tokens / total_input_tokens * 100) if total_input_tokens else 0
                         logger.info(f"RAG context built: {total_len:,} chars, {total_input_tokens:,} est. input tokens")
-                        lib_bits = []
+                        status_container.write(
+                            f"📊 **Context**: {total_input_tokens:,} tokens ({kb_ratio:.0f}% KB, {user_ratio:.0f}% user) — {format_context_usage(total_input_tokens, max_ctx, EFFECTIVE_MODEL)}"
+                        )
+                        status_container.write(f"📖 **Real-world**: {format_reading_equivalent(total_input_tokens)}")
                         if retrieval_report:
                             for rec in retrieval_report:
+                                lib_name = rec.get("library_name", "?")
                                 n = rec.get("chunks_retrieved", 0)
-                                lib_bits.append(f"{rec.get('library_name', '?')}: {n}")
-                        summary = " · ".join(lib_bits) if lib_bits else "—"
-                        status_container.write(
-                            f"📊 **Context**: {total_input_tokens:,} tokens ({kb_ratio:.0f}% KB, {user_ratio:.0f}% user) · {summary}"
-                        )
+                                k = rec.get("top_k", 0)
+                                srcs = rec.get("sources", [])
+                                if n == 0:
+                                    status_container.write(f"• **{lib_name}**: 0 chunks (top_k={k})")
+                                else:
+                                    file_summary = ", ".join(f"{s['file_name']} ({s['chunk_count']})" for s in srcs[:5])
+                                    if len(srcs) > 5:
+                                        file_summary += f" +{len(srcs) - 5} more"
+                                    status_container.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
                         status_container.write(f"⏱️ Retrieval: {timings['build_context_s']:.2f}s")
 
                         min_size = 16000
@@ -1255,7 +1353,7 @@ if current_page == "runner":
                                 )
                                 timings["model_run_s"] = time.perf_counter() - _t0
                                 out_tok = chars_to_tokens(len(str(result)))
-                                run_status.write(f"⏱️ {timings['model_run_s']:.2f}s · ✅ **Output**: {out_tok:,} tokens")
+                                run_status.write(f"⏱️ {timings['model_run_s']:.2f}s · ✅ **Output**: {out_tok:,} tokens (~{format_reading_equivalent(out_tok)})")
                                 run_status.update(label="✅ Analysis complete", state="complete")
                                 break
                             except CacheExpiredError as cache_expired:
@@ -1341,29 +1439,21 @@ if current_page == "runner":
                         step_label = f"Follow-on: {next_p.name}"
                         try:
                             step_timing: dict[str, float] = {"name": next_p.name}
-                            plan_status_title = (
-                                f"🔍 Re-planning retrieval for {next_p.name}…"
-                                if USE_RETRIEVAL_PLANNER
-                                else f"🔍 Preparing retrieval for {next_p.name}…"
-                            )
-                            with st.status(plan_status_title, expanded=True) as replan_status:
-                                _t0 = time.perf_counter()
-                                if USE_RETRIEVAL_PLANNER:
+                            if USE_RETRIEVAL_PLANNER:
+                                with st.status(f"🔍 Re-planning retrieval for {next_p.name}…", expanded=True) as replan_status:
+                                    _t0 = time.perf_counter()
                                     sel_ids, top_k_map = plan_retrieval(
                                         _rs, next_p.name, next_p.template_text, accumulated
                                     )
                                     id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
                                     libs_str = ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) if sel_ids else "none"
                                     replan_status.write(f"✅ **{libs_str}**")
-                                else:
-                                    sel_ids, top_k_map = get_default_plan(_rs)
-                                    replan_status.write("✅ Using all libraries.")
-                                step_timing["plan_retrieval_s"] = time.perf_counter() - _t0
-                                replan_status.write(f"⏱️ {step_timing['plan_retrieval_s']:.2f}s")
-                                replan_status.update(
-                                    label="✅ Re-planned" if USE_RETRIEVAL_PLANNER else "✅ Ready",
-                                    state="complete",
-                                )
+                                    step_timing["plan_retrieval_s"] = time.perf_counter() - _t0
+                                    replan_status.write(f"⏱️ {step_timing['plan_retrieval_s']:.2f}s")
+                                    replan_status.update(label="✅ Re-planned", state="complete")
+                            else:
+                                sel_ids, top_k_map = get_default_plan(_rs)
+                                step_timing["plan_retrieval_s"] = 0.0
                             if USE_QUERY_EXPANSION:
                                 step_phrases = expand_queries(
                                     next_p.name, next_p.template_text, accumulated
@@ -1387,7 +1477,21 @@ if current_page == "runner":
                                 last_transient_tokens = step_transient
                                 last_prompt_tokens = step_prompt
                                 last_total_input = step_kb + step_transient + step_prompt
-                                step_ctx_status.write(f"📊 {last_total_input:,} tokens · ⏱️ Retrieval: {step_timing['build_context_s']:.2f}s")
+                                step_ctx_status.write(f"📊 **Context**: {last_total_input:,} tokens")
+                                step_ctx_status.write(f"📖 **Real-world**: {format_reading_equivalent(last_total_input)}")
+                                if step_report:
+                                    for rec in step_report:
+                                        lib_name = rec.get("library_name", "?")
+                                        n = rec.get("chunks_retrieved", 0)
+                                        srcs = rec.get("sources", [])
+                                        if n == 0:
+                                            step_ctx_status.write(f"• **{lib_name}**: 0 chunks")
+                                        else:
+                                            file_summary = ", ".join(f"{s['file_name']} ({s['chunk_count']})" for s in srcs[:5])
+                                            if len(srcs) > 5:
+                                                file_summary += f" +{len(srcs) - 5} more"
+                                            step_ctx_status.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
+                                step_ctx_status.write(f"⏱️ Retrieval: {step_timing['build_context_s']:.2f}s")
                                 if len(step_context_xml) < min_size:
                                     step_ctx_status.update(label="Context too small", state="error")
                                     st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: context too small for cache"

@@ -1,12 +1,18 @@
-# check_models.py
-import google.generativeai as genai
+"""
+List available Gemini models. Requires GEMINI_API_KEY in environment.
+"""
 import os
+import sys
 
-# Set your key directly or load from environment
-os.environ["GEMINI_API_KEY"] = "AIzaSyA7mL0_exRI0t0LtPjOzpveQHzn6UTGvbg"
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+if not api_key:
+    print("GEMINI_API_KEY environment variable is required.", file=sys.stderr)
+    sys.exit(1)
 
-print("Available Gemini Models:")
+import google.generativeai as genai
+
+genai.configure(api_key=api_key)
+print("Available Gemini models:")
 for m in genai.list_models():
-    if 'gemini' in m.name:
-        print(f"- {m.name} (Methods: {m.supported_generation_methods})")	
+    if "gemini" in m.name:
+        print(f"  - {m.name}")

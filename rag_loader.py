@@ -245,7 +245,9 @@ def retrieve_and_build_context(
     top_k_per_library: int | dict[str, int],
 ) -> tuple[str, list[dict[str, Any]]]:
     """
-    Run hybrid retrieval over selected libraries, build context = Core + retrieved.
+    Single-query retrieval: hybrid search over selected libraries, build context = Core + retrieved.
+    The app currently uses retrieve_and_build_context_multi only; this is kept for optional use.
+
     selected_library_ids: list of library folder ids to search.
     top_k_per_library: int (same for all) or dict lib_id -> top_k.
 
