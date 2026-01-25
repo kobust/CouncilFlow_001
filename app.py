@@ -875,6 +875,15 @@ st.sidebar.markdown(
 st.sidebar.divider()
 st.sidebar.markdown("#### **Knowledge base**")
 
+# Show folder info first
+folder_info = get_cached_folder_info(folder_id) if folder_id else None
+if folder_info:
+    name = folder_info.get("name", "Drive folder")
+    link = folder_info.get("link", f"https://drive.google.com/drive/folders/{folder_id}")
+    st.sidebar.markdown(f"Context for the knowledge base dynamically stored here: [**{name}**]({link})")
+else:
+    st.sidebar.caption(f"Context for the knowledge base dynamically stored here: Folder `{folder_id[:20]}...`")
+
 # RAG knowledge base loading (runs once at boot)
 if not st.session_state.get("kb_loading_started") and folder_id:
     st.session_state["kb_loading_started"] = True
@@ -898,14 +907,6 @@ if not st.session_state.get("kb_loading_started") and folder_id:
         st.session_state["kb_loaded"] = False
         st.session_state["rag_state"] = None
         kb_status_placeholder.error(f"⚠ Load error: {str(e)[:60]}…")
-
-folder_info = get_cached_folder_info(folder_id) if folder_id else None
-if folder_info:
-    name = folder_info.get("name", "Drive folder")
-    link = folder_info.get("link", f"https://drive.google.com/drive/folders/{folder_id}")
-    st.sidebar.markdown(f"[**{name}**]({link})")
-else:
-    st.sidebar.caption(f"Folder: `{folder_id[:20]}...`")
 
 # KB status (loaded / error / loading) - show in knowledge base area
 # Note: Success/error messages are shown via kb_status_placeholder above, so we only show status if still loading
