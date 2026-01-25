@@ -40,6 +40,20 @@ def _effective_model() -> str:
 
 EFFECTIVE_MODEL = _effective_model()
 
+
+def _planner_model() -> str:
+    """Model for retrieval planner. Default gemini-2.0-flash to spread quota vs main agent."""
+    v = (os.environ.get("GEMINI_PLANNER_MODEL") or "").strip()
+    return v if v else "gemini-2.0-flash"
+
+
+PLANNER_MODEL = _planner_model()
+
+# GenerateContent (Gemini) is used by: run_agent (1 per run, main prompt+context),
+# run_retrieval_planner (1 when USE_RETRIEVAL_PLANNER), expand_queries (1 when USE_QUERY_EXPANSION),
+# rerank_chunks_llm (batches when RERANK_ENABLED), summarize_files_batch + describe_library (index build only).
+# Cache creation uses CachedContent API (caches.create), not GenerateContent.
+
 # Optional delay (seconds) before generateContent to spread API burst; helps per-minute quotas.
 def _pace_delay_seconds() -> int:
     try:
@@ -581,7 +595,7 @@ def run_retrieval_planner(
         logger.debug("No libraries available for retrieval planner")
         return {"libraries": []}
     client = _client()
-    m = model or DEFAULT_MODEL
+    m = model or PLANNER_MODEL
     catalog = _build_library_catalog(library_metadata)
     budget_text = (context_budget_section or "").strip() or "No explicit context budget; use judgment to stay within model limits."
     prompt = (

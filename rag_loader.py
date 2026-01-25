@@ -23,7 +23,7 @@ from brain import (
     rerank_chunks_llm,
     run_retrieval_planner,
 )
-from brain import EFFECTIVE_MODEL as _EFFECTIVE_MODEL
+from brain import EFFECTIVE_MODEL as _EFFECTIVE_MODEL, PLANNER_MODEL
 from rag import (
     CHUNK_MAX_CHARS,
     build_library_index,
@@ -46,8 +46,8 @@ RERANK_FACTOR = 2
 RETRIEVE_FACTOR = 2  # When rerank off: retrieve/take this many more chunks (we have context headroom).
 
 # LLM-based query expansion and retrieval planner (set False to reduce Gemini calls).
-USE_QUERY_EXPANSION = False
-USE_RETRIEVAL_PLANNER = True
+USE_QUERY_EXPANSION = True
+USE_RETRIEVAL_PLANNER = False
 
 
 def _embed_fn(texts: list[str]):
@@ -193,7 +193,7 @@ def plan_retrieval(
         user_content=user_content,
         library_metadata=library_metadata,
         context_budget_section=context_budget_section,
-        model=_EFFECTIVE_MODEL,
+        model=PLANNER_MODEL,
     )
 
     selected: list[str] = []
