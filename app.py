@@ -736,11 +736,55 @@ _SIDEBAR_HTML = f"""
     display: none !important;
   }}
 }}
-/* Remove horizontal bar above Navigation */
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:first-of-type hr,
-[data-testid="stSidebar"] > div:first-child hr,
-[data-testid="stSidebar"] hr:first-of-type {{
+/* Remove horizontal bar above Navigation - only hide the very first hr if it's before Navigation */
+[data-testid="stSidebar"] > div:first-child [data-testid="stMarkdownContainer"]:first-child hr:first-of-type {{
   display: none !important;
+}}
+/* Ensure all other hr elements in sidebar are visible - be very specific */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] hr {{
+  display: block !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  margin: 0.5rem 0 !important;
+  border: none !important;
+  border-top: 1px solid rgba(250, 250, 250, 0.2) !important;
+  height: 1px !important;
+}}
+/* Make caption text darker */
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{
+  color: #505050 !important;
+}}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {{
+  color: #505050 !important;
+}}
+/* Style section headers consistently - bold and darker */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong {{
+  color: #262626 !important;
+  font-weight: 600 !important;
+}}
+/* Make H4 headings in sidebar larger */
+[data-testid="stSidebar"] h4 {{
+  font-size: 1.1rem !important;
+  font-weight: 600 !important;
+  color: #262626 !important;
+  margin-top: 0.5rem !important;
+  margin-bottom: 0.5rem !important;
+}}
+/* Vertically center button text */
+[data-testid="stSidebar"] button {{
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  vertical-align: middle !important;
+}}
+[data-testid="stSidebar"] button > span,
+[data-testid="stSidebar"] button > div,
+[data-testid="stSidebar"] button > p,
+[data-testid="stSidebar"] button > * {{
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  vertical-align: middle !important;
 }}
 `;
     doc.head.appendChild(style);
@@ -797,7 +841,7 @@ components.html(_SIDEBAR_HTML, height=0)
 # -----------------------------------------------------------------------------
 
 # Navigation (no divider above)
-st.sidebar.markdown("**Navigation**")
+st.sidebar.markdown("#### **Navigation**")
 run_analysis_clicked = st.sidebar.button("▶️ Run Analysis", key="nav_run", use_container_width=True)
 if run_analysis_clicked:
     st.session_state["current_page"] = "runner"
@@ -815,19 +859,21 @@ if current_page == "edit_prompts" and not is_admin:
     st.rerun()
 
 # About
-st.sidebar.markdown("---")
-st.sidebar.caption("About")
+st.sidebar.divider()
+st.sidebar.markdown("#### **About**")
 st.sidebar.markdown(
     f"**{APP_NAME}**  \n"
     "RAG-powered LLM analysis tooling with hybrid retrieval (BM25 + semantic) and Gemini context caching to empower municipal decision making."
 )
+app_version = get_git_version()
+st.sidebar.markdown(f"App version: `{app_version}`")
 st.sidebar.markdown(
     'Developed by **[Todd Kobus](https://www.facebook.com/kobusforattleboro)**'
 )
 
 # Knowledge base section
-st.sidebar.markdown("---")
-st.sidebar.caption("Knowledge base")
+st.sidebar.divider()
+st.sidebar.markdown("#### **Knowledge base**")
 
 # RAG knowledge base loading (runs once at boot)
 if not st.session_state.get("kb_loading_started") and folder_id:
@@ -862,11 +908,10 @@ else:
     st.sidebar.caption(f"Folder: `{folder_id[:20]}...`")
 
 # KB status (loaded / error / loading) - show in knowledge base area
-if st.session_state.get("kb_loaded"):
-    st.sidebar.caption("✓ Knowledge base loaded")
-elif st.session_state.get("kb_load_error"):
+# Note: Success/error messages are shown via kb_status_placeholder above, so we only show status if still loading
+if st.session_state.get("kb_load_error"):
     st.sidebar.caption(f"⚠ {st.session_state['kb_load_error'][:50]}…")
-elif st.session_state.get("kb_loading_started"):
+elif st.session_state.get("kb_loading_started") and not st.session_state.get("kb_loaded"):
     st.sidebar.caption("⏳ Loading knowledge base…")
 
 if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb", use_container_width=True):
@@ -894,22 +939,15 @@ if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb
         st.sidebar.error(f"Error clearing cache: {e}")
 
 # Model & pipeline
-st.sidebar.markdown("---")
-st.sidebar.caption("Model & pipeline")
-app_version = get_git_version()
-st.sidebar.caption(f"App version: `{app_version}`")
+st.sidebar.divider()
+st.sidebar.markdown("#### **Model & pipeline**")
 st.sidebar.caption(f"Model: `{EFFECTIVE_MODEL}`")
 max_ctx = model_max_context(EFFECTIVE_MODEL)
 st.sidebar.caption(f"Context window: {max_ctx:,} tokens")
-st.sidebar.caption(
-    "RAG pipeline: Hybrid retrieval (BM25 + semantic embeddings), reciprocal rank fusion (RRF), "
-    "deduplication, optional query expansion & retrieval planner. "
-    "Context cached via Gemini CachedContent; library indexes on disk."
-)
 
 # Debug info section
-st.sidebar.markdown("---")
-st.sidebar.caption("System info")
+st.sidebar.divider()
+st.sidebar.markdown("#### **System info**")
 python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 st.sidebar.caption(f"Python: `{python_version}`")
 st.sidebar.caption(f"Platform: `{platform.system()} {platform.release()}`")
@@ -939,7 +977,7 @@ authenticator.logout(location="sidebar")
 # -----------------------------------------------------------------------------
 
 if current_page == "edit_prompts":
-    st.markdown("## ✏️ Prompt Editor")
+    st.markdown("### ✏️ Prompt Editor")
     if st.button("← Back to Run Analysis", key="back_to_runner"):
         st.session_state["current_page"] = "runner"
         st.rerun()
@@ -1053,7 +1091,7 @@ if current_page == "runner":
         prompts = []
         task_options = []
 
-    st.markdown("### ▶️ Run Analysis")
+    st.markdown("#### ▶️ Run Analysis")
     st.caption("Select a task, add documents or paste text, then run. Results use the council knowledge base.")
 
     # New Analysis: reset runner state
@@ -1074,7 +1112,7 @@ if current_page == "runner":
     sid = st.session_state.get("analysis_session_id", 0)
     st.markdown("---")
 
-    st.markdown("### Step 1: Select analysis type")
+    st.markdown("#### Step 1: Select analysis type")
     task_select = st.selectbox("Analysis type", options=task_options or ["—"], key="task_select", label_visibility="collapsed")
     selected = next((p for p in prompts if p.name == task_select), None)
 
@@ -1083,7 +1121,7 @@ if current_page == "runner":
         transient_items = list(st.session_state.get("transient_items", []))
         deleted_names = set(st.session_state.get("transient_deleted_file_names", []))
 
-        st.markdown("### Step 2: Add input")
+        st.markdown("#### Step 2: Add input")
         st.caption("Upload PDF/DOCX files or add named pastes. All become the subject of analysis.")
         files = st.file_uploader("Upload files (PDF, Word)", type=["pdf", "docx", "doc"], accept_multiple_files=True, key=f"file_upload_{sid}", label_visibility="collapsed")
         # Sync uploaded files -> transient_items
@@ -1159,7 +1197,7 @@ if current_page == "runner":
                             st.session_state["transient_deleted_file_names"] = list(s)
                         st.rerun()
 
-        st.markdown("### Step 3: Run")
+        st.markdown("#### Step 3: Run")
         run = st.button("Run analysis", key="run_btn", type="primary")
 
         if run:
@@ -1595,7 +1633,7 @@ if current_page == "runner":
         rag_report = st.session_state.get("last_rag_retrieval_report")
 
         if res is not None and res_task == selected.name:
-            st.markdown("### Step 4: Review results")
+            st.markdown("#### Step 4: Review results")
             logger.debug(f"Displaying output: type={type(res).__name__}")
             md = res if isinstance(res, str) else str(res)
             _markdown_with_copy(md, "result")
@@ -1684,7 +1722,7 @@ if current_page == "runner":
                 st.markdown("---")
                 st.info("A follow‑on prompt is configured; run again to see chained results.")
 
-            st.markdown("### Step 5: Export")
+            st.markdown("#### Step 5: Export")
             st.caption("Use the **Copy Markdown** expander above each result to copy the text.")
     else:
         if not task_options:
