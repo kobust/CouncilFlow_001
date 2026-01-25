@@ -1024,12 +1024,15 @@ if current_page == "edit_prompts":
             followon_p = db.get_prompt_by_id(verifier_id_value)
             if followon_p:
                 current_followon_str = f"{followon_p.id}: {followon_p.name}"
-        # Ensure widget sync when switching prompts
-        st.session_state["followon_select"] = current_followon_str or "— None —"
+        # Initialize or sync widget only when prompt selection changes
+        followon_key = f"followon_select_{selected_id}"
+        if followon_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
+            st.session_state[followon_key] = current_followon_str or "— None —"
         followon_index = 0
-        if current_followon_str and current_followon_str in followon_options:
-            followon_index = followon_options.index(current_followon_str)
-        selected_followon_str = st.selectbox("Follow-on prompt", followon_options, index=followon_index, key="followon_select")
+        current_selection = st.session_state.get(followon_key, current_followon_str or "— None —")
+        if current_selection and current_selection in followon_options:
+            followon_index = followon_options.index(current_selection)
+        selected_followon_str = st.selectbox("Follow-on prompt", followon_options, index=followon_index, key=followon_key)
         verifier_id = None
         if selected_followon_str and selected_followon_str != "— None —":
             try:
