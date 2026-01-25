@@ -1289,6 +1289,86 @@ if current_page == "edit_prompts":
         st.session_state["current_page"] = "runner"
         st.rerun()
     st.caption("Manage prompt templates. Admin only.")
+    
+    # Database import/export section
+    with st.expander("💾 Database Import/Export", expanded=False):
+        db_info = db.get_database_info()
+        if db_info.get("exists"):
+            size_mb = db_info.get("size_bytes", 0) / (1024 * 1024)
+            st.caption(f"Database: {db_info.get('path', 'unknown')} ({size_mb:.2f} MB, {db_info.get('prompt_count', 0)} prompts)")
+        else:
+            st.warning("Database file not found")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### Export Database")
+            st.caption("Download a backup of the current database file.")
+            if st.button("📥 Export Database", key="export_db", use_container_width=True):
+                try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    export_filename = f"councilflow_db_{timestamp}.db"
+                    export_path = os.path.join(tempfile.gettempdir(), export_filename)
+                    exported_path = db.export_database(export_path)
+                    
+                    # Read the file and provide download
+                    with open(exported_path, "rb") as f:
+                        st.download_button(
+                            label="⬇️ Download Database Backup",
+                            data=f.read(),
+                            file_name=export_filename,
+                            mime="application/x-sqlite3",
+                            key="download_db"
+                        )
+                    st.success(f"✅ Database exported successfully: {export_filename}")
+                    logger.info(f"Admin exported database to: {exported_path}")
+                except Exception as e:
+                    st.error(f"❌ Error exporting database: {e}")
+                    logger.error(f"Error exporting database: {e}", exc_info=True)
+        
+        with col2:
+            st.markdown("#### Import Database")
+            st.caption("⚠️ **Warning**: This will replace the current database. A backup will be created automatically.")
+            uploaded_file = st.file_uploader(
+                "Choose database file",
+                type=["db", "sqlite", "sqlite3"],
+                key="import_db_file",
+                help="Select a previously exported CouncilFlow database file (.db)"
+            )
+            
+            if uploaded_file is not None:
+                st.info(f"📄 File selected: {uploaded_file.name} ({uploaded_file.size:,} bytes)")
+                
+                if st.button("📤 Import Database", key="import_db", use_container_width=True, type="primary"):
+                    try:
+                        # Save uploaded file to temp location
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp_file:
+                            tmp_file.write(uploaded_file.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        # Import the database
+                        db.import_database(tmp_path, backup_existing=True)
+                        
+                        # Clean up temp file
+                        os.unlink(tmp_path)
+                        
+                        st.success("✅ Database imported successfully! The page will refresh.")
+                        st.info("🔄 Please refresh the page to see the imported data.")
+                        logger.info(f"Admin imported database from: {uploaded_file.name}")
+                        
+                        # Small delay then refresh
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Error importing database: {e}")
+                        logger.error(f"Error importing database: {e}", exc_info=True)
+                        # Clean up temp file if it exists
+                        try:
+                            if 'tmp_path' in locals():
+                                os.unlink(tmp_path)
+                        except Exception:
+                            pass
+    
     st.markdown("---")
     crud_prompts = sorted(db.get_all_prompts(), key=lambda p: p.name.casefold())
     crud_options = ["+ Add new"] + [p.name for p in crud_prompts]

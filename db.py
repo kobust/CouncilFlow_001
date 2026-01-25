@@ -5,6 +5,9 @@ SQLModel-backed persistence for prompt templates.
 from __future__ import annotations
 
 import logging
+import shutil
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import text
@@ -343,6 +346,113 @@ def update_planner_model(model_name: str | None) -> AppConfig:
     except Exception as e:
         logger.error(f"Error updating planner model: {e}", exc_info=True)
         raise
+
+
+# -----------------------------------------------------------------------------
+# Database Import/Export
+# -----------------------------------------------------------------------------
+
+
+def export_database(export_path: str | Path) -> str:
+    """
+    Export the database to a file by copying the database file.
+    Returns the path to the exported file.
+    """
+    export_path = Path(export_path)
+    source_path = Path(DB_PATH)
+    
+    if not source_path.exists():
+        raise FileNotFoundError(f"Database file not found: {DB_PATH}")
+    
+    # Ensure export directory exists
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Copy database file
+    shutil.copy2(source_path, export_path)
+    logger.info(f"Database exported to: {export_path}")
+    return str(export_path)
+
+
+def import_database(import_path: str | Path, backup_existing: bool = True) -> None:
+    """
+    Import a database from a file by replacing the current database.
+    
+    Args:
+        import_path: Path to the database file to import
+        backup_existing: If True, create a backup of the current database before importing
+    
+    Raises:
+        FileNotFoundError: If import_path doesn't exist
+        ValueError: If import_path is not a valid SQLite database
+    """
+    import_path = Path(import_path)
+    target_path = Path(DB_PATH)
+    
+    if not import_path.exists():
+        raise FileNotFoundError(f"Import file not found: {import_path}")
+    
+    # Verify it's a valid SQLite database (check magic bytes)
+    with open(import_path, "rb") as f:
+        magic = f.read(16)
+        if not magic.startswith(b"SQLite format 3"):
+            raise ValueError(f"File does not appear to be a valid SQLite database: {import_path}")
+    
+    # Backup existing database if requested
+    if backup_existing and target_path.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = target_path.parent / f"council.db.backup_{timestamp}"
+        shutil.copy2(target_path, backup_path)
+        logger.info(f"Backed up existing database to: {backup_path}")
+    
+    # Ensure target directory exists
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Copy imported database to target location
+    shutil.copy2(import_path, target_path)
+    
+    # Reset the engine so it picks up the new database
+    global _engine
+    _engine = None
+    
+    logger.info(f"Database imported from: {import_path}")
+    
+    # Reinitialize to ensure schema is up to date
+    init_db()
+
+
+def get_database_info() -> dict:
+    """
+    Get information about the current database.
+    Returns dict with file path, size, and record counts.
+    """
+    db_path = Path(DB_PATH)
+    info = {
+        "path": str(db_path),
+        "exists": db_path.exists(),
+        "size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+    }
+    
+    if db_path.exists():
+        try:
+            engine = _get_engine()
+            with Session(engine) as s:
+                # Count prompts
+                prompt_count = len(list(s.exec(select(PromptTemplate)).all()))
+                info["prompt_count"] = prompt_count
+                
+                # Get app config
+                config = s.get(AppConfig, 1)
+                if config:
+                    info["selected_model"] = config.selected_model
+                    info["planner_model"] = config.planner_model
+                else:
+                    info["selected_model"] = None
+                    info["planner_model"] = None
+        except Exception as e:
+            logger.warning(f"Error getting database info: {e}")
+            info["error"] = str(e)
+    
+    return info
 
 
 if __name__ == "__main__":
