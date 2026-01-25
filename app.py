@@ -2231,13 +2231,10 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                         if has_legal and legal_output:
                             st.markdown("**Legal Expert Consultation:**")
                             _markdown_with_copy(legal_output, f"legal_{step_num}_{step_name}")
-                
-                st.markdown("---")
-                st.markdown("**Final Combined Result (all steps):**")
-            
-            # Show the final combined result
-            md = res if isinstance(res, str) else str(res)
-            _markdown_with_copy(md, "result")
+            else:
+                # Fallback: if no step results stored, show final result
+                md = res if isinstance(res, str) else str(res)
+                _markdown_with_copy(md, "result")
 
             ctx_stats = st.session_state.get("last_run_context_stats")
             if ctx_stats:
