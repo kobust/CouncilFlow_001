@@ -99,7 +99,17 @@ COUNCILFLOW_VERSION = "1.0.0"
 
 
 def get_git_version() -> str:
-    """Get version string from git commit hash."""
+    """Get version string from git commit hash and build number."""
+    # Read build number
+    build_number = None
+    try:
+        build_file = repo_path("BUILD_NUMBER")
+        if os.path.exists(build_file):
+            with open(build_file, "r", encoding="utf-8") as f:
+                build_number = f.read().strip()
+    except Exception as e:
+        logger.debug(f"Could not read build number: {e}")
+    
     try:
         # Try to get short commit hash
         result = subprocess.run(
@@ -120,7 +130,10 @@ def get_git_version() -> str:
                 cwd=repo_path(),
             )
             if tag_result.returncode == 0:
-                return tag_result.stdout.strip()
+                tag = tag_result.stdout.strip()
+                if build_number:
+                    return f"{tag}.{build_number}"
+                return tag
             # Try to get branch name
             branch_result = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -130,9 +143,16 @@ def get_git_version() -> str:
                 cwd=repo_path(),
             )
             branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
-            return f"{COUNCILFLOW_VERSION}-{commit_hash[:7]} ({branch})"
+            version_str = f"{COUNCILFLOW_VERSION}-{commit_hash[:7]}"
+            if build_number:
+                version_str += f".{build_number}"
+            return f"{version_str} ({branch})"
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
         logger.debug(f"Could not get git version: {e}")
+    
+    # Fallback: return base version with build number if available
+    if build_number:
+        return f"{COUNCILFLOW_VERSION}.{build_number}"
     return COUNCILFLOW_VERSION
 
 # -----------------------------------------------------------------------------
