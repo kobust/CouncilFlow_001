@@ -668,7 +668,7 @@ _BANNER_HTML = f"""
   bar.id = "app-banner";
   bar.style.cssText = "position:fixed;top:0;left:0;right:0;width:100%;height:{_BANNER_H}px;background:#1e3a5f;color:#fff;display:flex;align-items:center;padding:0 1rem;gap:0.75rem;box-shadow:0 1px 4px rgba(0,0,0,0.15);font-family:inherit;z-index:1000002;";
   bar.innerHTML = '<button id="app-menu-btn" aria-label="Menu" style="width:32px;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,0.35);background:transparent;color:#fff;font-size:18px;line-height:1;cursor:pointer;">☰</button>' +
-    '<span style="font-size:1rem;font-weight:600;white-space:nowrap;">🏛️ {APP_NAME}</span>' +
+    '<span style="font-size:1.5rem;font-weight:600;white-space:nowrap;">🏛️ {APP_NAME}</span>' +
     '<span class="app-banner-subtitle" style="font-size:0.85rem;opacity:0.9;margin-left:0.5rem;">AI-assisted analysis for municipal council workflows</span>';
   doc.body.insertBefore(bar, doc.body.firstChild);
   var subtitle = bar.querySelector(".app-banner-subtitle");
