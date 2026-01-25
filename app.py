@@ -20,7 +20,7 @@ from pathlib import Path
 
 # Token usage optimization: configurable delays to spread API calls across time
 PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "10") or "10")
-LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "10") or "10")
+LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "0") or "0")
 
 import pandas as pd
 import streamlit as st
@@ -1852,8 +1852,8 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                     
                     # If legal questions exist and a legal expert prompt is configured, consult it
                     if legal_questions and getattr(selected, "legal_expert_prompt_id", None):
-                        # Add delay before legal expert consultation to spread token usage
-                        LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "10") or "10")
+                        # Add delay before legal expert consultation to spread token usage (default: 0, no delay)
+                        LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "0") or "0")
                         if LEGAL_EXPERT_DELAY_SECONDS > 0:
                             with st.status(f"⏳ Waiting {LEGAL_EXPERT_DELAY_SECONDS}s before legal consultation (rate limit management)…", expanded=False):
                                 time.sleep(LEGAL_EXPERT_DELAY_SECONDS)
@@ -2005,8 +2005,8 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                     # Store first step result for progressive display
                     first_step_result = main_content
                     if legal_expert_output:
+                        # Integrate legal expert output into main output (don't add as separate step)
                         first_step_result = f"{main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(legal_expert_output)}"
-                        chain.append(("Legal Expert Consultation", first_step_result))
                         accumulated = first_step_result
                     
                     # Initialize pipeline step results storage
@@ -2278,15 +2278,9 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                                 else:
                                     step_output_with_legal = step_main_content
                                 
-                                # Add follow-on prompt output to chain
+                                # Add follow-on prompt output to chain (legal expert already integrated in step_output_with_legal)
                                 accumulated = accumulated + _sep + step_output_with_legal
                                 chain.append((next_p.name, accumulated))
-                                
-                                # Add legal expert consultation as separate step if it happened
-                                if step_legal_expert_output:
-                                    step_legal_expert_step_output = f"{accumulated}"
-                                    chain.append((f"Legal Expert Consultation ({next_p.name})", step_legal_expert_step_output))
-                                    accumulated = step_legal_expert_step_output
                                 
                                 # Store this step's result for progressive display
                                 step_num = len(st.session_state.get("pipeline_step_results", [])) + 1
@@ -2407,11 +2401,8 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                     legal_output = step_result.get("legal_expert_output")
                     
                     with st.expander(f"Step {step_num}: {step_name}", expanded=(step_num == 1)):
+                        # full_output already includes legal expert consultation if present
                         _markdown_with_copy(full_output, f"step_{step_num}_{step_name}")
-                        
-                        if has_legal and legal_output:
-                            st.markdown("**Legal Expert Consultation:**")
-                            _markdown_with_copy(legal_output, f"legal_{step_num}_{step_name}")
             else:
                 # Fallback: if no step results stored, show final result
                 md = res if isinstance(res, str) else str(res)

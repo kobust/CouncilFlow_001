@@ -188,7 +188,7 @@ GEMINI_PACE_DELAY_SECONDS = _pace_delay_seconds()
 # If running multiple instances (dev + prod), they share the same quota.
 # Solution: Use different API keys or reduce GEMINI_RATE_LIMIT_RPM proportionally.
 _last_request_times: list[float] = []
-_RATE_LIMIT_REQUESTS_PER_MINUTE = 15  # Conservative default (can be overridden)
+_RATE_LIMIT_REQUESTS_PER_MINUTE = 10  # Conservative default (can be overridden via GEMINI_RATE_LIMIT_RPM env var)
 _RATE_LIMIT_WINDOW_SECONDS = 60
 _rate_limit_warning_shown = False
 
