@@ -313,10 +313,27 @@ def retrieve_and_build_context_multi(
     report: list[dict[str, Any]] = []
     use_map = isinstance(top_k_per_library, dict)
 
+    # Pre-embed all queries once and reuse across libraries (caching handled in embed_query)
+    # Deduplicate queries within the batch to avoid redundant embedding calls
+    query_to_embedding: dict[str, list[float]] = {}
     query_embeddings: list[list[float]] = []
+    
     for q in queries:
-        query_embeddings.append(_embed_query_fn(q))
-    logger.info("pre-embedded %d query phrase(s), reusing across libraries", len(query_embeddings))
+        if q in query_to_embedding:
+            # Reuse embedding for duplicate query in same batch
+            query_embeddings.append(query_to_embedding[q])
+            logger.debug(f"Reusing query embedding for duplicate query in batch: {q[:50]}...")
+        else:
+            # Embed query (will use cache if available)
+            emb = _embed_query_fn(q)
+            query_to_embedding[q] = emb
+            query_embeddings.append(emb)
+    
+    unique_queries = len(query_to_embedding)
+    if unique_queries < len(queries):
+        logger.info(f"Pre-embedded {len(queries)} query phrase(s) ({unique_queries} unique, {len(queries) - unique_queries} duplicates), reusing across libraries")
+    else:
+        logger.info(f"Pre-embedded {len(queries)} query phrase(s), reusing across libraries")
 
     for lib in rag_state["libraries"]:
         if lib["id"] not in selected_library_ids:

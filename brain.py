@@ -221,24 +221,161 @@ def embed_documents(texts: list[str], batch_size: int = EMBED_BATCH_SIZE) -> lis
     return out
 
 
-# Query embedding cache (session-level to avoid redundant API calls)
+# Query embedding cache (module-level fallback if Streamlit not available)
 _query_embedding_cache: dict[str, list[float]] = {}
+_disk_cache_loaded = False
+
+# Query expansion cache (task + content -> expanded phrases)
+_query_expansion_cache: dict[str, list[str]] = {}
+_query_expansion_disk_loaded = False
+
+# Retrieval planner cache (task + content + libraries -> plan)
+_retrieval_planner_cache: dict[str, dict[str, Any]] = {}
+_retrieval_planner_disk_loaded = False
+
+# File summary cache (file content hash -> summary)
+_file_summary_cache: dict[str, str] = {}
+_file_summary_disk_loaded = False
+
+# Library description cache (library name + file descriptors hash -> description)
+_library_description_cache: dict[str, str] = {}
+_library_description_disk_loaded = False
+
+
+def _load_disk_cache_if_needed() -> None:
+    """Lazy-load disk cache on first use."""
+    global _query_embedding_cache, _disk_cache_loaded
+    if _disk_cache_loaded:
+        return
+    try:
+        from rag_cache import load_query_embedding_cache, get_query_hash
+        disk_cache = load_query_embedding_cache()
+        # Merge disk cache into module cache (disk cache takes precedence for consistency)
+        _query_embedding_cache.update(disk_cache)
+        _disk_cache_loaded = True
+        logger.debug(f"Loaded {len(disk_cache)} query embeddings from disk cache")
+    except Exception as e:
+        logger.debug(f"Could not load disk cache (non-fatal): {e}")
+        _disk_cache_loaded = True  # Mark as loaded to avoid repeated attempts
+
+
+def _load_all_disk_caches() -> None:
+    """Pre-load all disk caches on startup for faster first use."""
+    global _query_embedding_cache, _disk_cache_loaded
+    global _query_expansion_cache, _query_expansion_disk_loaded
+    global _retrieval_planner_cache, _retrieval_planner_disk_loaded
+    global _file_summary_cache, _file_summary_disk_loaded
+    global _library_description_cache, _library_description_disk_loaded
+    
+    # Load query embedding cache
+    if not _disk_cache_loaded:
+        _load_disk_cache_if_needed()
+    
+    # Load query expansion cache
+    if not _query_expansion_disk_loaded:
+        try:
+            from rag_cache import load_query_expansion_cache
+            disk_cache = load_query_expansion_cache()
+            _query_expansion_cache.update(disk_cache)
+            _query_expansion_disk_loaded = True
+            logger.debug(f"Pre-loaded {len(disk_cache)} query expansion results from disk cache")
+        except Exception as e:
+            logger.debug(f"Could not pre-load query expansion cache (non-fatal): {e}")
+            _query_expansion_disk_loaded = True
+    
+    # Load retrieval planner cache
+    if not _retrieval_planner_disk_loaded:
+        try:
+            from rag_cache import load_retrieval_planner_cache
+            disk_cache = load_retrieval_planner_cache()
+            _retrieval_planner_cache.update(disk_cache)
+            _retrieval_planner_disk_loaded = True
+            logger.debug(f"Pre-loaded {len(disk_cache)} retrieval planner results from disk cache")
+        except Exception as e:
+            logger.debug(f"Could not pre-load retrieval planner cache (non-fatal): {e}")
+            _retrieval_planner_disk_loaded = True
+    
+    # Load file summary cache
+    if not _file_summary_disk_loaded:
+        try:
+            from rag_cache import load_file_summary_cache
+            disk_cache = load_file_summary_cache()
+            _file_summary_cache.update(disk_cache)
+            _file_summary_disk_loaded = True
+            logger.debug(f"Pre-loaded {len(disk_cache)} file summaries from disk cache")
+        except Exception as e:
+            logger.debug(f"Could not pre-load file summary cache (non-fatal): {e}")
+            _file_summary_disk_loaded = True
+    
+    # Load library description cache
+    if not _library_description_disk_loaded:
+        try:
+            from rag_cache import load_library_description_cache
+            disk_cache = load_library_description_cache()
+            _library_description_cache.update(disk_cache)
+            _library_description_disk_loaded = True
+            logger.debug(f"Pre-loaded {len(disk_cache)} library descriptions from disk cache")
+        except Exception as e:
+            logger.debug(f"Could not pre-load library description cache (non-fatal): {e}")
+            _library_description_disk_loaded = True
 
 
 def embed_query(text: str) -> list[float]:
     """
     Embed a single query for retrieval. Uses RETRIEVAL_QUERY task type. Retries on 429.
-    Caches embeddings in memory to avoid redundant API calls for identical queries.
+    
+    Multi-level caching strategy (fastest to slowest):
+    1. Streamlit session state (fastest, in-memory for current session)
+    2. Module-level in-memory cache (persists during process lifetime)
+    3. Disk cache (persists across restarts)
+    4. API call (if not cached)
+    
+    Caching improves speed and reduces API costs without affecting quality.
     """
     import hashlib
     import math
     
-    # Check cache first (use hash of query text as key)
+    # Get query hash for cache key
     query_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    
+    # Level 1: Check Streamlit session state (fastest, session-scoped)
+    try:
+        if "query_embedding_cache" not in st.session_state:
+            st.session_state["query_embedding_cache"] = {}
+        session_cache = st.session_state["query_embedding_cache"]
+        if query_hash in session_cache:
+            logger.debug(f"Query embedding session cache hit: {text[:50]}...")
+            return session_cache[query_hash]
+    except Exception:
+        pass  # Streamlit not available, continue to next level
+    
+    # Level 2: Check module-level in-memory cache
     if query_hash in _query_embedding_cache:
-        logger.debug(f"Query embedding cache hit for query: {text[:50]}...")
+        logger.debug(f"Query embedding memory cache hit: {text[:50]}...")
+        # Also store in session cache if available
+        try:
+            if "query_embedding_cache" not in st.session_state:
+                st.session_state["query_embedding_cache"] = {}
+            st.session_state["query_embedding_cache"][query_hash] = _query_embedding_cache[query_hash]
+        except Exception:
+            pass
         return _query_embedding_cache[query_hash]
     
+    # Level 3: Load disk cache if not already loaded
+    _load_disk_cache_if_needed()
+    if query_hash in _query_embedding_cache:
+        logger.debug(f"Query embedding disk cache hit: {text[:50]}...")
+        # Also store in session cache if available
+        try:
+            if "query_embedding_cache" not in st.session_state:
+                st.session_state["query_embedding_cache"] = {}
+            st.session_state["query_embedding_cache"][query_hash] = _query_embedding_cache[query_hash]
+        except Exception:
+            pass
+        return _query_embedding_cache[query_hash]
+    
+    # Level 4: API call (cache miss)
+    logger.debug(f"Query embedding cache miss, calling API: {text[:50]}...")
     client = _client()
     config = types.EmbedContentConfig(
         task_type="RETRIEVAL_QUERY",
@@ -271,11 +408,77 @@ def embed_query(text: str) -> list[float]:
     if norm > 0:
         v = [x / norm for x in v]
     
-    # Cache the result
+    # Cache the result at all levels
     _query_embedding_cache[query_hash] = v
-    logger.debug(f"Cached query embedding for: {text[:50]}...")
     
+    # Store in session cache if available
+    try:
+        if "query_embedding_cache" not in st.session_state:
+            st.session_state["query_embedding_cache"] = {}
+        st.session_state["query_embedding_cache"][query_hash] = v
+    except Exception:
+        pass
+    
+    # Save to disk cache periodically (every 10 new entries to avoid excessive I/O)
+    try:
+        from rag_cache import save_query_embedding_cache
+        # Update disk cache periodically (every 10 new entries to avoid excessive I/O)
+        if len(_query_embedding_cache) % 10 == 0:
+            save_query_embedding_cache(_query_embedding_cache)
+    except Exception as e:
+        logger.debug(f"Could not save to disk cache (non-fatal): {e}")
+    
+    logger.debug(f"Cached query embedding (new): {text[:50]}...")
     return v
+
+
+def save_query_embedding_cache_to_disk() -> None:
+    """
+    Explicitly save query embedding cache to disk.
+    Call this periodically or on shutdown to ensure persistence.
+    """
+    try:
+        from rag_cache import save_query_embedding_cache
+        save_query_embedding_cache(_query_embedding_cache)
+        logger.debug(f"Query embedding cache saved to disk ({len(_query_embedding_cache)} entries)")
+    except Exception as e:
+        logger.warning(f"Failed to save query embedding cache: {e}")
+
+
+def get_query_embedding_cache_stats() -> dict[str, Any]:
+    """
+    Get statistics about query embedding cache usage.
+    Returns dict with cache size, session cache size, etc.
+    """
+    stats = {
+        "memory_cache_size": len(_query_embedding_cache),
+        "disk_cache_loaded": _disk_cache_loaded,
+        "query_expansion_cache_size": len(_query_expansion_cache),
+        "retrieval_planner_cache_size": len(_retrieval_planner_cache),
+    }
+    try:
+        if "query_embedding_cache" in st.session_state:
+            stats["session_cache_size"] = len(st.session_state["query_embedding_cache"])
+        else:
+            stats["session_cache_size"] = 0
+    except Exception:
+        stats["session_cache_size"] = 0
+    return stats
+
+
+def save_all_caches_to_disk() -> None:
+    """
+    Save all caches to disk explicitly.
+    Call this periodically or on shutdown to ensure persistence.
+    """
+    save_query_embedding_cache_to_disk()
+    try:
+        from rag_cache import save_query_expansion_cache, save_retrieval_planner_cache
+        save_query_expansion_cache(_query_expansion_cache)
+        save_retrieval_planner_cache(_retrieval_planner_cache)
+        logger.debug("All caches saved to disk")
+    except Exception as e:
+        logger.warning(f"Failed to save some caches: {e}")
 
 
 # -----------------------------------------------------------------------------
@@ -424,26 +627,79 @@ def summarize_files_batch(
     """
     For each file {name, text}, produce a one-sentence summary via LLM.
     Processes in batches. Returns list of summary strings (same order as files).
+    
+    Caching: Results are cached based on file content hash.
+    This avoids redundant LLM calls for identical files during index rebuilds.
     """
+    import hashlib
+    
     if not files:
         return []
+    
+    # Load disk cache if not already loaded
+    global _file_summary_cache, _file_summary_disk_loaded
+    if not _file_summary_disk_loaded:
+        try:
+            from rag_cache import load_file_summary_cache
+            disk_cache = load_file_summary_cache()
+            _file_summary_cache.update(disk_cache)
+            _file_summary_disk_loaded = True
+            logger.debug(f"Pre-loaded {len(disk_cache)} file summaries from disk cache")
+        except Exception as e:
+            logger.debug(f"Could not load file summary disk cache (non-fatal): {e}")
+            _file_summary_disk_loaded = True
+    
+    # Check cache for each file and collect uncached ones
+    all_summaries: list[str] = []
+    uncached_files: list[tuple[int, dict[str, Any]]] = []  # (original_index, file)
+    
+    for idx, f in enumerate(files):
+        text = (f.get("text") or "").strip()
+        # Use first part of text for hash (consistent with what we send to LLM)
+        text_for_hash = text[:max_chars_per_file] if len(text) > max_chars_per_file else text
+        file_hash = hashlib.sha256(text_for_hash.encode('utf-8')).hexdigest()
+        
+        if file_hash in _file_summary_cache:
+            all_summaries.append(_file_summary_cache[file_hash])
+            logger.debug(f"File summary cache hit for file: {f.get('name', '?')[:50]}...")
+        else:
+            all_summaries.append(None)  # Placeholder, will be filled later
+            uncached_files.append((idx, f))
+    
+    # If all files were cached, return early
+    if not uncached_files:
+        logger.info(f"All {len(files)} file summaries retrieved from cache")
+        return all_summaries
+    
+    # Process uncached files in batches
     client = _client()
     m = DEFAULT_MODEL
-    all_summaries: list[str] = []
-    for b in range(0, len(files), batch_size):
-        batch = files[b : b + batch_size]
+    cache_updates: dict[str, str] = {}
+    
+    for b in range(0, len(uncached_files), batch_size):
+        batch = uncached_files[b : b + batch_size]
+        batch_indices = [idx for idx, _ in batch]
+        batch_files = [f for _, f in batch]
+        
         if progress_callback:
             try:
-                progress_callback("summarize", min(b + batch_size, len(files)), len(files), None)
+                progress_callback("summarize", min(b + batch_size, len(uncached_files)), len(uncached_files), None)
             except Exception:
                 pass
+        
         parts: list[str] = []
-        for i, f in enumerate(batch):
+        file_hashes: list[str] = []
+        for f in batch_files:
             name = f.get("name") or "Untitled"
             text = (f.get("text") or "").strip()
             if len(text) > max_chars_per_file:
                 text = text[:max_chars_per_file] + "..."
-            parts.append(f"Document {i + 1} (filename: {name}):\n\n{text or '(empty)'}")
+            parts.append(f"Document {len(parts) + 1} (filename: {name}):\n\n{text or '(empty)'}")
+            # Calculate hash for caching
+            text_for_hash = text
+            file_hash = hashlib.sha256(text_for_hash.encode('utf-8')).hexdigest()
+            file_hashes.append(file_hash)
+        
         prompt = (
             "For each of the following documents, provide exactly one short sentence (max 30 words) "
             "summarizing its contents. Respond with valid JSON only:\n"
@@ -456,24 +712,23 @@ def summarize_files_batch(
         )
         contents = [types.Content(role="user", parts=[_text_part(prompt)])]
         delay = 1.0
+        batch_summaries: list[str] = []
         for attempt in range(3):
             try:
                 r = client.models.generate_content(model=m, contents=contents, config=config)
                 text = (r.text or "").strip()
                 parsed = _parse_json_robust(text)
                 summaries = parsed.get("summaries") if isinstance(parsed, dict) else None
-                if isinstance(summaries, list) and len(summaries) >= len(batch):
-                    all_summaries.extend(summaries[: len(batch)])
+                if isinstance(summaries, list) and len(summaries) >= len(batch_files):
+                    batch_summaries = summaries[: len(batch_files)]
                     break
                 if isinstance(summaries, list):
-                    for s in summaries[: len(batch)]:
-                        all_summaries.append((s[:200] if isinstance(s, str) else str(s)))
-                    while len(all_summaries) < b + len(batch):
-                        all_summaries.append("(summary unavailable)")
+                    batch_summaries = [(s[:200] if isinstance(s, str) else str(s)) for s in summaries[: len(batch_files)]]
+                    while len(batch_summaries) < len(batch_files):
+                        batch_summaries.append("(summary unavailable)")
                     break
                 logger.warning("Summarizer response invalid, using fallback")
-                for _ in batch:
-                    all_summaries.append("(summary unavailable)")
+                batch_summaries = ["(summary unavailable)"] * len(batch_files)
                 break
             except (errors.ServerError, errors.ClientError) as e:
                 if attempt < 2:
@@ -483,17 +738,36 @@ def summarize_files_batch(
                     time.sleep(wait)
                     delay *= 2
                 else:
-                    for _ in batch:
-                        all_summaries.append("(summary unavailable)")
+                    batch_summaries = ["(summary unavailable)"] * len(batch_files)
                     logger.warning(f"Summarizer failed after retries: {e}")
                     break
             except Exception as e:
-                for _ in batch:
-                    all_summaries.append("(summary unavailable)")
+                batch_summaries = ["(summary unavailable)"] * len(batch_files)
                 logger.warning(f"Summarizer error: {e}")
                 break
-        if b + batch_size < len(files):
+        
+        # Update cache and results
+        for i, (orig_idx, _) in enumerate(batch):
+            if i < len(batch_summaries):
+                summary = batch_summaries[i]
+                file_hash = file_hashes[i]
+                all_summaries[orig_idx] = summary
+                _file_summary_cache[file_hash] = summary
+                cache_updates[file_hash] = summary
+        
+        if b + batch_size < len(uncached_files):
             time.sleep(0.3)
+    
+    # Save cache to disk periodically
+    if cache_updates:
+        try:
+            from rag_cache import save_file_summary_cache
+            if len(_file_summary_cache) % 50 == 0:  # Save every 50 new entries
+                save_file_summary_cache(_file_summary_cache)
+        except Exception as e:
+            logger.debug(f"Could not save file summary cache (non-fatal): {e}")
+    
+    logger.info(f"Generated {len(uncached_files)} new file summaries, {len(files) - len(uncached_files)} from cache")
     return all_summaries
 
 
@@ -506,9 +780,42 @@ def describe_library(
     """
     Produce a 1–2 sentence description of a library from its file list and per-file summaries.
     file_descriptors: list of {name, summary}.
+    
+    Caching: Results are cached based on library name + file descriptors hash.
+    This avoids redundant LLM calls for identical libraries during index rebuilds.
     """
+    import hashlib
+    import json
+    
     if not file_descriptors:
         return f"Library '{library_name}' has no files."
+    
+    # Build cache key from library name + file descriptors
+    # Use a stable representation of file descriptors (sorted by name, include summary)
+    fd_key = sorted([(d.get("name", ""), d.get("summary", "")[:120]) for d in file_descriptors[:max_files]])
+    cache_input = f"{library_name}|{json.dumps(fd_key, sort_keys=True)}"
+    cache_key = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
+    
+    # Load disk cache if not already loaded
+    global _library_description_cache, _library_description_disk_loaded
+    if not _library_description_disk_loaded:
+        try:
+            from rag_cache import load_library_description_cache
+            disk_cache = load_library_description_cache()
+            _library_description_cache.update(disk_cache)
+            _library_description_disk_loaded = True
+            logger.debug(f"Pre-loaded {len(disk_cache)} library descriptions from disk cache")
+        except Exception as e:
+            logger.debug(f"Could not load library description disk cache (non-fatal): {e}")
+            _library_description_disk_loaded = True
+    
+    # Check cache
+    if cache_key in _library_description_cache:
+        logger.debug(f"Library description cache hit: {library_name}")
+        return _library_description_cache[cache_key]
+    
+    # Cache miss - call LLM
+    logger.debug(f"Library description cache miss, calling LLM: {library_name}")
     limited = file_descriptors[:max_files]
     lines = []
     for d in limited:
@@ -530,10 +837,26 @@ def describe_library(
     contents = [types.Content(role="user", parts=[_text_part(prompt)])]
     try:
         r = client.models.generate_content(model=DEFAULT_MODEL, contents=contents, config=config)
-        return (r.text or "").strip() or f"Library '{library_name}' with {len(file_descriptors)} files."
+        description = (r.text or "").strip() or f"Library '{library_name}' with {len(file_descriptors)} files."
+        
+        # Cache the result
+        _library_description_cache[cache_key] = description
+        
+        # Save to disk cache periodically
+        try:
+            from rag_cache import save_library_description_cache
+            if len(_library_description_cache) % 20 == 0:  # Save every 20 new entries
+                save_library_description_cache(_library_description_cache)
+        except Exception as e:
+            logger.debug(f"Could not save library description cache (non-fatal): {e}")
+        
+        return description
     except Exception as e:
         logger.warning(f"describe_library failed: {e}")
-        return f"Library '{library_name}' with {len(file_descriptors)} files."
+        fallback = f"Library '{library_name}' with {len(file_descriptors)} files."
+        # Cache fallback too
+        _library_description_cache[cache_key] = fallback
+        return fallback
 
 
 # -----------------------------------------------------------------------------
@@ -610,10 +933,44 @@ def run_retrieval_planner(
     library_metadata: list of {name, library_description?, file_descriptors?: [{name, summary}]}.
     context_budget_section: optional paragraph describing token/chunk budget for retrieved KB.
     Returns {"libraries": [{"name": str, "top_k": int}, ...]} or None on failure.
+    
+    Caching: Results are cached based on task_name + task_description + user_content + library_metadata hash.
+    This avoids redundant LLM calls for identical or similar planning requests.
     """
+    import hashlib
+    import json
+    
     if not library_metadata:
         logger.debug("No libraries available for retrieval planner")
         return {"libraries": []}
+    
+    # Build cache key from inputs (include library names for cache key)
+    library_names = sorted([lib.get("name", "") for lib in library_metadata])
+    cache_input = f"{task_name}|{task_description[:2500]}|{user_content[:3500]}|{context_budget_section or ''}|{','.join(library_names)}"
+    cache_key = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
+    
+    # Check cache first (memory, then disk)
+    if cache_key in _retrieval_planner_cache:
+        logger.debug(f"Retrieval planner cache hit: {task_name[:50]}...")
+        return _retrieval_planner_cache[cache_key]
+    
+    # Load disk cache if not already loaded
+    global _retrieval_planner_disk_loaded
+    if not _retrieval_planner_disk_loaded:
+        try:
+            from rag_cache import load_retrieval_planner_cache
+            disk_cache = load_retrieval_planner_cache()
+            _retrieval_planner_cache.update(disk_cache)
+            _retrieval_planner_disk_loaded = True
+            if cache_key in _retrieval_planner_cache:
+                logger.debug(f"Retrieval planner disk cache hit: {task_name[:50]}...")
+                return _retrieval_planner_cache[cache_key]
+        except Exception as e:
+            logger.debug(f"Could not load retrieval planner disk cache (non-fatal): {e}")
+            _retrieval_planner_disk_loaded = True
+    
+    # Cache miss - call LLM
+    logger.debug(f"Retrieval planner cache miss, calling LLM: {task_name[:50]}...")
     client = _client()
     m = model or PLANNER_MODEL
     catalog = _build_library_catalog(library_metadata)
@@ -639,6 +996,18 @@ def run_retrieval_planner(
             parsed = _parse_json_robust(text)
             if parsed and isinstance(parsed.get("libraries"), list):
                 logger.info(f"Planner chose {len(parsed['libraries'])} libraries")
+                
+                # Cache the result
+                _retrieval_planner_cache[cache_key] = parsed
+                
+                # Save to disk cache periodically (every 10 new entries)
+                try:
+                    from rag_cache import save_retrieval_planner_cache
+                    if len(_retrieval_planner_cache) % 10 == 0:
+                        save_retrieval_planner_cache(_retrieval_planner_cache)
+                except Exception as e:
+                    logger.debug(f"Could not save retrieval planner cache (non-fatal): {e}")
+                
                 return parsed
             logger.warning("Planner response missing or invalid 'libraries' array")
             return None
@@ -685,8 +1054,40 @@ def expand_queries(
     """
     Generate 3–5 search phrases from task + user content via LLM.
     Returns list of phrases, or fallback [task_name + user_content excerpt] on failure.
+    
+    Caching: Results are cached based on task_name + template_text + user_content hash.
+    This avoids redundant LLM calls for identical or similar queries.
     """
+    import hashlib
+    
     fallback = [f"{task_name}\n\n{(user_content or '')[:2000]}"]
+    
+    # Build cache key from inputs
+    cache_input = f"{task_name}|{template_text[:1500]}|{user_content[:2500]}"
+    cache_key = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
+    
+    # Check cache first (memory, then disk)
+    if cache_key in _query_expansion_cache:
+        logger.debug(f"Query expansion cache hit: {task_name[:50]}...")
+        return _query_expansion_cache[cache_key]
+    
+    # Load disk cache if not already loaded
+    global _query_expansion_disk_loaded
+    if not _query_expansion_disk_loaded:
+        try:
+            from rag_cache import load_query_expansion_cache
+            disk_cache = load_query_expansion_cache()
+            _query_expansion_cache.update(disk_cache)
+            _query_expansion_disk_loaded = True
+            if cache_key in _query_expansion_cache:
+                logger.debug(f"Query expansion disk cache hit: {task_name[:50]}...")
+                return _query_expansion_cache[cache_key]
+        except Exception as e:
+            logger.debug(f"Could not load query expansion disk cache (non-fatal): {e}")
+            _query_expansion_disk_loaded = True
+    
+    # Cache miss - call LLM
+    logger.debug(f"Query expansion cache miss, calling LLM: {task_name[:50]}...")
     try:
         client = _client()
         m = model or DEFAULT_MODEL
@@ -721,6 +1122,18 @@ def expand_queries(
             if len(out) >= 5:
                 break
         logger.info("expand_queries: %d phrases", len(out))
+        
+        # Cache the result
+        _query_expansion_cache[cache_key] = out
+        
+        # Save to disk cache periodically (every 20 new entries)
+        try:
+            from rag_cache import save_query_expansion_cache
+            if len(_query_expansion_cache) % 20 == 0:
+                save_query_expansion_cache(_query_expansion_cache)
+        except Exception as e:
+            logger.debug(f"Could not save query expansion cache (non-fatal): {e}")
+        
         return out
     except Exception as e:
         logger.warning("expand_queries failed: %s, using fallback", e)

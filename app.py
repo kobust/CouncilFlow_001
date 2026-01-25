@@ -236,6 +236,32 @@ except Exception as e:
     st.error(f"Database error: {e}")
     st.stop()
 
+# Pre-load disk caches on startup for faster first use
+if "caches_preloaded" not in st.session_state:
+    try:
+        from brain import _load_all_disk_caches
+        _load_all_disk_caches()
+        st.session_state["caches_preloaded"] = True
+        logger.info("Pre-loaded all disk caches on startup")
+    except Exception as e:
+        logger.debug(f"Could not pre-load caches (non-fatal): {e}")
+        st.session_state["caches_preloaded"] = True  # Mark as attempted
+
+# Load session state cache from disk (persist across sessions)
+if "query_embedding_cache" not in st.session_state:
+    try:
+        from rag_cache import load_query_embedding_cache
+        from brain import get_query_hash
+        disk_cache = load_query_embedding_cache()
+        # Initialize session cache with disk cache (limited to 1000 entries for memory efficiency)
+        session_cache = dict(list(disk_cache.items())[-1000:])
+        st.session_state["query_embedding_cache"] = session_cache
+        if session_cache:
+            logger.debug(f"Loaded {len(session_cache)} query embeddings into session cache from disk")
+    except Exception as e:
+        logger.debug(f"Could not load session cache from disk (non-fatal): {e}")
+        st.session_state["query_embedding_cache"] = {}
+
 # Initialize session state
 if "last_result" not in st.session_state:
     st.session_state["last_result"] = None
@@ -1087,6 +1113,12 @@ if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb
         n = clear_disk_cache_for_folder(folder_id)
         if n:
             logger.info(f"Cleared {n} RAG index cache file(s)")
+        # Save all caches to disk when clearing RAG state
+        try:
+            from brain import save_all_caches_to_disk
+            save_all_caches_to_disk()
+        except Exception:
+            pass
         st.session_state["gemini_cache_name"] = None
         st.session_state["gemini_cache_folder_id"] = None
         st.session_state["run_cache_key"] = None
