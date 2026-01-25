@@ -221,9 +221,24 @@ def embed_documents(texts: list[str], batch_size: int = EMBED_BATCH_SIZE) -> lis
     return out
 
 
+# Query embedding cache (session-level to avoid redundant API calls)
+_query_embedding_cache: dict[str, list[float]] = {}
+
+
 def embed_query(text: str) -> list[float]:
-    """Embed a single query for retrieval. Uses RETRIEVAL_QUERY task type. Retries on 429."""
+    """
+    Embed a single query for retrieval. Uses RETRIEVAL_QUERY task type. Retries on 429.
+    Caches embeddings in memory to avoid redundant API calls for identical queries.
+    """
+    import hashlib
     import math
+    
+    # Check cache first (use hash of query text as key)
+    query_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    if query_hash in _query_embedding_cache:
+        logger.debug(f"Query embedding cache hit for query: {text[:50]}...")
+        return _query_embedding_cache[query_hash]
+    
     client = _client()
     config = types.EmbedContentConfig(
         task_type="RETRIEVAL_QUERY",
@@ -255,6 +270,11 @@ def embed_query(text: str) -> list[float]:
     norm = math.sqrt(sum(x * x for x in v))
     if norm > 0:
         v = [x / norm for x in v]
+    
+    # Cache the result
+    _query_embedding_cache[query_hash] = v
+    logger.debug(f"Cached query embedding for: {text[:50]}...")
+    
     return v
 
 

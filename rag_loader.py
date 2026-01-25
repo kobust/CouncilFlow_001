@@ -39,7 +39,7 @@ from rag_cache import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TOP_K = 35
+DEFAULT_TOP_K = 25
 TOP_K_MIN, TOP_K_MAX = 1, 100
 RERANK_ENABLED = False  # Disabled: slow. We retrieve more chunks instead (RETRIEVE_FACTOR).
 RERANK_FACTOR = 2

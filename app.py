@@ -18,6 +18,10 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+# Token usage optimization: configurable delays to spread API calls across time
+PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "10") or "10")
+LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "10") or "10")
+
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -1105,6 +1109,21 @@ st.sidebar.caption(f"Model: `{EFFECTIVE_MODEL}`")
 max_ctx = model_max_context(EFFECTIVE_MODEL)
 st.sidebar.caption(f"Context window: {max_ctx:,} tokens")
 
+# Token optimization settings
+st.sidebar.divider()
+st.sidebar.markdown("#### **Token Optimization**")
+current_pace = GEMINI_PACE_DELAY_SECONDS
+st.sidebar.caption(f"Pace delay: `{current_pace}s` (env: `GEMINI_PACE_DELAY_SECONDS`)")
+current_pipeline_delay = PIPELINE_STEP_DELAY_SECONDS
+st.sidebar.caption(f"Pipeline step delay: `{current_pipeline_delay}s` (env: `PIPELINE_STEP_DELAY_SECONDS`)")
+current_legal_delay = LEGAL_EXPERT_DELAY_SECONDS
+st.sidebar.caption(f"Legal expert delay: `{current_legal_delay}s` (env: `LEGAL_EXPERT_DELAY_SECONDS`)")
+if USE_QUERY_EXPANSION:
+    st.sidebar.caption("⚠️ Query expansion: **Enabled** (uses extra LLM calls)")
+    st.sidebar.caption("💡 Disable in `rag_loader.py` to reduce token usage")
+else:
+    st.sidebar.caption("✅ Query expansion: **Disabled** (saves tokens)")
+
 # Debug info section
 st.sidebar.divider()
 st.sidebar.markdown("#### **System info**")
@@ -1690,6 +1709,12 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                     
                     # If legal questions exist and a legal expert prompt is configured, consult it
                     if legal_questions and getattr(selected, "legal_expert_prompt_id", None):
+                        # Add delay before legal expert consultation to spread token usage
+                        LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "10") or "10")
+                        if LEGAL_EXPERT_DELAY_SECONDS > 0:
+                            with st.status(f"⏳ Waiting {LEGAL_EXPERT_DELAY_SECONDS}s before legal consultation (rate limit management)…", expanded=False):
+                                time.sleep(LEGAL_EXPERT_DELAY_SECONDS)
+                        
                         legal_expert_prompt_id = selected.legal_expert_prompt_id
                         legal_expert_p = db.get_prompt_by_id(legal_expert_prompt_id)
                         if legal_expert_p:
@@ -1860,6 +1885,7 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                     last_transient_tokens = transient_tokens
                     last_prompt_tokens = prompt_tokens
                     last_total_input = total_input_tokens
+                    
                     while current.verifier_id:
                         fid = current.verifier_id
                         if fid in seen:
@@ -1870,6 +1896,12 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                             logger.warning(f"Follow-on prompt id {fid} not found, stopping chain")
                             break
                         seen.add(next_p.id)
+                        
+                        # Add delay before follow-on prompt to spread token usage across time
+                        if PIPELINE_STEP_DELAY_SECONDS > 0:
+                            with st.status(f"⏳ Waiting {PIPELINE_STEP_DELAY_SECONDS}s before next step (rate limit management)…", expanded=False):
+                                time.sleep(PIPELINE_STEP_DELAY_SECONDS)
+                        
                         # Inject variables into follow-on prompts too
                         followon_variables = _build_prompt_variables(
                             username=_username,
@@ -2005,6 +2037,12 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                                 
                                 # If this follow-on prompt has legal expert configured and questions were found, consult it
                                 if step_legal_questions and getattr(next_p, "legal_expert_prompt_id", None):
+                                    # Add delay before legal expert consultation to spread token usage
+                                    LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "10") or "10")
+                                    if LEGAL_EXPERT_DELAY_SECONDS > 0:
+                                        with st.status(f"⏳ Waiting {LEGAL_EXPERT_DELAY_SECONDS}s before legal consultation (rate limit management)…", expanded=False):
+                                            time.sleep(LEGAL_EXPERT_DELAY_SECONDS)
+                                    
                                     step_legal_expert_prompt_id = next_p.legal_expert_prompt_id
                                     step_legal_expert_p = db.get_prompt_by_id(step_legal_expert_prompt_id)
                                     if step_legal_expert_p:
