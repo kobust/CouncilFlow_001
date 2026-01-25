@@ -678,7 +678,13 @@ _BANNER_HTML = f"""
   }}
   var style = doc.createElement("style");
   style.textContent = "[data-testid=\\"stAppViewContainer\\"] {{ padding-top: {_BANNER_H}px !important; }} " +
-    "main .block-container {{ padding-top: 0 !important; }}" +
+    "main .block-container {{ padding-top: 0 !important; margin-top: 0 !important; }} " +
+    "[data-testid=\\"stAppViewContainer\\"] > div:first-child {{ margin-top: 0 !important; padding-top: 0 !important; }} " +
+    "[data-testid=\\"stHeader\\"] {{ margin-top: 0 !important; padding-top: 0 !important; height: auto !important; min-height: 0 !important; }} " +
+    "[data-testid=\\"stHeader\\"] [data-testid=\\"stToolbar\\"] {{ display: flex !important; }} " +
+    "[data-testid=\\"stHeader\\"] button[kind=\\"header\\"]:not(#app-banner-right button):not([data-testid=\\"stSidebarCollapseButton\\"]) {{ opacity: 0 !important; pointer-events: none !important; }} " +
+    "[data-testid=\\"stSidebarCollapseButton\\"] {{ display: block !important; visibility: visible !important; position: relative !important; z-index: 1000004 !important; pointer-events: auto !important; cursor: pointer !important; }} " +
+    "[data-testid=\\"stSidebarCollapseButton\\"]:hover {{ opacity: 0.8 !important; }} " +
     "@media (max-width: 768px) {{ " +
     "[data-testid=\\"stAppViewContainer\\"] .block-container h2 {{ font-size: 1.4rem !important; }} " +
     "}} " +
@@ -686,11 +692,79 @@ _BANNER_HTML = f"""
   doc.head.appendChild(style);
   var bar = doc.createElement("div");
   bar.id = "app-banner";
-  bar.style.cssText = "position:fixed;top:0;left:0;right:0;width:100%;height:{_BANNER_H}px;background:#1e3a5f;color:#fff;display:flex;align-items:center;padding:0 1rem;gap:0.75rem;box-shadow:0 1px 4px rgba(0,0,0,0.15);font-family:inherit;z-index:1000002;";
-  bar.innerHTML = '<button id="app-menu-btn" aria-label="Menu" style="width:32px;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,0.35);background:transparent;color:#fff;font-size:18px;line-height:1;cursor:pointer;">☰</button>' +
+  bar.style.cssText = "position:fixed;top:0;left:0;right:0;width:100%;height:{_BANNER_H}px;background:#1e3a5f;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 1rem;gap:0.75rem;box-shadow:0 1px 4px rgba(0,0,0,0.15);font-family:inherit;z-index:1000002;";
+  var leftSection = '<div style="display:flex;align-items:center;gap:0.75rem;">' +
+    '<button id="app-menu-btn" aria-label="Menu" style="width:32px;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,0.35);background:transparent;color:#fff;font-size:18px;line-height:1;cursor:pointer;">☰</button>' +
     '<span style="font-size:1.5rem;font-weight:600;white-space:nowrap;">🏛️ {APP_NAME}</span>' +
-    '<span class="app-banner-subtitle" style="font-size:0.85rem;opacity:0.9;margin-left:0.5rem;">AI-assisted analysis for municipal council workflows</span>';
+    '<span class="app-banner-subtitle" style="font-size:0.85rem;opacity:0.9;margin-left:0.5rem;">AI-assisted analysis for municipal council workflows</span>' +
+    '</div>';
+  var rightSection = '<div id="app-banner-right" style="display:flex;align-items:center;"></div>';
+  bar.innerHTML = leftSection + rightSection;
   doc.body.insertBefore(bar, doc.body.firstChild);
+  
+  // Move Streamlit menu button to banner (NEVER move sidebar collapse button)
+  setTimeout(function() {{
+    // CRITICAL: Protect sidebar collapse button - ensure it stays in place and works
+    var sidebarCollapseBtn = doc.querySelector('[data-testid="stSidebarCollapseButton"]');
+    if (sidebarCollapseBtn) {{
+      // Keep it in its original parent - don't move it!
+      sidebarCollapseBtn.style.cssText = "display: block !important; visibility: visible !important; position: relative !important;";
+      // Store original parent to prevent accidental moves
+      if (!sidebarCollapseBtn.dataset.originalParent) {{
+        sidebarCollapseBtn.dataset.originalParent = sidebarCollapseBtn.parentElement ? sidebarCollapseBtn.parentElement.tagName : 'unknown';
+        sidebarCollapseBtn.dataset.protected = 'true';
+      }}
+    }}
+    
+    // Find Streamlit menu button - be VERY specific to avoid the collapse button
+    var streamlitMenu = null;
+    
+    // Method 1: Look for the three-dot menu button (most common Streamlit menu)
+    var menuButtons = doc.querySelectorAll('[data-testid="stHeader"] button, button[kind="header"]');
+    for (var i = 0; i < menuButtons.length; i++) {{
+      var btn = menuButtons[i];
+      var testId = btn.getAttribute('data-testid') || '';
+      var ariaLabel = btn.getAttribute('aria-label') || '';
+      var btnText = btn.textContent || '';
+      
+      // ABSOLUTELY SKIP sidebar collapse button - check multiple ways
+      if (testId === 'stSidebarCollapseButton' || 
+          testId.includes('Sidebar') ||
+          testId.includes('Collapse') ||
+          ariaLabel.includes('sidebar') ||
+          ariaLabel.includes('Sidebar') ||
+          ariaLabel.includes('Collapse') ||
+          btnText.trim() === '>>' ||
+          btnText.trim() === '<<' ||
+          btn.closest('[data-testid="stSidebar"]') ||
+          btn.dataset.protected === 'true') {{
+        continue;
+      }}
+      
+      // Look for Streamlit menu indicators
+      // The menu button usually has aria-label like "Main menu" or contains SVG icons
+      if (ariaLabel.toLowerCase().includes('menu') ||
+          ariaLabel.toLowerCase().includes('settings') ||
+          ariaLabel.toLowerCase().includes('options') ||
+          btn.querySelector('svg') ||  // Menu buttons often have SVG icons
+          btn.getAttribute('kind') === 'header') {{
+        streamlitMenu = btn;
+        break;
+      }}
+    }}
+    
+    // Only move if we found a menu button AND it's definitely not the collapse button
+    if (streamlitMenu && 
+        streamlitMenu.getAttribute('data-testid') !== 'stSidebarCollapseButton' &&
+        streamlitMenu.dataset.protected !== 'true' &&
+        !streamlitMenu.closest('[data-testid="stSidebar"]')) {{
+      var bannerRight = doc.getElementById("app-banner-right");
+      if (bannerRight) {{
+        streamlitMenu.style.cssText = "background:transparent !important;border:1px solid rgba(255,255,255,0.35) !important;color:#fff !important;padding:0.25rem 0.5rem !important;";
+        bannerRight.appendChild(streamlitMenu);
+      }}
+    }}
+  }}, 300);
   var subtitle = bar.querySelector(".app-banner-subtitle");
   var bannerStyle = doc.createElement("style");
   bannerStyle.textContent = "@media (max-width: 768px) {{ .app-banner-subtitle {{ display: none; }} }}";
