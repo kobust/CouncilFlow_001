@@ -33,21 +33,138 @@ DEFAULT_MODEL = "gemini-3-flash-preview"
 CACHE_TTL_SECONDS = 3600  # 60 minutes
 
 # Override via env to reduce quota issues (e.g. GEMINI_MODEL=gemini-2.0-flash).
+# Database-stored model takes precedence over env var.
 def _effective_model() -> str:
+    # First check database (if available)
+    try:
+        import db
+        config = db.get_app_config()
+        if config and config.selected_model:
+            logger.debug(f"Using model from database: {config.selected_model}")
+            return config.selected_model
+    except Exception as e:
+        logger.debug(f"Could not get model from database (non-fatal): {e}")
+    
+    # Fallback to env var
     v = (os.environ.get("GEMINI_MODEL") or "").strip()
-    return v if v else DEFAULT_MODEL
+    if v:
+        logger.debug(f"Using model from environment: {v}")
+        return v
+    
+    # Final fallback to default
+    logger.debug(f"Using default model: {DEFAULT_MODEL}")
+    return DEFAULT_MODEL
 
 
-EFFECTIVE_MODEL = _effective_model()
+# Initialize EFFECTIVE_MODEL at module load (will be refreshed on each call to get_effective_model)
+def get_effective_model() -> str:
+    """Get the effective model (checks database, then env, then default)."""
+    return _effective_model()
+
+
+EFFECTIVE_MODEL = get_effective_model()  # Initial value, but functions should call get_effective_model()
 
 
 def _planner_model() -> str:
-    """Model for retrieval planner. Default gemini-2.0-flash to spread quota vs main agent."""
+    """Model for retrieval planner. Checks database, then env, then default."""
+    # First check database (if available)
+    try:
+        import db
+        config = db.get_app_config()
+        if config and config.planner_model:
+            logger.debug(f"Using planner model from database: {config.planner_model}")
+            return config.planner_model
+    except Exception as e:
+        logger.debug(f"Could not get planner model from database (non-fatal): {e}")
+    
+    # Fallback to env var
     v = (os.environ.get("GEMINI_PLANNER_MODEL") or "").strip()
-    return v if v else "gemini-2.0-flash"
+    if v:
+        logger.debug(f"Using planner model from environment: {v}")
+        return v
+    
+    # Final fallback to default
+    default_planner = "gemini-2.0-flash"
+    logger.debug(f"Using default planner model: {default_planner}")
+    return default_planner
 
 
-PLANNER_MODEL = _planner_model()
+def get_planner_model() -> str:
+    """Get the planner model (checks database, then env, then default)."""
+    return _planner_model()
+
+
+PLANNER_MODEL = get_planner_model()  # Initial value, but functions should call get_planner_model()
+
+
+def list_available_models() -> list[str]:
+    """
+    Query Gemini API for available models.
+    Returns list of model names (e.g., ['gemini-3-flash-preview', 'gemini-2.0-flash', ...]).
+    """
+    try:
+        models = []
+        # Try using google.generativeai (old SDK) which has list_models()
+        try:
+            import google.generativeai as genai_old
+            api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                try:
+                    api_key = st.secrets["GEMINI_API_KEY"]
+                except Exception:
+                    pass
+            if api_key:
+                genai_old.configure(api_key=api_key)
+                for m in genai_old.list_models():
+                    if "gemini" in m.name.lower() and "generateContent" in (m.supported_generation_methods if hasattr(m, 'supported_generation_methods') else []):
+                        name = m.name
+                        # Extract model name (e.g., "models/gemini-3-flash-preview" -> "gemini-3-flash-preview")
+                        if '/' in name:
+                            name = name.split('/')[-1]
+                        models.append(name)
+        except Exception as e1:
+            logger.debug(f"Could not list models via google.generativeai: {e1}")
+            # Try new SDK if available
+            try:
+                client = _client()
+                # The new SDK might have a different API - check what's available
+                if hasattr(client, 'models') and hasattr(client.models, 'list'):
+                    for model in client.models.list():
+                        name = getattr(model, 'name', str(model))
+                        if 'gemini' in name.lower():
+                            if '/' in name:
+                                name = name.split('/')[-1]
+                            models.append(name)
+            except Exception as e2:
+                logger.debug(f"Could not list models via new SDK: {e2}")
+        
+        # Remove duplicates and sort
+        models = sorted(list(set(models)))
+        if models:
+            logger.info(f"Found {len(models)} available Gemini models")
+            return models
+        else:
+            # Return common models as fallback if API call failed
+            logger.warning("Could not fetch models from API, using fallback list")
+            return [
+                "gemini-3-flash-preview",
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-2.0-flash",
+                "gemini-1.5-pro",
+                "gemini-1.5-flash",
+            ]
+    except Exception as e:
+        logger.warning(f"Error listing available models: {e}")
+        # Return common models as fallback
+        return [
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ]
 
 # GenerateContent (Gemini) is used by: run_agent (1 per run, main prompt+context),
 # run_retrieval_planner (1 when USE_RETRIEVAL_PLANNER), expand_queries (1 when USE_QUERY_EXPANSION),
@@ -585,7 +702,7 @@ def create_gemini_cache(context_xml: str, max_retries: int = 5, initial_delay: f
     logger.info(f"Creating Gemini cache (context size: {len(context_xml)} chars, TTL: {CACHE_TTL_SECONDS}s)")
     client = _client()
     ttl = f"{CACHE_TTL_SECONDS}s"
-    m = EFFECTIVE_MODEL
+    m = get_effective_model()  # Get current model from database
     logger.debug(f"Building cache config with model {m}")
     config = types.CreateCachedContentConfig(
         contents=[
@@ -1050,7 +1167,7 @@ def run_retrieval_planner(
     # Cache miss - call LLM
     logger.debug(f"Retrieval planner cache miss, calling LLM: {task_name[:50]}...")
     client = _client()
-    m = model or PLANNER_MODEL
+    m = model or get_planner_model()  # Get current planner model from database
     catalog = _build_library_catalog(library_metadata)
     budget_text = (context_budget_section or "").strip() or "No explicit context budget; use judgment to stay within model limits."
     prompt = (
@@ -1487,7 +1604,7 @@ def run_agent(
         logger.error("Template error occurred at (around) char %d or later.\n%s", min(1312, len(prompt_template)), prompt_template[1300:1360])
         raise RuntimeError("Invalid template syntax in prompt. Check template text for backslashes or other special characters that may need escaping.") from e
     logger.debug(f"Rendered prompt length: {len(prompt)} chars")
-    m = model or EFFECTIVE_MODEL
+    m = model or get_effective_model()  # Use function to get current model from DB
     logger.debug(f"Using model: {m}")
     
     # Build content - either use cache or include context directly

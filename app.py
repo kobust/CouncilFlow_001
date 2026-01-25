@@ -59,7 +59,9 @@ except ImportError as import_err:
 import brain
 from brain import (
     CacheExpiredError,
-    EFFECTIVE_MODEL,
+    get_effective_model,
+    get_planner_model,
+    list_available_models,
     GEMINI_PACE_DELAY_SECONDS,
     chars_to_tokens,
     expand_queries,
@@ -271,6 +273,8 @@ if "last_task_name" not in st.session_state:
     st.session_state["last_task_name"] = None
 if "gemini_cache_name" not in st.session_state:
     st.session_state["gemini_cache_name"] = None
+if "gemini_cache_model" not in st.session_state:
+    st.session_state["gemini_cache_model"] = None
 if "gemini_cache_folder_id" not in st.session_state:
     st.session_state["gemini_cache_folder_id"] = None
 if "kb_loading_started" not in st.session_state:
@@ -1120,6 +1124,7 @@ if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb
         except Exception:
             pass
         st.session_state["gemini_cache_name"] = None
+        st.session_state["gemini_cache_model"] = None
         st.session_state["gemini_cache_folder_id"] = None
         st.session_state["run_cache_key"] = None
         st.session_state["kb_loading_started"] = False
@@ -1137,9 +1142,100 @@ if is_admin and st.sidebar.button("🔄 Refresh knowledge base", key="refresh_kb
 # Model & pipeline
 st.sidebar.divider()
 st.sidebar.markdown("#### **Model & pipeline**")
-st.sidebar.caption(f"Model: `{EFFECTIVE_MODEL}`")
-max_ctx = model_max_context(EFFECTIVE_MODEL)
+current_model = get_effective_model()
+current_planner_model = get_planner_model()
+st.sidebar.caption(f"Model: `{current_model}`")
+if current_planner_model and current_planner_model != current_model:
+    st.sidebar.caption(f"Planner: `{current_planner_model}`")
+max_ctx = model_max_context(current_model)
 st.sidebar.caption(f"Context window: {max_ctx:,} tokens")
+
+# Admin model selection
+if is_admin:
+    with st.sidebar.expander("⚙️ Model Selection (Admin)", expanded=False):
+        try:
+            available_models = list_available_models()
+            if available_models:
+                config = db.get_app_config()
+                current_selected = config.selected_model if config else current_model
+                
+                # Find current model index, or default to 0
+                try:
+                    current_index = available_models.index(current_selected)
+                except ValueError:
+                    current_index = 0
+                    if current_selected not in available_models:
+                        available_models.insert(0, current_selected)
+                        current_index = 0
+                
+                selected_model = st.selectbox(
+                    "Select Gemini Model",
+                    available_models,
+                    index=current_index,
+                    key="model_selector",
+                    help="This model will be used for all users. Changing the model helps manage rate limits by switching to different API quotas."
+                )
+                
+                if selected_model != current_selected:
+                    if st.button("💾 Save Model Selection", key="save_model", use_container_width=True):
+                        try:
+                            db.update_selected_model(selected_model)
+                            # Clear Gemini CachedContent cache when model changes (cache is model-specific)
+                            if "gemini_cache_name" in st.session_state:
+                                old_cache = st.session_state.get("gemini_cache_name")
+                                st.session_state["gemini_cache_name"] = None
+                                st.session_state["gemini_cache_model"] = None
+                                logger.info(f"Cleared Gemini cache (was: {old_cache}) due to model change")
+                            st.success(f"✅ Model updated to `{selected_model}`")
+                            logger.info(f"Admin updated model to: {selected_model}")
+                            # Refresh to apply changes immediately
+                            time.sleep(0.5)  # Brief delay to show success message
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error saving model: {e}")
+                            logger.error(f"Error saving model: {e}", exc_info=True)
+                
+                # Planner model selection (optional override)
+                st.markdown("---")
+                st.caption("**Planner Model** (optional override)")
+                planner_options = ["— Use same as main model —"] + available_models
+                current_planner_selected = config.planner_model if config and config.planner_model else None
+                
+                if current_planner_selected:
+                    try:
+                        planner_index = planner_options.index(current_planner_selected)
+                    except ValueError:
+                        planner_index = 0
+                else:
+                    planner_index = 0
+                
+                selected_planner = st.selectbox(
+                    "Planner Model",
+                    planner_options,
+                    index=planner_index,
+                    key="planner_model_selector",
+                    help="Optional: Use a different model for retrieval planning. Helps spread quota across models."
+                )
+                
+                planner_to_save = None if selected_planner == "— Use same as main model —" else selected_planner
+                if planner_to_save != current_planner_selected:
+                    if st.button("💾 Save Planner Model", key="save_planner_model", use_container_width=True):
+                        try:
+                            db.update_planner_model(planner_to_save)
+                            # Note: Planner model change doesn't require cache clearing (only affects retrieval planner, not main agent)
+                            st.success(f"✅ Planner model updated to `{planner_to_save or 'same as main'}`")
+                            logger.info(f"Admin updated planner model to: {planner_to_save}")
+                            # Refresh to apply changes immediately
+                            time.sleep(0.5)  # Brief delay to show success message
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error saving planner model: {e}")
+                            logger.error(f"Error saving planner model: {e}", exc_info=True)
+            else:
+                st.warning("⚠️ Could not fetch available models. Check API key configuration.")
+        except Exception as e:
+            st.error(f"❌ Error loading model selection: {e}")
+            logger.error(f"Error in model selection UI: {e}", exc_info=True)
 
 # Token optimization settings
 st.sidebar.divider()
@@ -1519,15 +1615,27 @@ if current_page == "runner":
                     cache_folder = st.session_state.get("gemini_cache_folder_id")
                     cache_name = None
                     cache_reused = False
+                    
+                    # Safety check: Clear cache if model changed (cache is model-specific)
+                    current_model = get_effective_model()
+                    _last_cache_model = st.session_state.get("gemini_cache_model")
+                    if _last_cache_model and _last_cache_model != current_model:
+                        logger.info(f"Model changed from {_last_cache_model} to {current_model}, clearing cache")
+                        st.session_state["gemini_cache_name"] = None
+                        st.session_state["gemini_cache_model"] = None
+                        _last_cache_name = None
+                    else:
+                        _last_cache_name = st.session_state.get("gemini_cache_name")
+                    
                     _run_cache_key = hashlib.sha256(
                         f"{folder_id}|{selected.id}|{(user_content or '')}".encode()
                     ).hexdigest()[:32]
                     _last_run_key = st.session_state.get("run_cache_key")
-                    _last_cache_name = st.session_state.get("gemini_cache_name")
                     _reuse_cache = (
                         _last_run_key == _run_cache_key
                         and _last_cache_name
                         and cache_folder == folder_id
+                        and _last_cache_model == current_model  # Model must match
                     )
 
                     status_container = st.status("🧠 Building context + cache…", expanded=True)
@@ -1545,13 +1653,13 @@ if current_page == "runner":
                         timings["build_context_s"] = time.perf_counter() - _t0
                         total_len = len(context_xml)
                         kb_tokens = chars_to_tokens(total_len)
-                        max_ctx = model_max_context(EFFECTIVE_MODEL)
+                        max_ctx = model_max_context(get_effective_model())
                         total_input_tokens = kb_tokens + prompt_tokens + transient_tokens
                         kb_ratio = (kb_tokens / total_input_tokens * 100) if total_input_tokens else 0
                         user_ratio = (transient_tokens / total_input_tokens * 100) if total_input_tokens else 0
                         logger.info(f"RAG context built: {total_len:,} chars, {total_input_tokens:,} est. input tokens")
                         status_container.write(
-                            f"📊 **Context**: {total_input_tokens:,} tokens ({kb_ratio:.0f}% KB, {user_ratio:.0f}% user) — {format_context_usage(total_input_tokens, max_ctx, EFFECTIVE_MODEL)}"
+                            f"📊 **Context**: {total_input_tokens:,} tokens ({kb_ratio:.0f}% KB, {user_ratio:.0f}% user) — {format_context_usage(total_input_tokens, max_ctx, get_effective_model())}"
                         )
                         status_container.write(f"📖 **Real-world**: {format_reading_equivalent(total_input_tokens)}")
                         if retrieval_report:
@@ -1626,6 +1734,7 @@ if current_page == "runner":
                                     st.stop()
                             if cache_created:
                                 st.session_state["gemini_cache_name"] = cache_name
+                                st.session_state["gemini_cache_model"] = get_effective_model()  # Track model used
                                 st.session_state["gemini_cache_folder_id"] = folder_id
                                 st.session_state["run_cache_key"] = _run_cache_key
                                 logger.info(f"Cache created: {cache_name}")
@@ -1699,6 +1808,7 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                                     st.info("Cache expired. Recreating…")
                                     logger.info("Clearing invalid cache from session state")
                                     st.session_state["gemini_cache_name"] = None
+                                    st.session_state["gemini_cache_model"] = None
                                     st.session_state["gemini_cache_folder_id"] = None
                                     
                                     # Recreate cache
@@ -1714,6 +1824,7 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                                             
                                             # Update session state with new cache
                                             st.session_state["gemini_cache_name"] = cache_name
+                                            st.session_state["gemini_cache_model"] = get_effective_model()  # Track model used
                                             st.session_state["gemini_cache_folder_id"] = folder_id
                                             logger.info(f"Cache recreated: {cache_name}")
                                     except Exception as recreate_error:
@@ -1876,7 +1987,7 @@ Legal questions will be automatically forwarded to a legal expert for consultati
                         "prompt_tokens": prompt_tokens,
                         "max_context": max_ctx,
                         "output_tokens": output_tokens,
-                        "model": EFFECTIVE_MODEL,
+                        "model": get_effective_model(),
                         "timings": timings,
                     }
                     

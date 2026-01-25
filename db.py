@@ -50,6 +50,15 @@ class PromptTemplate(SQLModel, table=True):
     legal_expert_prompt_id: Optional[int] = None  # prompt to use for legal questions
 
 
+class AppConfig(SQLModel, table=True):
+    """Application configuration stored in database (single row)."""
+    __table_args__ = {"extend_existing": True}
+
+    id: Optional[int] = Field(default=1, primary_key=True)  # Always ID 1 (singleton)
+    selected_model: str = Field(default="gemini-3-flash-preview")  # Selected Gemini model
+    planner_model: Optional[str] = Field(default="gemini-2.0-flash")  # Planner model (optional override)
+
+
 # -----------------------------------------------------------------------------
 # Init & seed
 # -----------------------------------------------------------------------------
@@ -87,6 +96,28 @@ def _migrate_legal_expert_prompt_id() -> None:
         logger.warning(f"Migration legal_expert_prompt_id: {e}")
 
 
+def _init_app_config() -> None:
+    """Initialize AppConfig table with default values if it doesn't exist."""
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            existing = s.get(AppConfig, 1)
+            if existing is None:
+                logger.info("Initializing AppConfig with default model")
+                config = AppConfig(
+                    id=1,
+                    selected_model="gemini-3-flash-preview",
+                    planner_model="gemini-2.0-flash",
+                )
+                s.add(config)
+                s.commit()
+                logger.info("AppConfig initialized")
+            else:
+                logger.debug("AppConfig already exists")
+    except Exception as e:
+        logger.warning(f"Error initializing AppConfig: {e}")
+
+
 def init_db() -> None:
     """Create tables and seed default prompt templates."""
     logger.info("Initializing database")
@@ -96,6 +127,7 @@ def init_db() -> None:
         SQLModel.metadata.create_all(engine)
         _migrate_follow_on_only()
         _migrate_legal_expert_prompt_id()
+        _init_app_config()
         with Session(engine) as s:
             existing = s.exec(select(PromptTemplate)).first()
             if existing is not None:
@@ -246,6 +278,70 @@ def delete_prompt(prompt_id: int) -> bool:
             return True
     except Exception as e:
         logger.error(f"Error deleting prompt {prompt_id}: {e}", exc_info=True)
+        raise
+
+
+# -----------------------------------------------------------------------------
+# App Config CRUD
+# -----------------------------------------------------------------------------
+
+
+def get_app_config() -> AppConfig:
+    """Get application configuration (singleton, always ID 1)."""
+    logger.debug("Fetching app config")
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            config = s.get(AppConfig, 1)
+            if config is None:
+                # Initialize if missing
+                _init_app_config()
+                config = s.get(AppConfig, 1)
+            return config
+    except Exception as e:
+        logger.error(f"Error fetching app config: {e}", exc_info=True)
+        raise
+
+
+def update_selected_model(model_name: str) -> AppConfig:
+    """Update the selected Gemini model. Returns updated config."""
+    logger.info(f"Updating selected model to: {model_name}")
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            config = s.get(AppConfig, 1)
+            if config is None:
+                config = AppConfig(id=1, selected_model=model_name)
+                s.add(config)
+            else:
+                config.selected_model = model_name
+            s.commit()
+            s.refresh(config)
+            logger.info(f"Model updated successfully: {config.selected_model}")
+            return config
+    except Exception as e:
+        logger.error(f"Error updating selected model: {e}", exc_info=True)
+        raise
+
+
+def update_planner_model(model_name: str | None) -> AppConfig:
+    """Update the planner model (optional override). Returns updated config."""
+    logger.info(f"Updating planner model to: {model_name}")
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            config = s.get(AppConfig, 1)
+            if config is None:
+                config = AppConfig(id=1, planner_model=model_name)
+                s.add(config)
+            else:
+                config.planner_model = model_name
+            s.commit()
+            s.refresh(config)
+            logger.info(f"Planner model updated successfully: {config.planner_model}")
+            return config
+    except Exception as e:
+        logger.error(f"Error updating planner model: {e}", exc_info=True)
         raise
 
 
