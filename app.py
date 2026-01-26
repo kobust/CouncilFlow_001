@@ -1833,27 +1833,45 @@ if current_page == "runner":
 
 **IMPORTANT - Legal Question Tracking:** 
 
-You must actively and aggressively review this analysis for unresolved legal questions, compliance issues, statutory requirements, regulatory concerns, or any matters requiring expert legal review. 
+You must actively review this analysis for unresolved legal questions that are **substantive, relevant, and would materially influence your recommendations or conclusions**.
 
-As you complete your analysis, carefully consider:
-- Are there any laws, regulations, or ordinances that need interpretation?
-- Are there compliance obligations, deadlines, or procedural requirements?
-- Are there potential legal risks, liabilities, or areas of concern?
-- Do any statutory citations or legal procedures need clarification?
+**Quality Over Quantity:** Only identify legal questions that meet ALL of the following criteria:
+1. **Substantive**: The question addresses a real legal issue, not a minor procedural detail or obvious matter
+2. **Relevant**: The question directly relates to the subject matter being analyzed
+3. **Material**: The answer to the question would meaningfully change your analysis, recommendations, or conclusions
 
-**Output Format:** At the very end of your response, if you identified ANY legal questions, add a section with this exact title:
+**What to Look For:**
+- Ambiguous statutory language that requires interpretation for this specific situation
+- Compliance obligations or deadlines that are unclear or potentially applicable
+- Legal risks or liabilities that could significantly impact recommendations
+- Regulatory requirements that may conflict or need clarification
+- Procedural requirements that could invalidate or delay proposed actions
+- Legal precedents or case law that might affect the analysis
+
+**What NOT to Include:**
+- Questions that are purely informational or already answered in your analysis
+- Hypothetical scenarios unrelated to the current situation
+- Minor procedural details that don't affect the substance of recommendations
+- Questions that can be answered with general legal knowledge
+
+**Output Format:** At the very end of your response, if you identified ANY legal questions that meet the criteria above, add a section with this exact title:
 
 ## Legal Questions Requiring Expert Review
 
-Then list each question as a bullet point:
-- [Your first legal question?]
-- [Your second legal question?]
+Then list each question as a clear, specific bullet point:
+- [Your first substantive legal question, phrased as a specific question that would influence the analysis]
+- [Your second substantive legal question, if applicable]
 
-If you found NO legal questions requiring expert review, do NOT include this section. Simply end your analysis normally.
+Each question should be:
+- Specific and actionable (not vague or general)
+- Directly relevant to the analysis
+- Formulated such that an answer would materially inform your recommendations
 
-Legal questions will be automatically forwarded to a legal expert for consultation.
+If you found NO legal questions that meet these criteria, do NOT include this section. Simply end your analysis normally.
+
+Legal questions will be automatically forwarded to a legal expert who will perform a targeted knowledge base search and provide expert guidance that will be integrated into your analysis.
 """
-                        logger.info("Legal expert prompt configured - injecting legal question tracking instructions")
+                        logger.info("Legal expert prompt configured - injecting enhanced legal question tracking instructions")
                     
                     full_template = prompt_variables + template_text + legal_question_tracking_instructions + "\n\n---\n\nSubject of analysis (transient input):\n{{ content }}"
                     logger.debug(f"Rendered template length: {len(full_template)} chars (with variables and legal tracking)")
@@ -2140,27 +2158,51 @@ Legal questions will be automatically forwarded to a legal expert for consultati
 
 **IMPORTANT - Legal Question Tracking:** 
 
-You must actively and aggressively review this analysis for unresolved legal questions, compliance issues, statutory requirements, regulatory concerns, or any matters requiring expert legal review. 
+You must actively review this analysis for unresolved legal questions that are **substantive, relevant, and would materially influence your recommendations or conclusions**.
 
-As you complete your analysis, carefully consider:
-- Are there any laws, regulations, or ordinances that need interpretation?
-- Are there compliance obligations, deadlines, or procedural requirements?
-- Are there potential legal risks, liabilities, or areas of concern?
-- Do any statutory citations or legal procedures need clarification?
+**Quality Over Quantity:** Only identify legal questions that meet ALL of the following criteria:
+1. **Substantive**: The question addresses a real legal issue, not a minor procedural detail or obvious matter
+2. **Relevant**: The question directly relates to the subject matter being analyzed
+3. **Material**: The answer to the question would meaningfully change your analysis, recommendations, or conclusions
+4. **Unresolved**: The question cannot be definitively answered from the knowledge base or general legal knowledge
 
-**Output Format:** At the very end of your response, if you identified ANY legal questions, add a section with this exact title:
+**What to Look For:**
+- Ambiguous statutory language that requires interpretation for this specific situation
+- Compliance obligations or deadlines that are unclear or potentially applicable
+- Legal risks or liabilities that could significantly impact recommendations
+- Regulatory requirements that may conflict or need clarification
+- Procedural requirements that could invalidate or delay proposed actions
+- Legal precedents or case law that might affect the analysis
+
+**What NOT to Include:**
+- Questions that are purely informational or already answered in your analysis
+- Hypothetical scenarios unrelated to the current situation
+- Minor procedural details that don't affect the substance of recommendations
+- Questions that can be answered with general legal knowledge
+
+**Think Critically:** Before listing a legal question, ask yourself:
+- "Would the answer to this question change my recommendations?"
+- "Is this a real legal uncertainty, or can I infer the answer from context?"
+- "Is this question specific enough to be actionable by a legal expert?"
+
+**Output Format:** At the very end of your response, if you identified ANY substantive legal questions that meet the criteria above, add a section with this exact title:
 
 ## Legal Questions Requiring Expert Review
 
-Then list each question as a bullet point:
-- [Your first legal question?]
-- [Your second legal question?]
+Then list each question as a clear, specific bullet point:
+- [Your first substantive legal question, phrased as a specific question that would influence the analysis]
+- [Your second substantive legal question, if applicable]
 
-If you found NO legal questions requiring expert review, do NOT include this section. Simply end your analysis normally.
+Each question should be:
+- Specific and actionable (not vague or general)
+- Directly relevant to the analysis
+- Formulated such that an answer would materially inform your recommendations
 
-Legal questions will be automatically forwarded to a legal expert for consultation.
+If you found NO legal questions that meet these criteria, do NOT include this section. Simply end your analysis normally.
+
+Legal questions will be automatically forwarded to a legal expert who will perform a targeted knowledge base search and provide expert guidance that will be integrated into your analysis.
 """
-                            logger.info(f"Legal expert prompt configured for {next_p.name} - injecting legal question tracking instructions")
+                            logger.info(f"Legal expert prompt configured for {next_p.name} - injecting enhanced legal question tracking instructions")
                         
                         followon_template = followon_variables + next_p.template_text + followon_legal_tracking + "\n\n---\n\nOutput from previous step(s):\n{{ previous_output }}"
                         step_label = f"Follow-on: {next_p.name}"
