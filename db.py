@@ -51,6 +51,29 @@ class PromptTemplate(SQLModel, table=True):
     verifier_id: Optional[int] = None
     follow_on_only: bool = Field(default=False, nullable=False)  # follow-on only
     legal_expert_prompt_id: Optional[int] = None  # prompt to use for legal questions
+    # Optional reusable JSON Schemas (sidecars) for this prompt:
+    # - input_schema_id: schema describing the expected transient input shape
+    # - output_schema_id: schema describing the model's output shape
+    input_schema_id: Optional[int] = Field(default=None, nullable=True)
+    output_schema_id: Optional[int] = Field(default=None, nullable=True)
+
+
+class JsonSchema(SQLModel, table=True):
+    """
+    Reusable JSON Schemas that can be attached to one or more prompt templates.
+
+    The schema payload is stored as raw JSON text so it can be edited directly
+    in the admin UI and sent to Gemini as a sidecar without needing a specific
+    Python type.
+    """
+    __table_args__ = {"extend_existing": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    # Optional short description for humans (how / where this schema is used)
+    description: Optional[str] = None
+    # Raw JSON Schema document (Draft-07+). Stored as TEXT in SQLite.
+    schema_json: str
 
 
 class AppConfig(SQLModel, table=True):
@@ -99,6 +122,28 @@ def _migrate_legal_expert_prompt_id() -> None:
         logger.warning(f"Migration legal_expert_prompt_id: {e}")
 
 
+def _migrate_prompt_schema_ids() -> None:
+    """
+    Add input_schema_id and output_schema_id columns to prompttemplate if missing.
+    This keeps existing databases working without manual migrations.
+    """
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(prompttemplate)")).fetchall()
+        columns = [r[1] for r in rows] if rows else []
+        with engine.connect() as conn:
+            if "input_schema_id" not in columns:
+                logger.info("Adding input_schema_id column to prompttemplate")
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN input_schema_id INTEGER"))
+            if "output_schema_id" not in columns:
+                logger.info("Adding output_schema_id column to prompttemplate")
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN output_schema_id INTEGER"))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration prompt schema ids: {e}")
+
+
 def _init_app_config() -> None:
     """Initialize AppConfig table with default values if it doesn't exist."""
     try:
@@ -130,6 +175,7 @@ def init_db() -> None:
         SQLModel.metadata.create_all(engine)
         _migrate_follow_on_only()
         _migrate_legal_expert_prompt_id()
+        _migrate_prompt_schema_ids()
         _init_app_config()
         with Session(engine) as s:
             existing = s.exec(select(PromptTemplate)).first()
@@ -206,11 +252,23 @@ def save_prompt(
     follow_on_only: bool = False,
     legal_expert_prompt_id: Optional[int] = None,
     *,
+    input_schema_id: Optional[int] = None,
+    output_schema_id: Optional[int] = None,
     id: Optional[int] = None,
 ) -> PromptTemplate:
     """Insert or update a prompt template. If id is given, update; else insert."""
     follow_on_only = bool(follow_on_only)
-    logger.info(f"Saving prompt: {name} (id: {id}, mode: {output_mode}, follow_on_only: {follow_on_only}, legal_expert: {legal_expert_prompt_id})")
+    logger.info(
+        "Saving prompt: %s (id: %s, mode: %s, follow_on_only: %s, legal_expert: %s, "
+        "input_schema_id: %s, output_schema_id: %s)",
+        name,
+        id,
+        output_mode,
+        follow_on_only,
+        legal_expert_prompt_id,
+        input_schema_id,
+        output_schema_id,
+    )
     try:
         engine = _get_engine()
         with Session(engine) as s:
@@ -226,6 +284,8 @@ def save_prompt(
                         verifier_id=verifier_id,
                         follow_on_only=follow_on_only,
                         legal_expert_prompt_id=legal_expert_prompt_id,
+                        input_schema_id=input_schema_id,
+                        output_schema_id=output_schema_id,
                     )
                     s.add(p)
                 else:
@@ -236,6 +296,8 @@ def save_prompt(
                     existing.verifier_id = verifier_id
                     existing.follow_on_only = follow_on_only
                     existing.legal_expert_prompt_id = legal_expert_prompt_id
+                    existing.input_schema_id = input_schema_id
+                    existing.output_schema_id = output_schema_id
                     p = existing
             else:
                 logger.debug("Creating new prompt")
@@ -246,6 +308,8 @@ def save_prompt(
                     verifier_id=verifier_id,
                     follow_on_only=follow_on_only,
                     legal_expert_prompt_id=legal_expert_prompt_id,
+                    input_schema_id=input_schema_id,
+                    output_schema_id=output_schema_id,
                 )
                 s.add(p)
             s.commit()
@@ -281,6 +345,107 @@ def delete_prompt(prompt_id: int) -> bool:
             return True
     except Exception as e:
         logger.error(f"Error deleting prompt {prompt_id}: {e}", exc_info=True)
+        raise
+
+
+# -----------------------------------------------------------------------------
+# JSON Schema CRUD
+# -----------------------------------------------------------------------------
+
+
+def get_all_schemas() -> list[JsonSchema]:
+    """Return all stored JSON Schemas."""
+    logger.debug("Fetching all JSON Schemas")
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            schemas = list(s.exec(select(JsonSchema)).all())
+            logger.info("Fetched %d JSON Schemas", len(schemas))
+            return schemas
+    except Exception as e:
+        logger.error(f"Error fetching JSON Schemas: {e}", exc_info=True)
+        raise
+
+
+def get_schema_by_id(schema_id: int) -> JsonSchema | None:
+    """Get a JSON Schema by its ID."""
+    logger.debug("Fetching JSON Schema with id %s", schema_id)
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            schema = s.get(JsonSchema, schema_id)
+            if schema:
+                logger.debug("Found JSON Schema: %s (id: %s)", schema.name, schema_id)
+            else:
+                logger.warning("JSON Schema with id %s not found", schema_id)
+            return schema
+    except Exception as e:
+        logger.error(f"Error fetching JSON Schema {schema_id}: {e}", exc_info=True)
+        raise
+
+
+def save_schema(
+    name: str,
+    schema_json: str,
+    description: Optional[str] = None,
+    *,
+    id: Optional[int] = None,
+) -> JsonSchema:
+    """
+    Insert or update a JSON Schema. If id is given, update; else insert.
+    The schema_json string should already be valid JSON (we do not enforce it here).
+    """
+    logger.info("Saving JSON Schema: %s (id: %s)", name, id)
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            if id is not None:
+                existing = s.get(JsonSchema, id)
+                if existing is None:
+                    logger.warning("JSON Schema id %s not found, creating new", id)
+                    schema = JsonSchema(
+                        name=name,
+                        description=description,
+                        schema_json=schema_json,
+                    )
+                    s.add(schema)
+                else:
+                    existing.name = name
+                    existing.description = description
+                    existing.schema_json = schema_json
+                    schema = existing
+            else:
+                schema = JsonSchema(
+                    name=name,
+                    description=description,
+                    schema_json=schema_json,
+                )
+                s.add(schema)
+            s.commit()
+            s.refresh(schema)
+            logger.info("JSON Schema saved successfully: %s (id: %s)", schema.name, schema.id)
+            return schema
+    except Exception as e:
+        logger.error(f"Error saving JSON Schema {name}: {e}", exc_info=True)
+        raise
+
+
+def delete_schema(schema_id: int) -> bool:
+    """Delete a JSON Schema by id. Returns True if deleted, False if not found."""
+    logger.info("Deleting JSON Schema id %s", schema_id)
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            existing = s.get(JsonSchema, schema_id)
+            if existing is None:
+                logger.warning("JSON Schema id %s not found", schema_id)
+                return False
+            s.delete(existing)
+            s.commit()
+            logger.info("Deleted JSON Schema %s (id=%s)", existing.name, schema_id)
+            return True
+    except Exception as e:
+        logger.error(f"Error deleting JSON Schema {schema_id}: {e}", exc_info=True)
         raise
 
 
@@ -439,6 +604,13 @@ def get_database_info() -> dict:
                 # Count prompts
                 prompt_count = len(list(s.exec(select(PromptTemplate)).all()))
                 info["prompt_count"] = prompt_count
+                # Count JSON Schemas (if table exists)
+                try:
+                    schema_count = len(list(s.exec(select(JsonSchema)).all()))
+                    info["schema_count"] = schema_count
+                except Exception:
+                    # Older databases may not yet have the JsonSchema table
+                    info["schema_count"] = 0
                 
                 # Get app config
                 config = s.get(AppConfig, 1)

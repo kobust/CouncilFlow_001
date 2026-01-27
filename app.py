@@ -1370,7 +1370,81 @@ if current_page == "edit_prompts":
                             pass
     
     st.markdown("---")
+    # Load prompts and any reusable JSON Schemas for sidecars
     crud_prompts = sorted(db.get_all_prompts(), key=lambda p: p.name.casefold())
+    try:
+        crud_schemas = sorted(db.get_all_schemas(), key=lambda s: s.name.casefold())
+    except Exception as e:
+        logger.error(f"Error loading JSON Schemas: {e}", exc_info=True)
+        crud_schemas = []
+
+    # Lightweight JSON Schema manager so schemas can be created/edited and then
+    # attached to one or more prompts.
+    with st.expander("🧩 JSON Schema library (sidecars)", expanded=False):
+        schema_options = ["+ Add new"] + [s.name for s in crud_schemas]
+        schema_select = st.selectbox("Select JSON Schema", schema_options, key="schema_select")
+        existing_schema = next((s for s in crud_schemas if s.name == schema_select), None)
+
+        schema_selected_id = existing_schema.id if existing_schema else None
+        if st.session_state.get("schema_last_selected") != schema_selected_id:
+            st.session_state["schema_last_selected"] = schema_selected_id
+            if existing_schema:
+                st.session_state["schema_name"] = existing_schema.name
+                st.session_state["schema_description"] = existing_schema.description or ""
+                st.session_state["schema_json"] = existing_schema.schema_json
+            else:
+                st.session_state["schema_name"] = ""
+                st.session_state["schema_description"] = ""
+                st.session_state["schema_json"] = "{\n  \"$schema\": \"https://json-schema.org/draft-07/schema#\",\n  \"type\": \"object\",\n  \"properties\": {},\n  \"required\": []\n}"
+
+        with st.form("schema_form", clear_on_submit=False):
+            schema_name = st.text_input("Schema name", value=st.session_state.get("schema_name", ""))
+            schema_description = st.text_input(
+                "Description (optional)",
+                value=st.session_state.get("schema_description", ""),
+                placeholder="Short description of how this schema is used",
+            )
+            schema_json_text = st.text_area(
+                "JSON Schema (raw JSON)",
+                value=st.session_state.get("schema_json", ""),
+                height=200,
+            )
+            schema_saved = st.form_submit_button("Save JSON Schema")
+            if schema_saved and schema_name and schema_json_text:
+                try:
+                    # Best-effort validation that the text is valid JSON
+                    import json as _json  # local import to avoid polluting top-level
+                    _ = _json.loads(schema_json_text)
+                    saved = db.save_schema(
+                        schema_name,
+                        schema_json_text,
+                        description=schema_description or None,
+                        id=existing_schema.id if existing_schema else None,
+                    )
+                    st.success(f"Saved JSON Schema «{saved.name}»")
+                    st.session_state["schema_select"] = saved.name
+                    st.rerun()
+                except Exception as e:
+                    logger.error(f"Error saving JSON Schema: {e}", exc_info=True)
+                    st.error(f"Error saving JSON Schema: {e}")
+
+        if existing_schema:
+            col_del1, col_del2 = st.columns([3, 1])
+            with col_del2:
+                confirm_schema_delete = st.checkbox(
+                    "Confirm delete", key="confirm_delete_schema", help="This will detach the schema from prompts but not modify them."
+                )
+                if st.button("Delete JSON Schema", key="delete_schema_btn", disabled=not confirm_schema_delete):
+                    try:
+                        db.delete_schema(existing_schema.id)
+                        st.success(f"Deleted JSON Schema «{existing_schema.name}»")
+                        if "schema_last_selected" in st.session_state:
+                            del st.session_state["schema_last_selected"]
+                        st.session_state["schema_select"] = "+ Add new"
+                        st.rerun()
+                    except Exception as e:
+                        logger.error(f"Error deleting JSON Schema: {e}", exc_info=True)
+                        st.error(f"Error deleting JSON Schema: {e}")
     crud_options = ["+ Add new"] + [p.name for p in crud_prompts]
     crud_select = st.selectbox("Select prompt", crud_options, key="crud_select")
     existing = next((p for p in crud_prompts if p.name == crud_select), None)
@@ -1385,12 +1459,16 @@ if current_page == "edit_prompts":
             st.session_state["crud_verifier_id"] = existing.verifier_id
             st.session_state["crud_follow_on_only"] = getattr(existing, "follow_on_only", False)
             st.session_state["crud_legal_expert_prompt_id"] = getattr(existing, "legal_expert_prompt_id", None)
+            st.session_state["crud_input_schema_id"] = getattr(existing, "input_schema_id", None)
+            st.session_state["crud_output_schema_id"] = getattr(existing, "output_schema_id", None)
         else:
             st.session_state["crud_name"] = ""
             st.session_state["crud_template"] = ""
             st.session_state["crud_verifier_id"] = None
             st.session_state["crud_follow_on_only"] = False
             st.session_state["crud_legal_expert_prompt_id"] = None
+            st.session_state["crud_input_schema_id"] = None
+            st.session_state["crud_output_schema_id"] = None
 
     with st.form("prompt_form", clear_on_submit=False):
         name_value = st.session_state.get("crud_name", "")
@@ -1398,6 +1476,8 @@ if current_page == "edit_prompts":
         verifier_id_value = st.session_state.get("crud_verifier_id", None)
         follow_on_only_value = st.session_state.get("crud_follow_on_only", False)
         legal_expert_prompt_id_value = st.session_state.get("crud_legal_expert_prompt_id", None)
+        input_schema_id_value = st.session_state.get("crud_input_schema_id", None)
+        output_schema_id_value = st.session_state.get("crud_output_schema_id", None)
         
         name = st.text_input("Name", value=name_value, placeholder="e.g. MC Analysis, Constituent Reply")
         template_text = st.text_area("Template", value=template_value, height=200, placeholder="Instructions for the AI. Use {{ content }} for the user's input.")
@@ -1481,12 +1561,92 @@ if current_page == "edit_prompts":
             except (ValueError, IndexError):
                 logger.warning(f"Could not parse legal expert ID from: {selected_legal_expert_str}")
                 legal_expert_prompt_id = None
+
+        # JSON Schema associations (sidecars)
+        st.markdown("**JSON Schemas (optional)**")
+        st.caption(
+            "Attach reusable JSON Schemas as sidecars. The schemas are sent to Gemini "
+            "along with the prompt and can also be referenced in the template via "
+            "`{{ input_schema_json }}` and `{{ output_schema_json }}`."
+        )
+
+        schema_options = ["— None —"] + [f"{s.id}: {s.name}" for s in crud_schemas]
+
+        # Input schema selector
+        current_input_schema_str = None
+        if input_schema_id_value:
+            _is = next((s for s in crud_schemas if s.id == input_schema_id_value), None)
+            if _is:
+                current_input_schema_str = f"{_is.id}: {_is.name}"
+        input_schema_key = f"input_schema_select_{selected_id}"
+        if input_schema_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
+            st.session_state[input_schema_key] = current_input_schema_str or "— None —"
+        input_schema_index = 0
+        current_input_selection = st.session_state.get(input_schema_key, current_input_schema_str or "— None —")
+        if current_input_selection and current_input_selection in schema_options:
+            input_schema_index = schema_options.index(current_input_selection)
+        selected_input_schema_str = st.selectbox(
+            "Input JSON schema", schema_options, index=input_schema_index, key=input_schema_key
+        )
+        input_schema_id = None
+        if selected_input_schema_str and selected_input_schema_str != "— None —":
+            try:
+                input_schema_id = int(selected_input_schema_str.split(":")[0])
+                logger.debug(f"Selected input schema ID: {input_schema_id}")
+            except (ValueError, IndexError):
+                logger.warning(f"Could not parse input schema ID from: {selected_input_schema_str}")
+                input_schema_id = None
+
+        # Output schema selector
+        current_output_schema_str = None
+        if output_schema_id_value:
+            _os = next((s for s in crud_schemas if s.id == output_schema_id_value), None)
+            if _os:
+                current_output_schema_str = f"{_os.id}: {_os.name}"
+        output_schema_key = f"output_schema_select_{selected_id}"
+        if output_schema_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
+            st.session_state[output_schema_key] = current_output_schema_str or "— None —"
+        output_schema_index = 0
+        current_output_selection = st.session_state.get(output_schema_key, current_output_schema_str or "— None —")
+        if current_output_selection and current_output_selection in schema_options:
+            output_schema_index = schema_options.index(current_output_selection)
+        selected_output_schema_str = st.selectbox(
+            "Output JSON schema", schema_options, index=output_schema_index, key=output_schema_key
+        )
+        output_schema_id = None
+        if selected_output_schema_str and selected_output_schema_str != "— None —":
+            try:
+                output_schema_id = int(selected_output_schema_str.split(":")[0])
+                logger.debug(f"Selected output schema ID: {output_schema_id}")
+            except (ValueError, IndexError):
+                logger.warning(f"Could not parse output schema ID from: {selected_output_schema_str}")
+                output_schema_id = None
         
         submitted = st.form_submit_button("Save")
         if submitted and name and template_text:
-            logger.info(f"Saving prompt: {name} (id: {existing.id if existing else 'new'}, verifier_id: {verifier_id}, follow_on_only: {follow_on_only}, legal_expert: {legal_expert_prompt_id})")
+            logger.info(
+                "Saving prompt: %s (id: %s, verifier_id: %s, follow_on_only: %s, "
+                "legal_expert: %s, input_schema_id: %s, output_schema_id: %s)",
+                name,
+                existing.id if existing else "new",
+                verifier_id,
+                follow_on_only,
+                legal_expert_prompt_id,
+                input_schema_id,
+                output_schema_id,
+            )
             try:
-                db.save_prompt(name, template_text, "markdown", verifier_id=verifier_id, follow_on_only=follow_on_only, legal_expert_prompt_id=legal_expert_prompt_id, id=existing.id if existing else None)
+                db.save_prompt(
+                    name,
+                    template_text,
+                    "markdown",
+                    verifier_id=verifier_id,
+                    follow_on_only=follow_on_only,
+                    legal_expert_prompt_id=legal_expert_prompt_id,
+                    input_schema_id=input_schema_id,
+                    output_schema_id=output_schema_id,
+                    id=existing.id if existing else None,
+                )
                 logger.info("Prompt saved successfully")
                 st.success("Saved.")
                 st.rerun()
@@ -1555,6 +1715,23 @@ if current_page == "runner":
 
     if selected:
         template_text = selected.template_text
+        # Load any JSON Schemas attached to this prompt so they can be passed
+        # both into the template (for references) and to Gemini as sidecars.
+        input_schema_json = None
+        output_schema_json = None
+        try:
+            if getattr(selected, "input_schema_id", None):
+                _schema = db.get_schema_by_id(selected.input_schema_id)
+                if _schema and getattr(_schema, "schema_json", None):
+                    input_schema_json = _schema.schema_json
+            if getattr(selected, "output_schema_id", None):
+                _schema = db.get_schema_by_id(selected.output_schema_id)
+                if _schema and getattr(_schema, "schema_json", None):
+                    output_schema_json = _schema.schema_json
+        except Exception as e:
+            logger.error(f"Error loading JSON Schemas for prompt {selected.id}: {e}", exc_info=True)
+            input_schema_json = None
+            output_schema_json = None
         transient_items = list(st.session_state.get("transient_items", []))
         deleted_names = set(st.session_state.get("transient_deleted_file_names", []))
 
@@ -1888,11 +2065,18 @@ Legal questions will be automatically forwarded to a legal expert who will perfo
                             logger.info(f"Calling brain.run_agent() (attempt {retry_attempt + 1}/{max_retries + 1})")
                             _t0 = time.perf_counter()
                             try:
+                                main_transient_data = {
+                                    "content": user_content,
+                                    "input_schema_json": input_schema_json or "",
+                                    "output_schema_json": output_schema_json or "",
+                                }
                                 result = brain.run_agent(
                                     full_template,
-                                    {"content": user_content},
+                                    main_transient_data,
                                     cache_name,
                                     expect_json=False,
+                                    input_schema_json=input_schema_json,
+                                    output_schema_json=output_schema_json,
                                 )
                                 timings["model_run_s"] = time.perf_counter() - _t0
                                 out_tok = chars_to_tokens(len(str(result)))
@@ -2021,14 +2205,36 @@ Legal questions will be automatically forwarded to a legal expert who will perfo
                                         time.sleep(GEMINI_PACE_DELAY_SECONDS)
                                     _t0 = time.perf_counter()
                                     try:
+                                        # Load any JSON Schemas attached to the legal expert prompt
+                                        le_input_schema_json = None
+                                        le_output_schema_json = None
+                                        try:
+                                            if getattr(legal_expert_p, "input_schema_id", None):
+                                                _le_schema = db.get_schema_by_id(legal_expert_p.input_schema_id)
+                                                if _le_schema and getattr(_le_schema, "schema_json", None):
+                                                    le_input_schema_json = _le_schema.schema_json
+                                            if getattr(legal_expert_p, "output_schema_id", None):
+                                                _le_schema = db.get_schema_by_id(legal_expert_p.output_schema_id)
+                                                if _le_schema and getattr(_le_schema, "schema_json", None):
+                                                    le_output_schema_json = _le_schema.schema_json
+                                        except Exception as e:
+                                            logger.error(f"Error loading JSON Schemas for legal expert prompt {legal_expert_p.id}: {e}", exc_info=True)
+                                            le_input_schema_json = None
+                                            le_output_schema_json = None
+
+                                        le_transient_data = {
+                                            "legal_questions": legal_query_text,
+                                            "original_output": main_content,
+                                            "input_schema_json": le_input_schema_json or "",
+                                            "output_schema_json": le_output_schema_json or "",
+                                        }
                                         legal_expert_output = brain.run_agent(
                                             legal_expert_template,
-                                            {
-                                                "legal_questions": legal_query_text,
-                                                "original_output": main_content,
-                                            },
+                                            le_transient_data,
                                             legal_cache_name,
                                             expect_json=False,
+                                            input_schema_json=le_input_schema_json,
+                                            output_schema_json=le_output_schema_json,
                                         )
                                         legal_expert_time = time.perf_counter() - _t0
                                         legal_status.write(f"⏱️ Legal expert: {legal_expert_time:.2f}s")
@@ -2278,11 +2484,35 @@ Legal questions will be automatically forwarded to a legal expert who will perfo
                                 while True:
                                     try:
                                         _t0 = time.perf_counter()
+                                        # Load any JSON Schemas attached to this follow-on prompt
+                                        step_input_schema_json = None
+                                        step_output_schema_json = None
+                                        try:
+                                            if getattr(next_p, "input_schema_id", None):
+                                                _step_schema = db.get_schema_by_id(next_p.input_schema_id)
+                                                if _step_schema and getattr(_step_schema, "schema_json", None):
+                                                    step_input_schema_json = _step_schema.schema_json
+                                            if getattr(next_p, "output_schema_id", None):
+                                                _step_schema = db.get_schema_by_id(next_p.output_schema_id)
+                                                if _step_schema and getattr(_step_schema, "schema_json", None):
+                                                    step_output_schema_json = _step_schema.schema_json
+                                        except Exception as e:
+                                            logger.error(f"Error loading JSON Schemas for follow-on prompt {next_p.id}: {e}", exc_info=True)
+                                            step_input_schema_json = None
+                                            step_output_schema_json = None
+
+                                        step_transient_data = {
+                                            "previous_output": accumulated,
+                                            "input_schema_json": step_input_schema_json or "",
+                                            "output_schema_json": step_output_schema_json or "",
+                                        }
                                         out = brain.run_agent(
                                             followon_template,
-                                            {"previous_output": accumulated},
+                                            step_transient_data,
                                             step_cache_name,
                                             expect_json=False,
+                                            input_schema_json=step_input_schema_json,
+                                            output_schema_json=step_output_schema_json,
                                         )
                                         step_timing["model_run_s"] = time.perf_counter() - _t0
                                         break
@@ -2372,14 +2602,36 @@ Legal questions will be automatically forwarded to a legal expert who will perfo
                                                     time.sleep(GEMINI_PACE_DELAY_SECONDS)
                                                 _t0 = time.perf_counter()
                                                 try:
+                                                    # Load any JSON Schemas attached to this legal expert prompt
+                                                    sle_input_schema_json = None
+                                                    sle_output_schema_json = None
+                                                    try:
+                                                        if getattr(step_legal_expert_p, "input_schema_id", None):
+                                                            _sle_schema = db.get_schema_by_id(step_legal_expert_p.input_schema_id)
+                                                            if _sle_schema and getattr(_sle_schema, "schema_json", None):
+                                                                sle_input_schema_json = _sle_schema.schema_json
+                                                        if getattr(step_legal_expert_p, "output_schema_id", None):
+                                                            _sle_schema = db.get_schema_by_id(step_legal_expert_p.output_schema_id)
+                                                            if _sle_schema and getattr(_sle_schema, "schema_json", None):
+                                                                sle_output_schema_json = _sle_schema.schema_json
+                                                    except Exception as e:
+                                                        logger.error(f"Error loading JSON Schemas for follow-on legal expert prompt {step_legal_expert_p.id}: {e}", exc_info=True)
+                                                        sle_input_schema_json = None
+                                                        sle_output_schema_json = None
+
+                                                    sle_transient_data = {
+                                                        "legal_questions": step_legal_query_text,
+                                                        "original_output": step_main_content,
+                                                        "input_schema_json": sle_input_schema_json or "",
+                                                        "output_schema_json": sle_output_schema_json or "",
+                                                    }
                                                     step_legal_expert_output = brain.run_agent(
                                                         step_legal_expert_template,
-                                                        {
-                                                            "legal_questions": step_legal_query_text,
-                                                            "original_output": step_main_content,
-                                                        },
+                                                        sle_transient_data,
                                                         step_legal_cache_name,
                                                         expect_json=False,
+                                                        input_schema_json=sle_input_schema_json,
+                                                        output_schema_json=sle_output_schema_json,
                                                     )
                                                     step_legal_expert_time = time.perf_counter() - _t0
                                                     step_legal_status.write(f"⏱️ Legal expert: {step_legal_expert_time:.2f}s")
@@ -2514,17 +2766,46 @@ Legal questions will be automatically forwarded to a legal expert who will perfo
             if pipeline_step_results and len(pipeline_step_results) > 0:
                 st.markdown("**Pipeline Results (by step):**")
                 st.caption("Each step's results are shown below. You can review them while subsequent steps are processing.")
-                
+
+                # Expand only the final step by default; earlier steps stay collapsed
+                last_step_number = pipeline_step_results[-1].get(
+                    "step_number", len(pipeline_step_results)
+                )
+
                 for step_result in pipeline_step_results:
                     step_num = step_result.get("step_number", 0)
                     step_name = step_result.get("step_name", "Unknown")
-                    full_output = step_result.get("full_output", step_result.get("output", ""))
+                    # Main analysis output for this step (without cumulative chaining)
+                    main_output = step_result.get("output", "")
+                    # full_output already includes legal expert consultation and any chaining
+                    full_output = step_result.get("full_output", main_output)
                     has_legal = step_result.get("has_legal_expert", False)
                     legal_output = step_result.get("legal_expert_output")
-                    
-                    with st.expander(f"Step {step_num}: {step_name}", expanded=(step_num == 1)):
-                        # full_output already includes legal expert consultation if present
-                        _markdown_with_copy(full_output, f"step_{step_num}_{step_name}")
+
+                    is_last_step = step_num == last_step_number
+                    with st.expander(f"Step {step_num}: {step_name}", expanded=is_last_step):
+                        # Show the step's primary analysis output
+                        st.markdown("**Step output**")
+                        _markdown_with_copy(
+                            main_output or full_output, f"step_{step_num}_{step_name}_main"
+                        )
+
+                        # If there was a separate legal expert consultation, surface it explicitly
+                        if has_legal and legal_output:
+                            st.markdown("---")
+                            st.markdown("**Legal expert consultation (raw)**")
+                            _markdown_with_copy(
+                                str(legal_output),
+                                f"step_{step_num}_{step_name}_legal",
+                            )
+
+                        # If full_output differs (e.g., cumulative with prior steps), show it as well
+                        if full_output and full_output != main_output:
+                            st.markdown("---")
+                            st.markdown("**Combined output (including prior steps / legal)**")
+                            _markdown_with_copy(
+                                full_output, f"step_{step_num}_{step_name}_full"
+                            )
             else:
                 # Fallback: if no step results stored, show final result
                 md = res if isinstance(res, str) else str(res)

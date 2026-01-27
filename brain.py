@@ -1579,6 +1579,8 @@ def run_agent(
     max_retries: int = 7,
     initial_delay: float = 1.0,
     context_xml: str | None = None,
+    input_schema_json: str | None = None,
+    output_schema_json: str | None = None,
 ) -> str | dict[str, Any]:
     """
     Render prompt_template with transient_data (jinja2), call Gemini with
@@ -1607,17 +1609,56 @@ def run_agent(
     m = model or get_effective_model()  # Use function to get current model from DB
     logger.debug(f"Using model: {m}")
     
-    # Build content - either use cache or include context directly
+    # Build content - either use cache or include context directly.
+    # If JSON Schema sidecars are provided, append them as additional Parts so that
+    # the model can see and follow them. The prompt itself can reference these
+    # schemas explicitly.
     no_afc = types.AutomaticFunctionCallingConfig(disable=True)
+
+    # If we have an output schema and it's valid JSON, configure Gemini for
+    # structured JSON output.
+    response_schema = None
+    if output_schema_json:
+        try:
+            response_schema = json.loads(output_schema_json)
+            logger.debug("Parsed output_schema_json for structured JSON response")
+        except Exception as e:
+            logger.warning(f"Could not parse output_schema_json as JSON; falling back to free-form output: {e}")
+            response_schema = None
+
     if cache_name:
         # Use cached content (preferred - faster and cheaper)
-        config = types.GenerateContentConfig(
-            cached_content=cache_name,
-            automatic_function_calling=no_afc,
-        )
+        parts: list[types.Part] = [_text_part(prompt)]
+        if input_schema_json:
+            parts.append(
+                _text_part(
+                    "\n\n[INPUT_JSON_SCHEMA]\n"
+                    f"{input_schema_json.strip()}\n"
+                    "[/INPUT_JSON_SCHEMA]"
+                )
+            )
+        if output_schema_json:
+            parts.append(
+                _text_part(
+                    "\n\n[OUTPUT_JSON_SCHEMA]\n"
+                    f"{output_schema_json.strip()}\n"
+                    "[/OUTPUT_JSON_SCHEMA]"
+                )
+            )
+
+        config_kwargs: dict[str, Any] = {
+            "cached_content": cache_name,
+            "automatic_function_calling": no_afc,
+        }
+        if response_schema is not None:
+            # Tell Gemini to return strict JSON following this schema.
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_json_schema"] = response_schema
+        config = types.GenerateContentConfig(**config_kwargs)
+
         prompt_content = types.Content(
             role="user",
-            parts=[_text_part(prompt)],
+            parts=parts,
         )
         contents = [prompt_content]
     else:
@@ -1627,10 +1668,36 @@ def run_agent(
         logger.warning("Running without cache - including full context in prompt (slower and more expensive)")
         # Combine context and prompt
         full_prompt = f"{context_xml}\n\n---\n\n{prompt}"
-        config = types.GenerateContentConfig(automatic_function_calling=no_afc)
+
+        full_parts: list[types.Part] = [_text_part(full_prompt)]
+        if input_schema_json:
+            full_parts.append(
+                _text_part(
+                    "\n\n[INPUT_JSON_SCHEMA]\n"
+                    f"{input_schema_json.strip()}\n"
+                    "[/INPUT_JSON_SCHEMA]"
+                )
+            )
+        if output_schema_json:
+            full_parts.append(
+                _text_part(
+                    "\n\n[OUTPUT_JSON_SCHEMA]\n"
+                    f"{output_schema_json.strip()}\n"
+                    "[/OUTPUT_JSON_SCHEMA]"
+                )
+            )
+
+        config_kwargs = {
+            "automatic_function_calling": no_afc,
+        }
+        if response_schema is not None:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_json_schema"] = response_schema
+        config = types.GenerateContentConfig(**config_kwargs)
+
         prompt_content = types.Content(
             role="user",
-            parts=[_text_part(full_prompt)],
+            parts=full_parts,
         )
         contents = [prompt_content]
     
