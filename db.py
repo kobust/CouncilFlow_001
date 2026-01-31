@@ -41,6 +41,18 @@ def _get_engine():
 # -----------------------------------------------------------------------------
 
 
+class Workflow(SQLModel, table=True):
+    """
+    Phase 5: Workflow definition. Prompts that are not follow-on-only can be assigned
+    to a workflow (which graph to run when this prompt is selected at run start).
+    """
+    __table_args__ = {"extend_existing": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str  # display name, e.g. "Default (Analysis)"
+    graph_key: str  # key used to select graph, e.g. "default", "agenda_review"
+
+
 class PromptTemplate(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
 
@@ -56,6 +68,35 @@ class PromptTemplate(SQLModel, table=True):
     # - output_schema_id: schema describing the model's output shape
     input_schema_id: Optional[int] = Field(default=None, nullable=True)
     output_schema_id: Optional[int] = Field(default=None, nullable=True)
+    # Auto-incremented on each save; used when recording which prompt version produced a run.
+    current_version: Optional[int] = Field(default=1, nullable=True)
+    # Phase 4: when True, run QA agent after follow-on chain to review and polish final output.
+    use_qa_agent: bool = Field(default=False, nullable=False)
+    # Phase 5: which workflow (graph) runs when this prompt is selected at start. N/A for follow_on_only.
+    workflow_id: Optional[int] = Field(default=None, nullable=True)
+
+
+class PromptVersion(SQLModel, table=True):
+    """
+    One row per saved version of a prompt. Created on each save (update or create).
+    Enables recording which prompt version generated a run; revert tools can be added later.
+    """
+    __table_args__ = {"extend_existing": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    prompt_template_id: int  # FK to PromptTemplate.id
+    version: int  # version number (1, 2, 3, ...)
+    name: str
+    template_text: str
+    output_mode: str
+    verifier_id: Optional[int] = None
+    follow_on_only: bool = Field(default=False, nullable=False)
+    legal_expert_prompt_id: Optional[int] = None
+    input_schema_id: Optional[int] = None
+    output_schema_id: Optional[int] = None
+    use_qa_agent: bool = Field(default=False, nullable=False)
+    workflow_id: Optional[int] = None
+    saved_at: Optional[datetime] = None  # when this version was saved
 
 
 class JsonSchema(SQLModel, table=True):
@@ -144,6 +185,95 @@ def _migrate_prompt_schema_ids() -> None:
         logger.warning(f"Migration prompt schema ids: {e}")
 
 
+def _migrate_current_version() -> None:
+    """Add current_version column to prompttemplate if missing; set to 1 for existing rows."""
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(prompttemplate)")).fetchall()
+        columns = [r[1] for r in rows] if rows else []
+        if "current_version" not in columns:
+            logger.info("Adding current_version column to prompttemplate")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN current_version INTEGER"))
+                conn.execute(text("UPDATE prompttemplate SET current_version = 1 WHERE current_version IS NULL"))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration current_version: {e}")
+
+
+def _migrate_workflow_id() -> None:
+    """Add workflow_id column to prompttemplate and promptversion if missing (Phase 5)."""
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows_pt = conn.execute(text("PRAGMA table_info(prompttemplate)")).fetchall()
+        columns_pt = [r[1].lower() for r in rows_pt] if rows_pt else []
+        if "workflow_id" not in columns_pt:
+            logger.info("Adding workflow_id column to prompttemplate")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN workflow_id INTEGER"))
+                conn.commit()
+        try:
+            with engine.connect() as conn:
+                rows_pv = conn.execute(text("PRAGMA table_info(promptversion)")).fetchall()
+        except Exception:
+            rows_pv = []
+        columns_pv = [r[1].lower() for r in rows_pv] if rows_pv else []
+        if rows_pv and "workflow_id" not in columns_pv:
+            logger.info("Adding workflow_id column to promptversion")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE promptversion ADD COLUMN workflow_id INTEGER"))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration workflow_id: {e}")
+
+
+def _migrate_use_qa_agent() -> None:
+    """Add use_qa_agent column to prompttemplate and promptversion if missing (Phase 4)."""
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows_pt = conn.execute(text("PRAGMA table_info(prompttemplate)")).fetchall()
+        columns_pt = [r[1] for r in rows_pt] if rows_pt else []
+        if "use_qa_agent" not in columns_pt:
+            logger.info("Adding use_qa_agent column to prompttemplate")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN use_qa_agent BOOLEAN DEFAULT 0"))
+                conn.commit()
+        # PromptVersion table (may not exist in very old DBs; create_all creates it)
+        try:
+            with engine.connect() as conn:
+                rows_pv = conn.execute(text("PRAGMA table_info(promptversion)")).fetchall()
+        except Exception:
+            rows_pv = []
+        columns_pv = [r[1] for r in rows_pv] if rows_pv else []
+        if rows_pv and "use_qa_agent" not in columns_pv:
+            logger.info("Adding use_qa_agent column to promptversion")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE promptversion ADD COLUMN use_qa_agent BOOLEAN DEFAULT 0"))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration use_qa_agent: {e}")
+
+
+def _seed_workflows() -> None:
+    """Seed Workflow table with default workflow(s) if empty (Phase 5)."""
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            existing = list(s.exec(select(Workflow)).all())
+            if existing:
+                return
+            logger.info("Seeding Workflow table")
+            s.add(Workflow(name="Default (Analysis)", graph_key="default"))
+            s.add(Workflow(name="Agenda packet review", graph_key="agenda_review"))
+            s.commit()
+            logger.info("Workflow table seeded")
+    except Exception as e:
+        logger.warning(f"Error seeding workflows: {e}")
+
+
 def _init_app_config() -> None:
     """Initialize AppConfig table with default values if it doesn't exist."""
     try:
@@ -176,7 +306,11 @@ def init_db() -> None:
         _migrate_follow_on_only()
         _migrate_legal_expert_prompt_id()
         _migrate_prompt_schema_ids()
+        _migrate_current_version()
+        _migrate_use_qa_agent()
+        _migrate_workflow_id()
         _init_app_config()
+        _seed_workflows()
         with Session(engine) as s:
             existing = s.exec(select(PromptTemplate)).first()
             if existing is not None:
@@ -244,6 +378,61 @@ def get_prompt_by_id(prompt_id: int) -> PromptTemplate | None:
         raise
 
 
+def list_prompt_versions(prompt_template_id: int) -> list[PromptVersion]:
+    """Return version history for a prompt template, newest first (by version desc)."""
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            return list(
+                s.exec(
+                    select(PromptVersion)
+                    .where(PromptVersion.prompt_template_id == prompt_template_id)
+                    .order_by(PromptVersion.version.desc())
+                ).all()
+            )
+    except Exception as e:
+        logger.error(f"Error listing prompt versions for {prompt_template_id}: {e}", exc_info=True)
+        return []
+
+
+def get_prompt_version(prompt_template_id: int, version: int) -> PromptVersion | None:
+    """Return one saved version of a prompt template, or None."""
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            return s.exec(
+                select(PromptVersion).where(
+                    PromptVersion.prompt_template_id == prompt_template_id,
+                    PromptVersion.version == version,
+                )
+            ).first()
+    except Exception as e:
+        logger.error(f"Error getting prompt version {prompt_template_id} v{version}: {e}", exc_info=True)
+        return None
+
+
+def get_all_workflows() -> list[Workflow]:
+    """Return all workflows (Phase 5)."""
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            return list(s.exec(select(Workflow).order_by(Workflow.id)).all())
+    except Exception as e:
+        logger.error(f"Error fetching workflows: {e}", exc_info=True)
+        raise
+
+
+def get_workflow_by_id(workflow_id: int) -> Workflow | None:
+    """Get a workflow by its ID (Phase 5)."""
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            return s.get(Workflow, workflow_id)
+    except Exception as e:
+        logger.error(f"Error fetching workflow {workflow_id}: {e}", exc_info=True)
+        raise
+
+
 def save_prompt(
     name: str,
     template_text: str,
@@ -254,9 +443,13 @@ def save_prompt(
     *,
     input_schema_id: Optional[int] = None,
     output_schema_id: Optional[int] = None,
+    use_qa_agent: bool = False,
+    workflow_id: Optional[int] = None,
     id: Optional[int] = None,
 ) -> PromptTemplate:
-    """Insert or update a prompt template. If id is given, update; else insert."""
+    """Insert or update a prompt template. If id is given, update; else insert.
+    On each save, a snapshot is written to PromptVersion and current_version is set/incremented.
+    """
     follow_on_only = bool(follow_on_only)
     logger.info(
         "Saving prompt: %s (id: %s, mode: %s, follow_on_only: %s, legal_expert: %s, "
@@ -286,10 +479,51 @@ def save_prompt(
                         legal_expert_prompt_id=legal_expert_prompt_id,
                         input_schema_id=input_schema_id,
                         output_schema_id=output_schema_id,
+                        current_version=1,
+                        use_qa_agent=use_qa_agent,
+                        workflow_id=workflow_id if not follow_on_only else None,
                     )
                     s.add(p)
+                    s.flush()  # get p.id
+                    s.add(
+                        PromptVersion(
+                            prompt_template_id=p.id,
+                            version=1,
+                            name=p.name,
+                            template_text=p.template_text,
+                            output_mode=p.output_mode,
+                            verifier_id=p.verifier_id,
+                            follow_on_only=p.follow_on_only,
+                            legal_expert_prompt_id=p.legal_expert_prompt_id,
+                            input_schema_id=p.input_schema_id,
+                            output_schema_id=p.output_schema_id,
+                            use_qa_agent=p.use_qa_agent,
+                            workflow_id=p.workflow_id,
+                            saved_at=datetime.utcnow(),
+                        )
+                    )
                 else:
                     logger.debug(f"Updating prompt: {existing.name} -> {name}")
+                    # Snapshot current state to PromptVersion before updating
+                    cur_ver = existing.current_version if existing.current_version is not None else 1
+                    s.add(
+                        PromptVersion(
+                            prompt_template_id=existing.id,
+                            version=cur_ver,
+                            name=existing.name,
+                            template_text=existing.template_text,
+                            output_mode=existing.output_mode,
+                            verifier_id=existing.verifier_id,
+                            follow_on_only=existing.follow_on_only,
+                            legal_expert_prompt_id=existing.legal_expert_prompt_id,
+                            input_schema_id=existing.input_schema_id,
+                            output_schema_id=existing.output_schema_id,
+                            use_qa_agent=getattr(existing, "use_qa_agent", False),
+                            workflow_id=getattr(existing, "workflow_id", None),
+                            saved_at=datetime.utcnow(),
+                        )
+                    )
+                    new_ver = cur_ver + 1
                     existing.name = name
                     existing.template_text = template_text
                     existing.output_mode = output_mode
@@ -298,6 +532,9 @@ def save_prompt(
                     existing.legal_expert_prompt_id = legal_expert_prompt_id
                     existing.input_schema_id = input_schema_id
                     existing.output_schema_id = output_schema_id
+                    existing.use_qa_agent = use_qa_agent
+                    existing.workflow_id = workflow_id if not follow_on_only else None
+                    existing.current_version = new_ver
                     p = existing
             else:
                 logger.debug("Creating new prompt")
@@ -310,11 +547,32 @@ def save_prompt(
                     legal_expert_prompt_id=legal_expert_prompt_id,
                     input_schema_id=input_schema_id,
                     output_schema_id=output_schema_id,
+                    current_version=1,
+                    use_qa_agent=use_qa_agent,
+                    workflow_id=workflow_id if not follow_on_only else None,
                 )
                 s.add(p)
+                s.flush()
+                s.add(
+                    PromptVersion(
+                        prompt_template_id=p.id,
+                        version=1,
+                        name=p.name,
+                        template_text=p.template_text,
+                        output_mode=p.output_mode,
+                        verifier_id=p.verifier_id,
+                        follow_on_only=p.follow_on_only,
+                        legal_expert_prompt_id=p.legal_expert_prompt_id,
+                        input_schema_id=p.input_schema_id,
+                        output_schema_id=p.output_schema_id,
+                        use_qa_agent=p.use_qa_agent,
+                        workflow_id=p.workflow_id,
+                        saved_at=datetime.utcnow(),
+                    )
+                )
             s.commit()
             s.refresh(p)
-            logger.info(f"Prompt saved successfully: {p.name} (id: {p.id})")
+            logger.info(f"Prompt saved successfully: {p.name} (id: {p.id}, version: {p.current_version})")
             return p
     except Exception as e:
         logger.error(f"Error saving prompt {name}: {e}", exc_info=True)
@@ -514,13 +772,14 @@ def update_planner_model(model_name: str | None) -> AppConfig:
 
 
 # -----------------------------------------------------------------------------
-# Database Import/Export
+# Database Import/Export (config only: council.db; run data lives in council_runs.db)
 # -----------------------------------------------------------------------------
 
 
 def export_database(export_path: str | Path) -> str:
     """
-    Export the database to a file by copying the database file.
+    Export the config database (council.db) to a file by copying the database file.
+    Run/analysis data is not exported; it lives in council_runs.db (runs_db.py).
     Returns the path to the exported file.
     """
     export_path = Path(export_path)
@@ -540,12 +799,13 @@ def export_database(export_path: str | Path) -> str:
 
 def import_database(import_path: str | Path, backup_existing: bool = True) -> None:
     """
-    Import a database from a file by replacing the current database.
-    
+    Import the config database (council.db) from a file by replacing the current database.
+    Run/analysis data in council_runs.db is never modified by import.
+
     Args:
         import_path: Path to the database file to import
         backup_existing: If True, create a backup of the current database before importing
-    
+
     Raises:
         FileNotFoundError: If import_path doesn't exist
         ValueError: If import_path is not a valid SQLite database

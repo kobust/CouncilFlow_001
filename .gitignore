@@ -6,3 +6,6 @@ secrets.toml
 .streamlit/secrets.toml
 service_account.json
 .rag_cache/
+
+# Run/analysis data (Phase 0: never exported/imported; config sync uses council.db only)
+council_runs.db

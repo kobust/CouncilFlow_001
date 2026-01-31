@@ -84,6 +84,19 @@ Open the URL shown in the terminal. Log in with a user from `config.yaml`, conne
 | `GEMINI_RATE_LIMIT_RPM` | Requests per minute limit for rate limiting (default: `10`). **If running multiple instances with same API key, set to `total_limit / num_instances`** |
 | `COUNCILFLOW_INSTANCE_COUNT` | Number of instances sharing the API key (for rate limit warnings, optional) |
 | `COUNCILFLOW_DATA_DIR` | Data directory on Linux/Docker (default: `/app/data`) |
+| `COUNCILFLOW_USE_GRAPH_CHECKPOINTER` | Set to `1` or `true` to persist LangGraph checkpoints in `council_runs.db` (D6). Default off; state may contain non-serializable objects. |
+
+---
+
+## Optional: Verify LangGraph (Phase 3)
+
+After installing requirements, you can confirm the analysis graph compiles:
+
+```bash
+python -m workflow_graph
+```
+
+Expected: `Graph compiled OK (no checkpointer)` and, if `langgraph-checkpoint-sqlite` is installed, `Graph compiled OK (with SqliteSaver)`.
 
 ---
 
@@ -117,8 +130,14 @@ docker run -p 8080:8080 -e GEMINI_API_KEY="..." -e GCP_SERVICE_ACCOUNT_JSON='{"t
 | `rag.py` | Chunking, BM25, hybrid retrieval, RRF, deduplication |
 | `librarian.py` | Drive client, file fetch, text extraction |
 | `rag_cache.py` | Disk cache for library indexes |
+| `db.py` | Config persistence: prompts, JSON schemas, app config (`council.db`) |
+| `runs_db.py` | Run/analysis persistence: `AnalysisRun` table (`council_runs.db`) |
+| `workflow.py` | Analysis workflow steps (Phase 2); used by `workflow_graph` | 
+| `workflow_graph.py` | LangGraph StateGraph: plan → retrieve → cache → main agent → [conditional legal] → integrate → follow-on chain (Phase 3) |
 | `config.yaml` | Auth (streamlit-authenticator) and cookie config |
 | `RAG_ARCHITECTURE.md` | RAG design, document selection flow, config tunables |
+
+**Databases:** `council.db` holds prompts, JSON schemas, and app config (export/import sync this file only). `council_runs.db` holds analysis run history and is not exported or imported; it is gitignored. See `AGENTIC_DESIGN_IDEAS.md` for the migration plan.
 
 ---
 

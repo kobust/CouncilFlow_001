@@ -15,8 +15,13 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[misc, assignment]
 
 # Token usage optimization: configurable delays to spread API calls across time
 PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "10") or "10")
@@ -57,6 +62,8 @@ except ImportError as import_err:
     OCR_ERROR_MSG = f"OCR Python libraries not installed: {import_err}"
 
 import brain
+import workflow as workflow_module
+import workflow_graph
 from brain import (
     CacheExpiredError,
     get_effective_model,
@@ -71,6 +78,7 @@ from brain import (
     model_max_context,
 )
 import db
+import runs_db
 from librarian import get_cached_file_list, get_cached_folder_info
 from rag_cache import clear_disk_cache_for_folder
 from rag_loader import (
@@ -236,6 +244,15 @@ try:
 except Exception as e:
     logger.error(f"Database initialization failed: {e}", exc_info=True)
     st.error(f"Database error: {e}")
+    st.stop()
+
+logger.debug("Initializing runs database")
+try:
+    runs_db.init_runs_db()
+    logger.debug("Runs database initialized")
+except Exception as e:
+    logger.error(f"Runs database initialization failed: {e}", exc_info=True)
+    st.error(f"Runs database error: {e}")
     st.stop()
 
 # Pre-load disk caches on startup for faster first use
@@ -670,6 +687,25 @@ def _markdown_with_copy(md: str, key_suffix: str) -> None:
         st.code(md, language="markdown", line_numbers=False)
 
 
+def _format_run_datetime(
+    dt: datetime | None,
+    stored_tz: str = "UTC",
+) -> str:
+    """Format a run datetime (stored in stored_tz, typically UTC) for display in local time."""
+    if dt is None:
+        return "?"
+    try:
+        # Assume naive datetimes from DB are in stored_tz (UTC)
+        dt_aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        if dt_aware.tzinfo is None:
+            dt_aware = dt_aware.replace(tzinfo=timezone.utc)
+        # Convert to server's local timezone (user's local when app runs locally)
+        local = dt_aware.astimezone()
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        return dt.strftime("%Y-%m-%d %H:%M") + " (UTC)"
+
+
 def _build_prompt_variables(username: str = "", user_name: str = "") -> str:
     """
     Build a variables section to inject into all prompts.
@@ -1045,9 +1081,16 @@ if is_admin:
     if open_editor_clicked:
         st.session_state["current_page"] = "edit_prompts"
         st.rerun()
+    run_history_clicked = st.sidebar.button("📋 Run history", key="nav_run_history", use_container_width=True)
+    if run_history_clicked:
+        st.session_state["current_page"] = "run_history"
+        st.rerun()
 
 current_page = st.session_state.get("current_page", "runner")
 if current_page == "edit_prompts" and not is_admin:
+    st.session_state["current_page"] = "runner"
+    st.rerun()
+if current_page == "run_history" and not is_admin:
     st.session_state["current_page"] = "runner"
     st.rerun()
 
@@ -1448,6 +1491,80 @@ if current_page == "edit_prompts":
     crud_options = ["+ Add new"] + [p.name for p in crud_prompts]
     crud_select = st.selectbox("Select prompt", crud_options, key="crud_select")
     existing = next((p for p in crud_prompts if p.name == crud_select), None)
+
+    # Show version clearly (default 1 for new or legacy prompts)
+    if existing:
+        version = getattr(existing, "current_version", None) or 1
+        st.markdown(f"**Current version:** {version}")
+    else:
+        st.markdown("**Current version:** 1 *(new prompt)*")
+
+    # Restored-version banner
+    if existing and st.session_state.get("crud_restored_version"):
+        st.info(f"Restored to version **{st.session_state['crud_restored_version']}**. You can edit and **Save** to create a new version.")
+
+    # Version history (existing prompt only)
+    if existing:
+        with st.expander("Version history", expanded=False):
+            versions = db.list_prompt_versions(existing.id)
+            if not versions:
+                st.caption("No version history yet (save this prompt to create the first version).")
+            else:
+                for pv in versions:
+                    saved_str = pv.saved_at.strftime("%Y-%m-%d %H:%M") if getattr(pv, "saved_at", None) else "—"
+                    col1, col2, col3 = st.columns([1, 2, 2])
+                    with col1:
+                        st.markdown(f"**v{pv.version}**")
+                    with col2:
+                        st.caption(f"Saved: {saved_str}")
+                    with col3:
+                        if st.button("Restore", key=f"restore_v{pv.version}_{existing.id}"):
+                            st.session_state["crud_name"] = pv.name
+                            st.session_state["crud_template"] = pv.template_text
+                            st.session_state["crud_verifier_id"] = pv.verifier_id
+                            st.session_state["crud_follow_on_only"] = getattr(pv, "follow_on_only", False)
+                            st.session_state["crud_legal_expert_prompt_id"] = getattr(pv, "legal_expert_prompt_id", None)
+                            st.session_state["crud_input_schema_id"] = getattr(pv, "input_schema_id", None)
+                            st.session_state["crud_output_schema_id"] = getattr(pv, "output_schema_id", None)
+                            st.session_state["crud_use_qa_agent"] = getattr(pv, "use_qa_agent", False)
+                            st.session_state["crud_workflow_id"] = getattr(pv, "workflow_id", None)
+                            st.session_state["crud_restored_version"] = pv.version
+                            # Sync widget keys so selectboxes show restored selection
+                            _fk = f"followon_select_{existing.id}"
+                            if pv.verifier_id:
+                                _fp = db.get_prompt_by_id(pv.verifier_id)
+                                st.session_state[_fk] = f"{_fp.id}: {_fp.name}" if _fp else "— None —"
+                            else:
+                                st.session_state[_fk] = "— None —"
+                            try:
+                                crud_workflows = db.get_all_workflows()
+                                _wk = f"workflow_select_{existing.id}"
+                                if pv.workflow_id and crud_workflows:
+                                    _wf = next((w for w in crud_workflows if w.id == pv.workflow_id), None)
+                                    st.session_state[_wk] = f"{_wf.id}: {_wf.name}" if _wf else "— Default —"
+                                else:
+                                    st.session_state[_wk] = "— Default —"
+                            except Exception:
+                                pass
+                            _lk = f"legal_expert_select_{existing.id}"
+                            if getattr(pv, "legal_expert_prompt_id", None):
+                                _lp = db.get_prompt_by_id(pv.legal_expert_prompt_id)
+                                st.session_state[_lk] = f"{_lp.id}: {_lp.name}" if _lp else "— None —"
+                            else:
+                                st.session_state[_lk] = "— None —"
+                            _ik = f"input_schema_select_{existing.id}"
+                            _ok = f"output_schema_select_{existing.id}"
+                            if pv.input_schema_id and crud_schemas:
+                                _is = next((s for s in crud_schemas if s.id == pv.input_schema_id), None)
+                                st.session_state[_ik] = f"{_is.id}: {_is.name}" if _is else "— None —"
+                            else:
+                                st.session_state[_ik] = "— None —"
+                            if pv.output_schema_id and crud_schemas:
+                                _os = next((s for s in crud_schemas if s.id == pv.output_schema_id), None)
+                                st.session_state[_ok] = f"{_os.id}: {_os.name}" if _os else "— None —"
+                            else:
+                                st.session_state[_ok] = "— None —"
+                            st.rerun()
     
     # Sync form values only when selection changes (avoid clobbering submitted values)
     selected_id = existing.id if existing else None
@@ -1461,6 +1578,8 @@ if current_page == "edit_prompts":
             st.session_state["crud_legal_expert_prompt_id"] = getattr(existing, "legal_expert_prompt_id", None)
             st.session_state["crud_input_schema_id"] = getattr(existing, "input_schema_id", None)
             st.session_state["crud_output_schema_id"] = getattr(existing, "output_schema_id", None)
+            st.session_state["crud_use_qa_agent"] = getattr(existing, "use_qa_agent", False)
+            st.session_state["crud_workflow_id"] = getattr(existing, "workflow_id", None)
         else:
             st.session_state["crud_name"] = ""
             st.session_state["crud_template"] = ""
@@ -1469,6 +1588,8 @@ if current_page == "edit_prompts":
             st.session_state["crud_legal_expert_prompt_id"] = None
             st.session_state["crud_input_schema_id"] = None
             st.session_state["crud_output_schema_id"] = None
+            st.session_state["crud_use_qa_agent"] = False
+            st.session_state["crud_workflow_id"] = None
 
     with st.form("prompt_form", clear_on_submit=False):
         name_value = st.session_state.get("crud_name", "")
@@ -1478,6 +1599,8 @@ if current_page == "edit_prompts":
         legal_expert_prompt_id_value = st.session_state.get("crud_legal_expert_prompt_id", None)
         input_schema_id_value = st.session_state.get("crud_input_schema_id", None)
         output_schema_id_value = st.session_state.get("crud_output_schema_id", None)
+        use_qa_agent_value = st.session_state.get("crud_use_qa_agent", False)
+        workflow_id_value = st.session_state.get("crud_workflow_id", None)
         
         name = st.text_input("Name", value=name_value, placeholder="e.g. MC Analysis, Constituent Reply")
         template_text = st.text_area("Template", value=template_value, height=200, placeholder="Instructions for the AI. Use {{ content }} for the user's input.")
@@ -1534,6 +1657,54 @@ if current_page == "edit_prompts":
             key="crud_follow_on_only",
         )
         st.caption("If checked, this prompt will not appear in the Analysis type dropdown.")
+        
+        # Phase 5: Workflow selector (admin only; not exposed on Run Analysis). N/A for follow-on only.
+        st.markdown("**Workflow**")
+        if follow_on_only:
+            st.caption("N/A — Follow-on only prompts are not used at the start of a workflow.")
+            workflow_id = None
+        else:
+            try:
+                crud_workflows = db.get_all_workflows()
+            except Exception as e:
+                logger.error(f"Error loading workflows: {e}", exc_info=True)
+                crud_workflows = []
+            workflow_options = ["— Default —"] + [f"{w.id}: {w.name}" for w in crud_workflows]
+            workflow_key = f"workflow_select_{selected_id}"
+            current_workflow_str = "— Default —"
+            if workflow_id_value and crud_workflows:
+                wf = next((w for w in crud_workflows if w.id == workflow_id_value), None)
+                if wf:
+                    current_workflow_str = f"{wf.id}: {wf.name}"
+            if workflow_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
+                st.session_state[workflow_key] = current_workflow_str
+            idx = 0
+            if st.session_state.get(workflow_key) in workflow_options:
+                idx = workflow_options.index(st.session_state[workflow_key])
+            selected_workflow_str = st.selectbox(
+                "Workflow (which graph runs when this prompt is selected at run start)",
+                options=workflow_options,
+                index=idx,
+                key=workflow_key,
+                label_visibility="collapsed",
+            )
+            if selected_workflow_str and selected_workflow_str != "— Default —":
+                try:
+                    workflow_id = int(selected_workflow_str.split(":")[0])
+                except (ValueError, IndexError):
+                    workflow_id = None
+            else:
+                workflow_id = crud_workflows[0].id if crud_workflows else None  # Default = first workflow
+            st.caption("Not shown to users on Run Analysis; determines which workflow graph is used.")
+        
+        # Phase 4: QA agent (runs after follow-on chain to review and polish final output)
+        use_qa_agent = st.checkbox(
+            "Use QA agent for this task",
+            value=use_qa_agent_value,
+            key="crud_use_qa_agent",
+            help="After the main analysis, legal review, and follow-on chain, run a QA step to review and polish the final output.",
+        )
+        st.caption("When enabled, a QA agent reviews the full chain output and produces a polished final document.")
         
         # Legal expert prompt selector
         st.markdown("**Legal expert prompt (optional)**")
@@ -1645,9 +1816,12 @@ if current_page == "edit_prompts":
                     legal_expert_prompt_id=legal_expert_prompt_id,
                     input_schema_id=input_schema_id,
                     output_schema_id=output_schema_id,
+                    use_qa_agent=use_qa_agent,
+                    workflow_id=workflow_id if not follow_on_only else None,
                     id=existing.id if existing else None,
                 )
                 logger.info("Prompt saved successfully")
+                st.session_state["crud_restored_version"] = None
                 st.success("Saved.")
                 st.rerun()
             except Exception as e:
@@ -1673,6 +1847,198 @@ if current_page == "edit_prompts":
                     st.error(f"Error deleting: {e}")
 
     st.markdown("---")
+
+# -----------------------------------------------------------------------------
+# Run history page (admin only)
+# -----------------------------------------------------------------------------
+
+elif current_page == "run_history":
+    st.markdown("### 📋 Run history")
+    if st.button("← Back to Run Analysis", key="back_from_history"):
+        st.session_state["current_page"] = "runner"
+        if "run_history_view_id" in st.session_state:
+            del st.session_state["run_history_view_id"]
+        st.rerun()
+    st.caption("Recent analysis runs. Run data is stored locally and is not exported or imported. Times are shown in your local time.")
+
+    view_id = st.session_state.get("run_history_view_id")
+    if view_id is not None:
+        run_detail = runs_db.get_analysis_run_by_id(view_id)
+        if run_detail:
+            stored_tz = getattr(run_detail, "stored_timezone", None) or "UTC"
+            started_str = _format_run_datetime(run_detail.started_at, stored_tz)
+            completed_str = _format_run_datetime(run_detail.completed_at, stored_tz)
+            st.subheader(f"Run #{run_detail.id}: {run_detail.task_name}")
+            st.caption(
+                f"By **{run_detail.username}** · **{run_detail.status}**"
+                + (f" · Prompt version: **{run_detail.prompt_version}**" if getattr(run_detail, "prompt_version", None) is not None else "")
+            )
+            st.caption(f"**Started:** {started_str} · **Completed:** {completed_str}")
+            st.caption(f"Stored in **{stored_tz}**, shown in local time.")
+            st.markdown("---")
+            # Output / Pre-QA / Post-QA when QA was used
+            pre_qa = getattr(run_detail, "pre_qa_output", None)
+            qa_out = getattr(run_detail, "qa_output", None)
+            if pre_qa or qa_out:
+                tab_labels = ["Output"]
+                if pre_qa:
+                    tab_labels.append("Pre-QA")
+                if qa_out:
+                    tab_labels.append("Post-QA")
+                tabs = st.tabs(tab_labels)
+                with tabs[0]:
+                    _markdown_with_copy(run_detail.output_text or "(no output)", f"run_{run_detail.id}_output")
+                idx = 1
+                if pre_qa:
+                    with tabs[idx]:
+                        _markdown_with_copy(pre_qa, f"run_{run_detail.id}_pre_qa")
+                    idx += 1
+                if qa_out:
+                    with tabs[idx]:
+                        _markdown_with_copy(qa_out, f"run_{run_detail.id}_post_qa")
+            else:
+                st.markdown("#### Output")
+                _markdown_with_copy(run_detail.output_text or "(no output)", f"run_{run_detail.id}_output")
+            if run_detail.chain_steps:
+                try:
+                    steps = json.loads(run_detail.chain_steps) if isinstance(run_detail.chain_steps, str) else run_detail.chain_steps
+                    if steps:
+                        with st.expander("Chain steps", expanded=False):
+                            for s in steps:
+                                name = s.get("step_name", "?") if isinstance(s, dict) else "?"
+                                out = s.get("output", "") if isinstance(s, dict) else str(s)
+                                st.markdown(f"**{name}**")
+                                st.text(out[:3000] + ("…" if len(out) > 3000 else ""))
+                except Exception:
+                    st.text(run_detail.chain_steps[:2000])
+            if run_detail.error_message:
+                st.markdown("---")
+                st.markdown("#### Error")
+                st.error(run_detail.error_message)
+            events = runs_db.list_run_events(run_detail.id)
+            if events:
+                with st.expander("Event log", expanded=False):
+                    for ev in events:
+                        ts = ev.created_at
+                        ts_str = _format_run_datetime(ts, getattr(run_detail, "stored_timezone", None) or "UTC") if ts else "—"
+                        st.caption(f"{ts_str} · **{ev.step_name}** · {ev.event_type}" + (f" · {ev.payload}" if ev.payload else ""))
+            if st.button("← Back to list", key="back_to_list"):
+                del st.session_state["run_history_view_id"]
+                st.rerun()
+        else:
+            st.warning(f"Run #{view_id} not found.")
+            if "run_history_view_id" in st.session_state:
+                del st.session_state["run_history_view_id"]
+            st.rerun()
+    else:
+        # Run history filters (persist in session_state)
+        if "run_history_task_filter" not in st.session_state:
+            st.session_state["run_history_task_filter"] = "All"
+        if "run_history_status_filter" not in st.session_state:
+            st.session_state["run_history_status_filter"] = "All"
+        if "run_history_version_filter" not in st.session_state:
+            st.session_state["run_history_version_filter"] = 0
+        if "run_history_filter_by_date" not in st.session_state:
+            st.session_state["run_history_filter_by_date"] = False
+        if "run_history_date_from" not in st.session_state:
+            st.session_state["run_history_date_from"] = datetime.now().date() - timedelta(days=30)
+        if "run_history_date_to" not in st.session_state:
+            st.session_state["run_history_date_to"] = datetime.now().date()
+
+        try:
+            runnable_prompts = [p for p in db.get_all_prompts() if not getattr(p, "follow_on_only", False)]
+            task_filter_options = ["All"] + sorted([p.name for p in runnable_prompts], key=str.casefold)
+        except Exception:
+            task_filter_options = ["All"]
+        status_filter_options = ["All", "Completed", "Failed", "Running"]
+
+        with st.expander("Filters", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                task_filter = st.selectbox(
+                    "Task",
+                    options=task_filter_options,
+                    index=task_filter_options.index(st.session_state["run_history_task_filter"])
+                    if st.session_state["run_history_task_filter"] in task_filter_options else 0,
+                    key="run_history_task_filter_select",
+                )
+                st.session_state["run_history_task_filter"] = task_filter
+            with c2:
+                status_filter = st.selectbox(
+                    "Status",
+                    options=status_filter_options,
+                    index=status_filter_options.index(st.session_state["run_history_status_filter"])
+                    if st.session_state["run_history_status_filter"] in status_filter_options else 0,
+                    key="run_history_status_filter_select",
+                )
+                st.session_state["run_history_status_filter"] = status_filter
+            with c3:
+                version_filter = st.number_input(
+                    "Prompt version (0 = any)",
+                    min_value=0,
+                    value=st.session_state["run_history_version_filter"],
+                    key="run_history_version_filter_input",
+                )
+                st.session_state["run_history_version_filter"] = int(version_filter) if version_filter is not None else 0
+            filter_by_date = st.checkbox(
+                "Filter by date range",
+                value=st.session_state["run_history_filter_by_date"],
+                key="run_history_filter_by_date_cb",
+            )
+            st.session_state["run_history_filter_by_date"] = filter_by_date
+            if filter_by_date:
+                d1, d2 = st.columns(2)
+                with d1:
+                    date_from = st.date_input(
+                        "From",
+                        value=st.session_state["run_history_date_from"],
+                        key="run_history_date_from_input",
+                    )
+                    st.session_state["run_history_date_from"] = date_from
+                with d2:
+                    date_to = st.date_input(
+                        "To",
+                        value=st.session_state["run_history_date_to"],
+                        key="run_history_date_to_input",
+                    )
+                    st.session_state["run_history_date_to"] = date_to
+
+        task_name_filter = None if st.session_state["run_history_task_filter"] == "All" else st.session_state["run_history_task_filter"]
+        status_filter_val = None if st.session_state["run_history_status_filter"] == "All" else st.session_state["run_history_status_filter"]
+        prompt_version_filter = None if st.session_state["run_history_version_filter"] == 0 else st.session_state["run_history_version_filter"]
+        date_from_dt = None
+        date_to_dt = None
+        if st.session_state["run_history_filter_by_date"]:
+            date_from_dt = datetime.combine(st.session_state["run_history_date_from"], datetime.min.time())
+            date_to_dt = datetime.combine(st.session_state["run_history_date_to"], datetime.max.time())
+
+        runs_list = runs_db.list_analysis_runs(
+            20,
+            task_name_filter=task_name_filter,
+            status_filter=status_filter_val,
+            prompt_version_filter=prompt_version_filter,
+            date_from=date_from_dt,
+            date_to=date_to_dt,
+        )
+        if not runs_list:
+            st.info("No runs yet. Run an analysis from the Run Analysis page.")
+        else:
+            for r in runs_list:
+                stored_tz = getattr(r, "stored_timezone", None) or "UTC"
+                started_str = _format_run_datetime(r.started_at, stored_tz)
+                with st.container():
+                    c1, c2, c3 = st.columns([3, 2, 1])
+                    with c1:
+                        st.markdown(f"**{r.task_name}**")
+                    with c2:
+                        pv = getattr(r, "prompt_version", None)
+                        pv_str = f" · v{pv}" if pv is not None else ""
+                        st.caption(f"{r.username} · {started_str} · {r.status}{pv_str}")
+                    with c3:
+                        if st.button("View", key=f"view_run_{r.id}"):
+                            st.session_state["run_history_view_id"] = r.id
+                            st.rerun()
+                    st.divider()
 
 # -----------------------------------------------------------------------------
 # Run Analysis page
@@ -1832,918 +2198,164 @@ if current_page == "runner":
                 can_proceed = False
 
             if can_proceed:
+                run_started_at = datetime.utcnow()
+                st.session_state["_run_started_at"] = run_started_at
+                _rs = st.session_state.get("rag_state")
+                if _rs is None and folder_id:
+                    _rs = get_cached_rag_state(folder_id, _progress_callback=None)
+                    st.session_state["rag_state"] = _rs
+                if _rs is None:
+                    if is_admin:
+                        st.error("RAG knowledge base not loaded. Use **Refresh Knowledge Base** and try again.")
+                    else:
+                        st.error("RAG knowledge base not loaded. Ask an administrator to refresh it, then try again.")
+                    st.stop()
+                logger.info(f"Starting run: folder_id={folder_id}, content_len={len(user_content)}")
+                prompt_variables = _build_prompt_variables(
+                    username=_username,
+                    user_name=st.session_state.get("name", "unknown"),
+                )
+                legal_tracking = (
+                    workflow_module.LEGAL_TRACKING_MAIN
+                    if getattr(selected, "legal_expert_prompt_id", None)
+                    else ""
+                )
+                main_full_template = (
+                    prompt_variables + template_text + legal_tracking
+                    + "\n\n---\n\nSubject of analysis (transient input):\n{{ content }}"
+                )
+                # Phase 5.2: state is serializable (no rag_state, selected_prompt, _callbacks, build_prompt_variables)
+                state = {
+                    "task_name": selected.name,
+                    "template_text": template_text,
+                    "user_content": user_content,
+                    "folder_id": folder_id,
+                    "prompt_template_id": selected.id,
+                    "username": _username,
+                    "user_name": st.session_state.get("name", "unknown"),
+                    "prompt_variables": prompt_variables,
+                    "main_full_template": main_full_template,
+                    "input_schema_json": input_schema_json,
+                    "output_schema_json": output_schema_json,
+                    "session_cache_name": st.session_state.get("gemini_cache_name"),
+                    "session_cache_model": st.session_state.get("gemini_cache_model"),
+                    "session_cache_folder_id": st.session_state.get("gemini_cache_folder_id"),
+                    "session_run_cache_key": st.session_state.get("run_cache_key"),
+                    "gemini_call_count": 0,
+                }
+
+                _prompt_version = getattr(selected, "current_version", None) or 1
+                # Phase 5: resolve workflow key from prompt's workflow (not exposed to user on Run Analysis)
+                _wf_id = getattr(selected, "workflow_id", None)
+                _wf = db.get_workflow_by_id(_wf_id) if _wf_id else None
+                _workflow_key = _wf.graph_key if _wf else workflow_graph.DEFAULT_WORKFLOW_KEY
+                _thread_id = uuid.uuid4().hex
                 try:
-                    _rs = st.session_state.get("rag_state")
-                    if _rs is None and folder_id:
-                        _rs = get_cached_rag_state(folder_id, _progress_callback=None)
-                        st.session_state["rag_state"] = _rs
-                    if _rs is None:
-                        if is_admin:
-                            st.error("RAG knowledge base not loaded. Use **Refresh Knowledge Base** and try again.")
-                        else:
-                            st.error("RAG knowledge base not loaded. Ask an administrator to refresh it, then try again.")
-                        st.stop()
-                    logger.info(f"Starting run: folder_id={folder_id}, content_len={len(user_content)}")
-                    timings: dict[str, float] = {}
-                    if USE_RETRIEVAL_PLANNER:
-                        status_container = st.status("🔍 Planning retrieval…", expanded=True)
-                        with status_container:
-                            _t0 = time.perf_counter()
-                            sel_ids, top_k_map = plan_retrieval(
-                                _rs, selected.name, selected.template_text, user_content
-                            )
-                            id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
-                            libs_str = ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) if sel_ids else "none"
-                            status_container.write(f"✅ **{libs_str}** · top_k per library")
-                            timings["plan_retrieval_s"] = time.perf_counter() - _t0
-                            status_container.write(f"⏱️ {timings['plan_retrieval_s']:.2f}s")
-                            status_container.update(label="✅ Retrieval planned", state="complete")
-                    else:
-                        sel_ids, top_k_map = get_default_plan(_rs)
-                        timings["plan_retrieval_s"] = 0.0
-                    if USE_QUERY_EXPANSION:
-                        query_phrases = expand_queries(
-                            selected.name, selected.template_text, user_content
+                    with st.status("Running analysis…", expanded=True) as status:
+                        run_config = {
+                            "configurable": {
+                                "callbacks": {
+                                    "write": status.write,
+                                    "update_label": lambda label, _s: status.update(label=label),
+                                },
+                                "build_prompt_variables": _build_prompt_variables,
+                                "thread_id": _thread_id,
+                                "log_run_event": lambda step_name, event_type, payload=None: runs_db.insert_run_event(
+                                    step_name, event_type, thread_id=_thread_id, payload=payload
+                                ),
+                            }
+                        }
+                        status.write("Planning retrieval → context → main agent → legal (if needed) → follow-ons…")
+                        state = workflow_graph.run_analysis_graph(
+                            state, workflow_key=_workflow_key, config=run_config, thread_id=_thread_id
                         )
-                    else:
-                        query_phrases = get_fallback_phrases(
-                            selected.name, selected.template_text, user_content
-                        )
-                    cache_folder = st.session_state.get("gemini_cache_folder_id")
-                    cache_name = None
-                    cache_reused = False
-                    
-                    # Safety check: Clear cache if model changed (cache is model-specific)
-                    current_model = get_effective_model()
-                    _last_cache_model = st.session_state.get("gemini_cache_model")
-                    if _last_cache_model and _last_cache_model != current_model:
-                        logger.info(f"Model changed from {_last_cache_model} to {current_model}, clearing cache")
-                        st.session_state["gemini_cache_name"] = None
-                        st.session_state["gemini_cache_model"] = None
-                        _last_cache_name = None
-                    else:
-                        _last_cache_name = st.session_state.get("gemini_cache_name")
-                    
-                    _run_cache_key = hashlib.sha256(
-                        f"{folder_id}|{selected.id}|{(user_content or '')}".encode()
-                    ).hexdigest()[:32]
-                    _last_run_key = st.session_state.get("run_cache_key")
-                    _reuse_cache = (
-                        _last_run_key == _run_cache_key
-                        and _last_cache_name
-                        and cache_folder == folder_id
-                        and _last_cache_model == current_model  # Model must match
-                    )
-
-                    status_container = st.status("🧠 Building context + cache…", expanded=True)
-                    with status_container:
-                        if USE_QUERY_EXPANSION and len(query_phrases) > 1:
-                            status_container.write(f"🔍 {len(query_phrases)} search phrases")
-                        transient_len = len(user_content)
-                        transient_tokens = chars_to_tokens(transient_len)
-                        prompt_wrapper = len(selected.template_text) + 80
-                        prompt_tokens = chars_to_tokens(prompt_wrapper)
-                        _t0 = time.perf_counter()
-                        context_xml, retrieval_report = retrieve_and_build_context_multi(
-                            _rs, query_phrases, sel_ids, top_k_map
-                        )
-                        timings["build_context_s"] = time.perf_counter() - _t0
-                        total_len = len(context_xml)
-                        kb_tokens = chars_to_tokens(total_len)
-                        max_ctx = model_max_context(get_effective_model())
-                        total_input_tokens = kb_tokens + prompt_tokens + transient_tokens
-                        kb_ratio = (kb_tokens / total_input_tokens * 100) if total_input_tokens else 0
-                        user_ratio = (transient_tokens / total_input_tokens * 100) if total_input_tokens else 0
-                        logger.info(f"RAG context built: {total_len:,} chars, {total_input_tokens:,} est. input tokens")
-                        status_container.write(
-                            f"📊 **Context**: {total_input_tokens:,} tokens ({kb_ratio:.0f}% KB, {user_ratio:.0f}% user) — {format_context_usage(total_input_tokens, max_ctx, get_effective_model())}"
-                        )
-                        status_container.write(f"📖 **Real-world**: {format_reading_equivalent(total_input_tokens)}")
-                        if retrieval_report:
-                            for rec in retrieval_report:
-                                lib_name = rec.get("library_name", "?")
-                                n = rec.get("chunks_retrieved", 0)
-                                k = rec.get("top_k", 0)
-                                srcs = rec.get("sources", [])
-                                if n == 0:
-                                    status_container.write(f"• **{lib_name}**: 0 chunks (top_k={k})")
-                                else:
-                                    file_summary = ", ".join(f"{s['file_name']} ({s['chunk_count']})" for s in srcs[:5])
-                                    if len(srcs) > 5:
-                                        file_summary += f" +{len(srcs) - 5} more"
-                                    status_container.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
-                        status_container.write(f"⏱️ Retrieval: {timings['build_context_s']:.2f}s")
-
-                        min_size = 16000
-                        if len(context_xml) < min_size:
-                            status_container.update(label="Context too small", state="error")
-                            st.error("Context is too small for the AI cache. Add more core documents or use additional libraries, then try again.")
-                            st.stop()
-
-                        if _reuse_cache:
-                            cache_name = _last_cache_name
-                            timings["cache_create_s"] = 0.0
-                            cache_reused = True
-                            logger.info("Reusing Gemini cache (same task + input)")
-                            status_container.write("✓ **Reused cache** (same task + input)")
-                            status_container.update(label="✅ Context + cache ready", state="complete")
-                        else:
-                            cache_created = False
-                            try:
-                                _ctx_tok = chars_to_tokens(len(context_xml))
-                                status_container.write(f"📐 Caching {_ctx_tok:,} tokens…")
-                                _t0 = time.perf_counter()
-
-                                def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
-                                    status_container.write(f"Attempt {attempt}/{max_attempts} failed. Retrying in {delay:.0f}s…")
-                                    status_container.update(label="Building context + cache… (retry)", state="running")
-
-                                cache_name = brain.create_gemini_cache(context_xml, progress_callback=retry_progress)
-                                timings["cache_create_s"] = time.perf_counter() - _t0
-                                status_container.write(f"⏱️ Cache: {timings['cache_create_s']:.2f}s")
-                                status_container.update(label="✅ Context + cache ready", state="complete")
-                                cache_created = True
-                            except Exception as cache_error:
-                                status_container.update(label="Context + cache failed", state="error")
-                                logger.error(f"Failed to create cache: {cache_error}", exc_info=True)
-                                error_str = str(cache_error).lower()
-                                error_msg = str(cache_error)
-                                if "too small" in error_str or "min_total_token_count" in error_str:
-                                    st.error(f"**Knowledge base too small for Gemini caching**\n\nError: {cache_error}")
-                                    st.info("The knowledge base needs to contain at least ~16KB of text (4096 tokens).")
-                                    st.stop()
-                                elif "too large" in error_str or "max_total_token_count" in error_str:
-                                    st.error("**Cache Content Too Large**")
-                                    st.warning(
-                                        "Your knowledge base is too large to cache. Gemini caching has size limits "
-                                        "that your current content exceeds."
-                                    )
-                                    st.info("**Solutions:**\n1. **Reduce knowledge base size** – Filter or summarize documents in your Drive folder\n2. **Check API key permissions** – Ensure your API key has caching enabled in Google Cloud Console")
-                                    st.error(f"**Technical details:** {error_msg}")
-                                    st.stop()
-                                elif "503" in error_str or "unavailable" in error_str or "server" in error_str or "failed to create cache after" in error_str:
-                                    st.error("**Gemini API Temporarily Unavailable**")
-                                    st.warning("The Gemini API returned 503. Wait a few minutes, check https://status.cloud.google.com/, then try again.")
-                                    st.error(f"**Technical details:** {error_msg}")
-                                    st.stop()
-                                else:
-                                    st.error(f"**Failed to create cache**\n\nError: {cache_error}")
-                                    st.stop()
-                            if cache_created:
-                                st.session_state["gemini_cache_name"] = cache_name
-                                st.session_state["gemini_cache_model"] = get_effective_model()  # Track model used
-                                st.session_state["gemini_cache_folder_id"] = folder_id
-                                st.session_state["run_cache_key"] = _run_cache_key
-                                logger.info(f"Cache created: {cache_name}")
-                    # Build prompt variables (date/time, user info, etc.) to inject into all prompts
-                    prompt_variables = _build_prompt_variables(
-                        username=_username,
-                        user_name=st.session_state.get("name", "unknown")
-                    )
-                    
-                    # If legal expert prompt is configured, inject instructions to track unresolved legal questions
-                    legal_question_tracking_instructions = ""
-                    if getattr(selected, "legal_expert_prompt_id", None):
-                        legal_question_tracking_instructions = """
-
----
-
-**IMPORTANT - Legal Question Tracking:** 
-
-You must actively review this analysis for unresolved legal questions that are **substantive, relevant, and would materially influence your recommendations or conclusions**.
-
-**Quality Over Quantity:** Only identify legal questions that meet ALL of the following criteria:
-1. **Substantive**: The question addresses a real legal issue, not a minor procedural detail or obvious matter
-2. **Relevant**: The question directly relates to the subject matter being analyzed
-3. **Material**: The answer to the question would meaningfully change your analysis, recommendations, or conclusions
-
-**What to Look For:**
-- Ambiguous statutory language that requires interpretation for this specific situation
-- Compliance obligations or deadlines that are unclear or potentially applicable
-- Legal risks or liabilities that could significantly impact recommendations
-- Regulatory requirements that may conflict or need clarification
-- Procedural requirements that could invalidate or delay proposed actions
-- Legal precedents or case law that might affect the analysis
-
-**What NOT to Include:**
-- Questions that are purely informational or already answered in your analysis
-- Hypothetical scenarios unrelated to the current situation
-- Minor procedural details that don't affect the substance of recommendations
-- Questions that can be answered with general legal knowledge
-
-**Output Format:** At the very end of your response, if you identified ANY legal questions that meet the criteria above, add a section with this exact title:
-
-## Legal Questions Requiring Expert Review
-
-Then list each question as a clear, specific bullet point:
-- [Your first substantive legal question, phrased as a specific question that would influence the analysis]
-- [Your second substantive legal question, if applicable]
-
-Each question should be:
-- Specific and actionable (not vague or general)
-- Directly relevant to the analysis
-- Formulated such that an answer would materially inform your recommendations
-
-If you found NO legal questions that meet these criteria, do NOT include this section. Simply end your analysis normally.
-
-Legal questions will be automatically forwarded to a legal expert who will perform a targeted knowledge base search and provide expert guidance that will be integrated into your analysis.
-"""
-                        logger.info("Legal expert prompt configured - injecting enhanced legal question tracking instructions")
-                    
-                    full_template = prompt_variables + template_text + legal_question_tracking_instructions + "\n\n---\n\nSubject of analysis (transient input):\n{{ content }}"
-                    logger.debug(f"Rendered template length: {len(full_template)} chars (with variables and legal tracking)")
-                    
-                    max_retries = 1
-                    for retry_attempt in range(max_retries + 1):
-                        run_label = "🚀 Model thinking…" if retry_attempt == 0 else "Cache expired, recreating and retrying…"
-                        with st.status(run_label, expanded=True) as run_status:
-                            run_status.write(f"📐 **Input**: {total_input_tokens:,} tokens" + (" · ✓ Reused cache" if cache_reused else ""))
-                            if GEMINI_PACE_DELAY_SECONDS > 0:
-                                run_status.write(f"⏳ Pacing {GEMINI_PACE_DELAY_SECONDS}s…")
-                                time.sleep(GEMINI_PACE_DELAY_SECONDS)
-                            run_status.write("⏳ Calling model…")
-                            logger.info(f"Calling brain.run_agent() (attempt {retry_attempt + 1}/{max_retries + 1})")
-                            _t0 = time.perf_counter()
-                            try:
-                                main_transient_data = {
-                                    "content": user_content,
-                                    "input_schema_json": input_schema_json or "",
-                                    "output_schema_json": output_schema_json or "",
-                                }
-                                result = brain.run_agent(
-                                    full_template,
-                                    main_transient_data,
-                                    cache_name,
-                                    expect_json=False,
-                                    input_schema_json=input_schema_json,
-                                    output_schema_json=output_schema_json,
-                                )
-                                timings["model_run_s"] = time.perf_counter() - _t0
-                                out_tok = chars_to_tokens(len(str(result)))
-                                run_status.write(f"⏱️ {timings['model_run_s']:.2f}s · ✅ **Output**: {out_tok:,} tokens (~{format_reading_equivalent(out_tok)})")
-                                run_status.update(label="✅ Analysis complete", state="complete")
-                                break
-                            except CacheExpiredError as cache_expired:
-                                logger.warning(f"Cache expired (attempt {retry_attempt + 1}/{max_retries + 1}): {cache_expired}")
-                                if retry_attempt < max_retries:
-                                    # Clear invalid cache and recreate
-                                    st.info("Cache expired. Recreating…")
-                                    logger.info("Clearing invalid cache from session state")
-                                    st.session_state["gemini_cache_name"] = None
-                                    st.session_state["gemini_cache_model"] = None
-                                    st.session_state["gemini_cache_folder_id"] = None
-                                    
-                                    # Recreate cache
-                                    logger.info("Recreating Gemini cache after expiration")
-                                    try:
-                                        status_container = st.status("Recreating cache…", expanded=False)
-                                        with status_container:
-                                            def retry_progress(attempt: int, max_attempts: int, delay: float, error_msg: str):
-                                                status_container.write(f"Retry {attempt}/{max_attempts} in {delay:.0f}s…")
-                                                status_container.update(label="Recreating cache… (retry)", state="running")
-                                            cache_name = brain.create_gemini_cache(context_xml, progress_callback=retry_progress)
-                                            status_container.update(label="✅ Cache ready", state="complete")
-                                            
-                                            # Update session state with new cache
-                                            st.session_state["gemini_cache_name"] = cache_name
-                                            st.session_state["gemini_cache_model"] = get_effective_model()  # Track model used
-                                            st.session_state["gemini_cache_folder_id"] = folder_id
-                                            logger.info(f"Cache recreated: {cache_name}")
-                                    except Exception as recreate_error:
-                                        logger.error(f"Failed to recreate cache: {recreate_error}", exc_info=True)
-                                        st.error(f"**Failed to recreate cache after expiration**\n\n{recreate_error}")
-                                        st.stop()
-                                        raise
-                                else:
-                                    # Max retries reached
-                                    logger.error(f"Cache expired and failed to recreate after {max_retries + 1} attempts")
-                                    st.error("**Cache Expired**")
-                                    st.warning("The cache expired and could not be recreated. Please try again.")
-                                    st.error(f"**Technical details:**\n\n{cache_expired}")
-                                    st.stop()
-                                    raise
-                    
-                    logger.info(f"Agent completed: result type={type(result).__name__}")
-                    output_tokens = chars_to_tokens(len(str(result)))
-                    
-                    # Extract legal questions from output (if any)
-                    main_content, legal_questions = extract_legal_questions(str(result))
-                    legal_expert_output = None
-                    legal_expert_report = None
-                    final_output = main_content  # Initialize with main content
-                    
-                    # If legal questions exist and a legal expert prompt is configured, consult it
-                    if legal_questions and getattr(selected, "legal_expert_prompt_id", None):
-                        # Add delay before legal expert consultation to spread token usage (default: 0, no delay)
-                        LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "0") or "0")
-                        if LEGAL_EXPERT_DELAY_SECONDS > 0:
-                            with st.status(f"⏳ Waiting {LEGAL_EXPERT_DELAY_SECONDS}s before legal consultation (rate limit management)…", expanded=False):
-                                time.sleep(LEGAL_EXPERT_DELAY_SECONDS)
-                        
-                        legal_expert_prompt_id = selected.legal_expert_prompt_id
-                        legal_expert_p = db.get_prompt_by_id(legal_expert_prompt_id)
-                        if legal_expert_p:
-                            logger.info(f"Legal questions detected ({len(legal_questions)}). Consulting legal expert: {legal_expert_p.name}")
-                            with st.status("⚖️ Consulting legal expert…", expanded=True) as legal_status:
-                                legal_status.write(f"Found {len(legal_questions)} legal question(s). Performing separate knowledge base search…")
-                                
-                                # Build legal expert query from questions
-                                legal_query_text = "\n\n".join([f"Q{i+1}: {q}" for i, q in enumerate(legal_questions)])
-                                
-                                # Plan retrieval for legal expert (separate search)
-                                if USE_RETRIEVAL_PLANNER:
-                                    _t0 = time.perf_counter()
-                                    legal_sel_ids, legal_top_k_map = plan_retrieval(
-                                        _rs, legal_expert_p.name, legal_expert_p.template_text, legal_query_text
-                                    )
-                                    legal_plan_time = time.perf_counter() - _t0
-                                    legal_status.write(f"⏱️ Legal retrieval planning: {legal_plan_time:.2f}s")
-                                else:
-                                    legal_sel_ids, legal_top_k_map = get_default_plan(_rs)
-                                
-                                # Query expansion for legal expert
-                                if USE_QUERY_EXPANSION:
-                                    legal_query_phrases = expand_queries(
-                                        legal_expert_p.name, legal_expert_p.template_text, legal_query_text
-                                    )
-                                else:
-                                    legal_query_phrases = get_fallback_phrases(
-                                        legal_expert_p.name, legal_expert_p.template_text, legal_query_text
-                                    )
-                                
-                                # Build context for legal expert (separate RAG search)
-                                legal_status.write("Retrieving legal context…")
-                                _t0 = time.perf_counter()
-                                legal_context_xml, legal_expert_report = retrieve_and_build_context_multi(
-                                    _rs, legal_query_phrases, legal_sel_ids, legal_top_k_map
-                                )
-                                legal_retrieval_time = time.perf_counter() - _t0
-                                legal_status.write(f"⏱️ Legal retrieval: {legal_retrieval_time:.2f}s")
-                                
-                                # Create cache for legal expert
-                                if len(legal_context_xml) >= min_size:
-                                    legal_status.write("Caching legal context…")
-                                    _t0 = time.perf_counter()
-                                    legal_cache_name = brain.create_gemini_cache(legal_context_xml)
-                                    legal_cache_time = time.perf_counter() - _t0
-                                    legal_status.write(f"⏱️ Legal cache: {legal_cache_time:.2f}s")
-                                else:
-                                    legal_status.update(label="Legal context too small", state="error")
-                                    st.warning("Legal expert context is too small. Proceeding without legal consultation.")
-                                    legal_cache_name = None
-                                
-                                # Run legal expert prompt
-                                if legal_cache_name:
-                                    # Inject variables into legal expert prompt too
-                                    legal_expert_variables = _build_prompt_variables(
-                                        username=_username,
-                                        user_name=st.session_state.get("name", "unknown")
-                                    )
-                                    legal_expert_template = legal_expert_variables + legal_expert_p.template_text + "\n\n---\n\nLegal questions to answer:\n{{ legal_questions }}\n\n---\n\nOriginal analysis context:\n{{ original_output }}"
-                                    legal_status.write("Running legal expert analysis…")
-                                    if GEMINI_PACE_DELAY_SECONDS > 0:
-                                        time.sleep(GEMINI_PACE_DELAY_SECONDS)
-                                    _t0 = time.perf_counter()
-                                    try:
-                                        # Load any JSON Schemas attached to the legal expert prompt
-                                        le_input_schema_json = None
-                                        le_output_schema_json = None
-                                        try:
-                                            if getattr(legal_expert_p, "input_schema_id", None):
-                                                _le_schema = db.get_schema_by_id(legal_expert_p.input_schema_id)
-                                                if _le_schema and getattr(_le_schema, "schema_json", None):
-                                                    le_input_schema_json = _le_schema.schema_json
-                                            if getattr(legal_expert_p, "output_schema_id", None):
-                                                _le_schema = db.get_schema_by_id(legal_expert_p.output_schema_id)
-                                                if _le_schema and getattr(_le_schema, "schema_json", None):
-                                                    le_output_schema_json = _le_schema.schema_json
-                                        except Exception as e:
-                                            logger.error(f"Error loading JSON Schemas for legal expert prompt {legal_expert_p.id}: {e}", exc_info=True)
-                                            le_input_schema_json = None
-                                            le_output_schema_json = None
-
-                                        le_transient_data = {
-                                            "legal_questions": legal_query_text,
-                                            "original_output": main_content,
-                                            "input_schema_json": le_input_schema_json or "",
-                                            "output_schema_json": le_output_schema_json or "",
-                                        }
-                                        legal_expert_output = brain.run_agent(
-                                            legal_expert_template,
-                                            le_transient_data,
-                                            legal_cache_name,
-                                            expect_json=False,
-                                            input_schema_json=le_input_schema_json,
-                                            output_schema_json=le_output_schema_json,
-                                        )
-                                        legal_expert_time = time.perf_counter() - _t0
-                                        legal_status.write(f"⏱️ Legal expert: {legal_expert_time:.2f}s")
-                                        legal_status.update(label="✅ Legal consultation complete", state="complete")
-                                        logger.info(f"Legal expert consultation completed: {len(str(legal_expert_output))} chars")
-                                    except Exception as legal_err:
-                                        logger.error(f"Legal expert consultation failed: {legal_err}", exc_info=True)
-                                        legal_status.update(label="Legal consultation failed", state="error")
-                                        st.warning(f"Legal expert consultation failed: {legal_err}")
-                                        legal_expert_output = None
-                        else:
-                            logger.warning(f"Legal expert prompt {legal_expert_prompt_id} not found")
-                    
-                    # Integrate legal expertise into main output
-                    if legal_expert_output:
-                        # Append legal expertise as a section without modifying main content significantly
-                        final_output = f"{main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(legal_expert_output)}"
-                        logger.info("Integrated legal expertise into output")
-                    else:
-                        final_output = main_content
-                    
-                    st.session_state["last_result"] = final_output
-                    st.session_state["last_mode"] = "markdown"
-                    st.session_state["last_task_name"] = selected.name
-                    st.session_state["last_rag_retrieval_report"] = retrieval_report
-                    # Track legal questions per step (for display)
-                    legal_questions_by_step = []
-                    if legal_questions:
-                        legal_questions_by_step.append({
-                            "step_name": selected.name,
-                            "questions": legal_questions,
-                            "expert_output": legal_expert_output,
-                            "expert_report": legal_expert_report,
-                            "has_legal_expert": bool(getattr(selected, "legal_expert_prompt_id", None))
-                        })
-                    elif getattr(selected, "legal_expert_prompt_id", None):
-                        # Legal expert configured but no questions found
-                        legal_questions_by_step.append({
-                            "step_name": selected.name,
-                            "questions": None,
-                            "expert_output": None,
-                            "expert_report": None,
-                            "has_legal_expert": True
-                        })
-                    
-                    st.session_state["last_legal_questions"] = legal_questions if legal_questions else None
-                    st.session_state["last_legal_expert_output"] = legal_expert_output if legal_expert_output else None
-                    st.session_state["last_legal_expert_report"] = legal_expert_report if legal_expert_report else None
-                    st.session_state["legal_questions_by_step"] = legal_questions_by_step
-                    st.session_state["last_run_context_stats"] = {
-                        "total_input_tokens": total_input_tokens,
-                        "kb_tokens": kb_tokens,
-                        "transient_tokens": transient_tokens,
-                        "prompt_tokens": prompt_tokens,
-                        "max_context": max_ctx,
-                        "output_tokens": output_tokens,
-                        "model": get_effective_model(),
-                        "timings": timings,
-                    }
-                    
-                    # Chained follow-on prompts: run sequentially, concatenating outputs.
-                    # Re-evaluate context (plan + retrieve + cache) before each follow-on.
-                    # Legal expert consultation (if any) should appear as a separate step BEFORE follow-on prompts.
-                    _sep = "\n\n---\n\n"
-                    accumulated: str = main_content  # Start with main content only (legal expert will be added as separate step)
-                    chain: list[tuple[str, str]] = [(selected.name, accumulated)]
-                    
-                    # Store step results for progressive display
-                    if "pipeline_step_results" not in st.session_state:
-                        st.session_state["pipeline_step_results"] = []
-                    
-                    # Store first step result for progressive display
-                    first_step_result = main_content
-                    if legal_expert_output:
-                        # Integrate legal expert output into main output (don't add as separate step)
-                        first_step_result = f"{main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(legal_expert_output)}"
-                        accumulated = first_step_result
-                    
-                    # Initialize pipeline step results storage
-                    st.session_state["pipeline_step_results"] = [{
-                        "step_number": 1,
-                        "step_name": selected.name,
-                        "output": main_content,
-                        "has_legal_expert": bool(legal_expert_output),
-                        "legal_expert_output": str(legal_expert_output) if legal_expert_output else None,
-                        "full_output": first_step_result
-                    }]
-                    
-                    chain_timings: list[dict[str, float]] = []
-                    current = selected
-                    seen: set[int] = {selected.id}
-                    st.session_state["last_chain_error"] = None
-                    last_retrieval_report = retrieval_report
-                    last_kb_tokens = kb_tokens
-                    last_transient_tokens = transient_tokens
-                    last_prompt_tokens = prompt_tokens
-                    last_total_input = total_input_tokens
-                    
-                    while current.verifier_id:
-                        fid = current.verifier_id
-                        if fid in seen:
-                            logger.warning(f"Follow-on cycle detected (prompt id={fid}), stopping chain")
-                            break
-                        next_p = db.get_prompt_by_id(fid)
-                        if not next_p:
-                            logger.warning(f"Follow-on prompt id {fid} not found, stopping chain")
-                            break
-                        seen.add(next_p.id)
-                        
-                        # Add delay before follow-on prompt to spread token usage across time
-                        if PIPELINE_STEP_DELAY_SECONDS > 0:
-                            with st.status(f"⏳ Waiting {PIPELINE_STEP_DELAY_SECONDS}s before next step (rate limit management)…", expanded=False):
-                                time.sleep(PIPELINE_STEP_DELAY_SECONDS)
-                        
-                        # Inject variables into follow-on prompts too
-                        followon_variables = _build_prompt_variables(
+                except workflow_module.WorkflowError as e:
+                    st.error(e.message)
+                    if e.details:
+                        st.caption(e.details)
+                    logger.error(f"Workflow failed: {e}", exc_info=True)
+                    try:
+                        run_row = runs_db.insert_analysis_run(
                             username=_username,
-                            user_name=st.session_state.get("name", "unknown")
+                            task_name=selected.name,
+                            status="failed",
+                            prompt_template_id=selected.id,
+                            prompt_version=_prompt_version,
+                            folder_id=folder_id,
+                            started_at=st.session_state.get("_run_started_at") or datetime.utcnow(),
+                            completed_at=datetime.utcnow(),
+                            input_summary=f"{len(user_content)} chars",
+                            error_message=e.message,
                         )
-                        
-                        # If this follow-on prompt has legal expert configured, inject legal question tracking instructions
-                        followon_legal_tracking = ""
-                        if getattr(next_p, "legal_expert_prompt_id", None):
-                            followon_legal_tracking = """
-
----
-
-**IMPORTANT - Legal Question Tracking:** 
-
-You must actively review this analysis for unresolved legal questions that are **substantive, relevant, and would materially influence your recommendations or conclusions**.
-
-**Quality Over Quantity:** Only identify legal questions that meet ALL of the following criteria:
-1. **Substantive**: The question addresses a real legal issue, not a minor procedural detail or obvious matter
-2. **Relevant**: The question directly relates to the subject matter being analyzed
-3. **Material**: The answer to the question would meaningfully change your analysis, recommendations, or conclusions
-4. **Unresolved**: The question cannot be definitively answered from the knowledge base or general legal knowledge
-
-**What to Look For:**
-- Ambiguous statutory language that requires interpretation for this specific situation
-- Compliance obligations or deadlines that are unclear or potentially applicable
-- Legal risks or liabilities that could significantly impact recommendations
-- Regulatory requirements that may conflict or need clarification
-- Procedural requirements that could invalidate or delay proposed actions
-- Legal precedents or case law that might affect the analysis
-
-**What NOT to Include:**
-- Questions that are purely informational or already answered in your analysis
-- Hypothetical scenarios unrelated to the current situation
-- Minor procedural details that don't affect the substance of recommendations
-- Questions that can be answered with general legal knowledge
-
-**Think Critically:** Before listing a legal question, ask yourself:
-- "Would the answer to this question change my recommendations?"
-- "Is this a real legal uncertainty, or can I infer the answer from context?"
-- "Is this question specific enough to be actionable by a legal expert?"
-
-**Output Format:** At the very end of your response, if you identified ANY substantive legal questions that meet the criteria above, add a section with this exact title:
-
-## Legal Questions Requiring Expert Review
-
-Then list each question as a clear, specific bullet point:
-- [Your first substantive legal question, phrased as a specific question that would influence the analysis]
-- [Your second substantive legal question, if applicable]
-
-Each question should be:
-- Specific and actionable (not vague or general)
-- Directly relevant to the analysis
-- Formulated such that an answer would materially inform your recommendations
-
-If you found NO legal questions that meet these criteria, do NOT include this section. Simply end your analysis normally.
-
-Legal questions will be automatically forwarded to a legal expert who will perform a targeted knowledge base search and provide expert guidance that will be integrated into your analysis.
-"""
-                            logger.info(f"Legal expert prompt configured for {next_p.name} - injecting enhanced legal question tracking instructions")
-                        
-                        followon_template = followon_variables + next_p.template_text + followon_legal_tracking + "\n\n---\n\nOutput from previous step(s):\n{{ previous_output }}"
-                        step_label = f"Follow-on: {next_p.name}"
-                        try:
-                            step_timing: dict[str, float] = {"name": next_p.name}
-                            if USE_RETRIEVAL_PLANNER:
-                                with st.status(f"🔍 Re-planning retrieval for {next_p.name}…", expanded=True) as replan_status:
-                                    _t0 = time.perf_counter()
-                                    sel_ids, top_k_map = plan_retrieval(
-                                        _rs, next_p.name, next_p.template_text, accumulated
-                                    )
-                                    id_to_name = {lib["id"]: lib["name"] for lib in _rs.get("libraries", [])}
-                                    libs_str = ", ".join([id_to_name.get(lid, "?") for lid in sel_ids]) if sel_ids else "none"
-                                    replan_status.write(f"✅ **{libs_str}**")
-                                    step_timing["plan_retrieval_s"] = time.perf_counter() - _t0
-                                    replan_status.write(f"⏱️ {step_timing['plan_retrieval_s']:.2f}s")
-                                    replan_status.update(label="✅ Re-planned", state="complete")
-                            else:
-                                sel_ids, top_k_map = get_default_plan(_rs)
-                                step_timing["plan_retrieval_s"] = 0.0
-                            if USE_QUERY_EXPANSION:
-                                step_phrases = expand_queries(
-                                    next_p.name, next_p.template_text, accumulated
-                                )
-                            else:
-                                step_phrases = get_fallback_phrases(
-                                    next_p.name, next_p.template_text, accumulated
-                                )
-                            with st.status(f"🧠 Context + cache for {next_p.name}…", expanded=True) as step_ctx_status:
-                                step_ctx_status.write("Retrieving…")
-                                _t0 = time.perf_counter()
-                                step_context_xml, step_report = retrieve_and_build_context_multi(
-                                    _rs, step_phrases, sel_ids, top_k_map
-                                )
-                                step_timing["build_context_s"] = time.perf_counter() - _t0
-                                last_retrieval_report = step_report
-                                step_kb = chars_to_tokens(len(step_context_xml))
-                                step_transient = chars_to_tokens(len(accumulated))
-                                step_prompt = chars_to_tokens(len(next_p.template_text) + 80)
-                                last_kb_tokens = step_kb
-                                last_transient_tokens = step_transient
-                                last_prompt_tokens = step_prompt
-                                last_total_input = step_kb + step_transient + step_prompt
-                                step_ctx_status.write(f"📊 **Context**: {last_total_input:,} tokens")
-                                step_ctx_status.write(f"📖 **Real-world**: {format_reading_equivalent(last_total_input)}")
-                                if step_report:
-                                    for rec in step_report:
-                                        lib_name = rec.get("library_name", "?")
-                                        n = rec.get("chunks_retrieved", 0)
-                                        srcs = rec.get("sources", [])
-                                        if n == 0:
-                                            step_ctx_status.write(f"• **{lib_name}**: 0 chunks")
-                                        else:
-                                            file_summary = ", ".join(f"{s['file_name']} ({s['chunk_count']})" for s in srcs[:5])
-                                            if len(srcs) > 5:
-                                                file_summary += f" +{len(srcs) - 5} more"
-                                            step_ctx_status.write(f"• **{lib_name}**: {n} chunks from {len(srcs)} file(s) — {file_summary}")
-                                step_ctx_status.write(f"⏱️ Retrieval: {step_timing['build_context_s']:.2f}s")
-                                if len(step_context_xml) < min_size:
-                                    step_ctx_status.update(label="Context too small", state="error")
-                                    st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: context too small for cache"
-                                    break
-                                step_ctx_status.write("Caching…")
-                                _t0 = time.perf_counter()
-                                step_cache_name = brain.create_gemini_cache(step_context_xml)
-                                step_timing["cache_create_s"] = time.perf_counter() - _t0
-                                step_ctx_status.write(f"⏱️ Cache: {step_timing['cache_create_s']:.2f}s")
-                                step_ctx_status.update(label="✅ Context + cache ready", state="complete")
-                            with st.spinner(step_label + "…"):
-                                if GEMINI_PACE_DELAY_SECONDS > 0:
-                                    time.sleep(GEMINI_PACE_DELAY_SECONDS)
-                                retry = 0
-                                while True:
-                                    try:
-                                        _t0 = time.perf_counter()
-                                        # Load any JSON Schemas attached to this follow-on prompt
-                                        step_input_schema_json = None
-                                        step_output_schema_json = None
-                                        try:
-                                            if getattr(next_p, "input_schema_id", None):
-                                                _step_schema = db.get_schema_by_id(next_p.input_schema_id)
-                                                if _step_schema and getattr(_step_schema, "schema_json", None):
-                                                    step_input_schema_json = _step_schema.schema_json
-                                            if getattr(next_p, "output_schema_id", None):
-                                                _step_schema = db.get_schema_by_id(next_p.output_schema_id)
-                                                if _step_schema and getattr(_step_schema, "schema_json", None):
-                                                    step_output_schema_json = _step_schema.schema_json
-                                        except Exception as e:
-                                            logger.error(f"Error loading JSON Schemas for follow-on prompt {next_p.id}: {e}", exc_info=True)
-                                            step_input_schema_json = None
-                                            step_output_schema_json = None
-
-                                        step_transient_data = {
-                                            "previous_output": accumulated,
-                                            "input_schema_json": step_input_schema_json or "",
-                                            "output_schema_json": step_output_schema_json or "",
-                                        }
-                                        out = brain.run_agent(
-                                            followon_template,
-                                            step_transient_data,
-                                            step_cache_name,
-                                            expect_json=False,
-                                            input_schema_json=step_input_schema_json,
-                                            output_schema_json=step_output_schema_json,
-                                        )
-                                        step_timing["model_run_s"] = time.perf_counter() - _t0
-                                        break
-                                    except CacheExpiredError as ce:
-                                        logger.warning(f"Cache expired during {next_p.name} (attempt {retry + 1}): {ce}")
-                                        if retry < 1:
-                                            st.info("Cache expired. Recreating…")
-                                            step_cache_name = brain.create_gemini_cache(step_context_xml)
-                                            retry += 1
-                                        else:
-                                            raise
-                                
-                                # Extract legal questions from follow-on prompt output
-                                step_main_content, step_legal_questions = extract_legal_questions(str(out))
-                                step_legal_expert_output = None
-                                step_legal_expert_report = None
-                                
-                                # If this follow-on prompt has legal expert configured and questions were found, consult it
-                                if step_legal_questions and getattr(next_p, "legal_expert_prompt_id", None):
-                                    # Add delay before legal expert consultation to spread token usage
-                                    LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "10") or "10")
-                                    if LEGAL_EXPERT_DELAY_SECONDS > 0:
-                                        with st.status(f"⏳ Waiting {LEGAL_EXPERT_DELAY_SECONDS}s before legal consultation (rate limit management)…", expanded=False):
-                                            time.sleep(LEGAL_EXPERT_DELAY_SECONDS)
-                                    
-                                    step_legal_expert_prompt_id = next_p.legal_expert_prompt_id
-                                    step_legal_expert_p = db.get_prompt_by_id(step_legal_expert_prompt_id)
-                                    if step_legal_expert_p:
-                                        logger.info(f"Legal questions detected in {next_p.name} ({len(step_legal_questions)}). Consulting legal expert: {step_legal_expert_p.name}")
-                                        with st.status(f"⚖️ Legal consultation for {next_p.name}…", expanded=True) as step_legal_status:
-                                            step_legal_status.write(f"Found {len(step_legal_questions)} legal question(s). Performing separate knowledge base search…")
-                                            
-                                            # Build legal expert query from questions
-                                            step_legal_query_text = "\n\n".join([f"Q{i+1}: {q}" for i, q in enumerate(step_legal_questions)])
-                                            
-                                            # Plan retrieval for legal expert
-                                            if USE_RETRIEVAL_PLANNER:
-                                                _t0 = time.perf_counter()
-                                                step_legal_sel_ids, step_legal_top_k_map = plan_retrieval(
-                                                    _rs, step_legal_expert_p.name, step_legal_expert_p.template_text, step_legal_query_text
-                                                )
-                                                step_legal_plan_time = time.perf_counter() - _t0
-                                                step_legal_status.write(f"⏱️ Legal retrieval planning: {step_legal_plan_time:.2f}s")
-                                            else:
-                                                step_legal_sel_ids, step_legal_top_k_map = get_default_plan(_rs)
-                                            
-                                            # Query expansion for legal expert
-                                            if USE_QUERY_EXPANSION:
-                                                step_legal_query_phrases = expand_queries(
-                                                    step_legal_expert_p.name, step_legal_expert_p.template_text, step_legal_query_text
-                                                )
-                                            else:
-                                                step_legal_query_phrases = get_fallback_phrases(
-                                                    step_legal_expert_p.name, step_legal_expert_p.template_text, step_legal_query_text
-                                                )
-                                            
-                                            # Build context for legal expert
-                                            step_legal_status.write("Retrieving legal context…")
-                                            _t0 = time.perf_counter()
-                                            step_legal_context_xml, step_legal_expert_report = retrieve_and_build_context_multi(
-                                                _rs, step_legal_query_phrases, step_legal_sel_ids, step_legal_top_k_map
-                                            )
-                                            step_legal_retrieval_time = time.perf_counter() - _t0
-                                            step_legal_status.write(f"⏱️ Legal retrieval: {step_legal_retrieval_time:.2f}s")
-                                            
-                                            # Create cache for legal expert
-                                            if len(step_legal_context_xml) >= min_size:
-                                                step_legal_status.write("Caching legal context…")
-                                                _t0 = time.perf_counter()
-                                                step_legal_cache_name = brain.create_gemini_cache(step_legal_context_xml)
-                                                step_legal_cache_time = time.perf_counter() - _t0
-                                                step_legal_status.write(f"⏱️ Legal cache: {step_legal_cache_time:.2f}s")
-                                            else:
-                                                step_legal_status.update(label="Legal context too small", state="error")
-                                                st.warning(f"Legal expert context for {next_p.name} is too small. Proceeding without legal consultation.")
-                                                step_legal_cache_name = None
-                                            
-                                            # Run legal expert prompt
-                                            if step_legal_cache_name:
-                                                step_legal_expert_variables = _build_prompt_variables(
-                                                    username=_username,
-                                                    user_name=st.session_state.get("name", "unknown")
-                                                )
-                                                step_legal_expert_template = step_legal_expert_variables + step_legal_expert_p.template_text + "\n\n---\n\nLegal questions to answer:\n{{ legal_questions }}\n\n---\n\nOriginal analysis context:\n{{ original_output }}"
-                                                step_legal_status.write("Running legal expert analysis…")
-                                                if GEMINI_PACE_DELAY_SECONDS > 0:
-                                                    time.sleep(GEMINI_PACE_DELAY_SECONDS)
-                                                _t0 = time.perf_counter()
-                                                try:
-                                                    # Load any JSON Schemas attached to this legal expert prompt
-                                                    sle_input_schema_json = None
-                                                    sle_output_schema_json = None
-                                                    try:
-                                                        if getattr(step_legal_expert_p, "input_schema_id", None):
-                                                            _sle_schema = db.get_schema_by_id(step_legal_expert_p.input_schema_id)
-                                                            if _sle_schema and getattr(_sle_schema, "schema_json", None):
-                                                                sle_input_schema_json = _sle_schema.schema_json
-                                                        if getattr(step_legal_expert_p, "output_schema_id", None):
-                                                            _sle_schema = db.get_schema_by_id(step_legal_expert_p.output_schema_id)
-                                                            if _sle_schema and getattr(_sle_schema, "schema_json", None):
-                                                                sle_output_schema_json = _sle_schema.schema_json
-                                                    except Exception as e:
-                                                        logger.error(f"Error loading JSON Schemas for follow-on legal expert prompt {step_legal_expert_p.id}: {e}", exc_info=True)
-                                                        sle_input_schema_json = None
-                                                        sle_output_schema_json = None
-
-                                                    sle_transient_data = {
-                                                        "legal_questions": step_legal_query_text,
-                                                        "original_output": step_main_content,
-                                                        "input_schema_json": sle_input_schema_json or "",
-                                                        "output_schema_json": sle_output_schema_json or "",
-                                                    }
-                                                    step_legal_expert_output = brain.run_agent(
-                                                        step_legal_expert_template,
-                                                        sle_transient_data,
-                                                        step_legal_cache_name,
-                                                        expect_json=False,
-                                                        input_schema_json=sle_input_schema_json,
-                                                        output_schema_json=sle_output_schema_json,
-                                                    )
-                                                    step_legal_expert_time = time.perf_counter() - _t0
-                                                    step_legal_status.write(f"⏱️ Legal expert: {step_legal_expert_time:.2f}s")
-                                                    step_legal_status.update(label="✅ Legal consultation complete", state="complete")
-                                                    logger.info(f"Legal expert consultation for {next_p.name} completed: {len(str(step_legal_expert_output))} chars")
-                                                except Exception as step_legal_err:
-                                                    logger.error(f"Legal expert consultation for {next_p.name} failed: {step_legal_err}", exc_info=True)
-                                                    step_legal_status.update(label="Legal consultation failed", state="error")
-                                                    st.warning(f"Legal expert consultation for {next_p.name} failed: {step_legal_err}")
-                                                    step_legal_expert_output = None
-                                    else:
-                                        logger.warning(f"Legal expert prompt {step_legal_expert_prompt_id} not found for {next_p.name}")
-                                
-                                # Integrate legal expertise into follow-on output if present
-                                if step_legal_expert_output:
-                                    step_output_with_legal = f"{step_main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(step_legal_expert_output)}"
-                                    logger.info(f"Integrated legal expertise into {next_p.name} output")
-                                else:
-                                    step_output_with_legal = step_main_content
-                                
-                                # Add follow-on prompt output to chain (legal expert already integrated in step_output_with_legal)
-                                accumulated = accumulated + _sep + step_output_with_legal
-                                chain.append((next_p.name, accumulated))
-                                
-                                # Store this step's result for progressive display
-                                step_num = len(st.session_state.get("pipeline_step_results", [])) + 1
-                                step_results = st.session_state.get("pipeline_step_results", [])
-                                step_results.append({
-                                    "step_number": step_num,
-                                    "step_name": next_p.name,
-                                    "output": step_main_content,
-                                    "has_legal_expert": bool(step_legal_expert_output),
-                                    "legal_expert_output": str(step_legal_expert_output) if step_legal_expert_output else None,
-                                    "full_output": step_output_with_legal
-                                })
-                                st.session_state["pipeline_step_results"] = step_results
-                                
-                                # Track legal questions for this follow-on step
-                                if step_legal_questions:
-                                    legal_questions_by_step.append({
-                                        "step_name": next_p.name,
-                                        "questions": step_legal_questions,
-                                        "expert_output": step_legal_expert_output,
-                                        "expert_report": step_legal_expert_report,
-                                        "has_legal_expert": bool(getattr(next_p, "legal_expert_prompt_id", None))
-                                    })
-                                elif getattr(next_p, "legal_expert_prompt_id", None):
-                                    # Legal expert configured but no questions found
-                                    legal_questions_by_step.append({
-                                        "step_name": next_p.name,
-                                        "questions": None,
-                                        "expert_output": None,
-                                        "expert_report": None,
-                                        "has_legal_expert": True
-                                    })
-                                
-                                # Update session state with latest legal questions tracking
-                                st.session_state["legal_questions_by_step"] = legal_questions_by_step
-                                step_timing["total_s"] = (
-                                    step_timing.get("plan_retrieval_s", 0)
-                                    + step_timing.get("build_context_s", 0)
-                                    + step_timing.get("cache_create_s", 0)
-                                    + step_timing.get("model_run_s", 0)
-                                )
-                                chain_timings.append(step_timing)
-                                logger.info(f"Follow-on {next_p.name} completed; accumulated length={len(accumulated)}")
-                                current = next_p
-                        except CacheExpiredError as ce:
-                            logger.error(f"Follow-on {next_p.name} failed: cache could not be recreated", exc_info=True)
-                            st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: cache expired"
-                            break
-                        except Exception as e:
-                            logger.error(f"Error running follow-on {next_p.name}: {e}", exc_info=True)
-                            st.warning(f"⚠️ Follow-on «{next_p.name}» failed: {e}")
-                            st.session_state["last_chain_error"] = f"Follow-on «{next_p.name}»: {e}"
-                            break
-                    st.session_state["last_result"] = accumulated
-                    st.session_state["last_chain"] = chain
-                    st.session_state["last_chain_timings"] = chain_timings
-                    st.session_state["last_rag_retrieval_report"] = last_retrieval_report
-                    stats = st.session_state["last_run_context_stats"]
-                    stats["kb_tokens"] = last_kb_tokens
-                    stats["transient_tokens"] = last_transient_tokens
-                    stats["prompt_tokens"] = last_prompt_tokens
-                    stats["total_input_tokens"] = last_total_input
-                    stats["output_tokens"] = chars_to_tokens(len(accumulated))
-                except RuntimeError as e:
-                    # Handle quota errors and other runtime errors with helpful messages
-                    error_msg = str(e)
-                    if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "Quota Exceeded" in error_msg:
-                        st.error("**⚠️ Quota Exceeded (429)**")
-                        st.warning("You've exceeded your per-minute token limit for the Gemini API.")
-                        st.markdown("""
-                        **What happened:**
-                        - Your request used too many tokens in a 1-minute window
-                        - Limit: 4,000,000 input tokens per minute for gemini-2.0-flash
-                        
-                        **Solutions:**
-                        1. **Wait 1-2 minutes** - Quotas reset every minute
-                        2. **Reduce context size** - Your knowledge base is very large
-                        3. **Request quota increase** - [Google Cloud Console Quotas](https://console.cloud.google.com/apis/api/generativelanguage.googleapis.com/quotas)
-                        4. **Monitor usage** - [Check your rate limits](https://ai.dev/rate-limit)
-                        """)
-                        st.error(f"**Technical details:**\n\n{error_msg}")
-                    else:
-                        st.error(f"**Error running agent:**\n\n{error_msg}")
-                    logger.error(f"Error during run: {e}", exc_info=True)
+                        if run_row and run_row.id:
+                            try:
+                                runs_db.update_run_events_run_id(_thread_id, run_row.id)
+                            except Exception:
+                                pass
+                    except Exception as persist_err:
+                        logger.warning(f"Could not persist failed run: {persist_err}")
                     st.stop()
-                except Exception as e:
-                    logger.error(f"Error during run: {e}", exc_info=True)
-                    st.error(f"**Error running agent:**\n\n{e}")
-                    st.stop()
+
+                # Sync workflow state to session (Phase 2)
+                st.session_state["last_result"] = state["final_output"]
+                st.session_state["last_mode"] = "markdown"
+                st.session_state["last_task_name"] = state["task_name"]
+                st.session_state["last_rag_retrieval_report"] = state.get("retrieval_report")
+                st.session_state["pipeline_step_results"] = state.get("pipeline_step_results", [])
+                st.session_state["last_legal_questions"] = state.get("legal_questions")
+                st.session_state["last_legal_expert_output"] = state.get("legal_expert_output")
+                st.session_state["last_legal_expert_report"] = state.get("legal_expert_report")
+                st.session_state["legal_questions_by_step"] = state.get("legal_questions_by_step", [])
+                st.session_state["last_run_context_stats"] = state.get("last_run_context_stats", {})
+                st.session_state["last_chain"] = state.get("chain")
+                st.session_state["last_chain_timings"] = state.get("chain_timings", [])
+                st.session_state["last_chain_error"] = state.get("last_chain_error")
+                st.session_state["last_prompt_version"] = _prompt_version
+                if state.get("cache_name"):
+                    st.session_state["gemini_cache_name"] = state["cache_name"]
+                    st.session_state["gemini_cache_model"] = get_effective_model()
+                    st.session_state["gemini_cache_folder_id"] = folder_id
+                if state.get("run_cache_key") is not None:
+                    st.session_state["run_cache_key"] = state["run_cache_key"]
+
+                # Persist successful run (Phase 1)
+                _started = st.session_state.get("_run_started_at") or run_started_at
+                _retrieval_summary = ""
+                if state.get("retrieval_report"):
+                    parts = [
+                        f"{r.get('library_name', '?')}: {r.get('chunks_retrieved', 0)} chunks"
+                        for r in state["retrieval_report"]
+                    ]
+                    _retrieval_summary = "; ".join(parts) if parts else ""
+                try:
+                    run_row = runs_db.insert_analysis_run(
+                        username=_username,
+                        task_name=selected.name,
+                        status="completed",
+                        prompt_template_id=selected.id,
+                        prompt_version=_prompt_version,
+                        folder_id=folder_id,
+                        started_at=_started,
+                        completed_at=datetime.utcnow(),
+                        input_summary=f"{len(user_content)} chars",
+                        output_text=state["final_output"],
+                        output_mode="markdown",
+                        has_legal_review=bool(state.get("legal_questions")),
+                        legal_questions=json.dumps(state["legal_questions"]) if state.get("legal_questions") else None,
+                        legal_expert_output=state.get("legal_expert_output"),
+                        chain_steps=(
+                            json.dumps([{"step_name": n, "output": o} for n, o in state["chain"]])
+                            if state.get("chain") else None
+                        ),
+                        retrieval_report_summary=_retrieval_summary or None,
+                        model_used=get_effective_model(),
+                        pre_qa_output=state.get("pre_qa_output"),
+                        qa_output=state.get("qa_output"),
+                    )
+                    if run_row and run_row.id:
+                        runs_db.update_run_events_run_id(_thread_id, run_row.id)
+                except Exception as persist_err:
+                    logger.warning(f"Could not persist run to runs DB: {persist_err}")
 
         # Success path continues to Output section below.
 
@@ -2759,6 +2371,9 @@ Legal questions will be automatically forwarded to a legal expert who will perfo
 
         if res is not None and res_task == selected.name:
             st.markdown("#### Step 4: Review results")
+            _pv = st.session_state.get("last_prompt_version")
+            if _pv is not None:
+                st.caption(f"Prompt version: **{_pv}**")
             logger.debug(f"Displaying output: type={type(res).__name__}")
             
             # Display progressive results for each step in the pipeline
@@ -2824,7 +2439,8 @@ Legal questions will be automatically forwarded to a legal expert who will perfo
                     timings = ctx_stats.get("timings", {})
                     pct = (tot / mx * 100) if mx else 0
                     st.caption("Token estimates (~4 chars/token). Real-world equivalents use Harry Potter, pages, and reading hours.")
-                    st.markdown(f"**Model**: `{model}` · **Max context**: {mx:,} tokens")
+                    gemini_calls = ctx_stats.get("gemini_calls", 0)
+                    st.markdown(f"**Model**: `{model}` · **Max context**: {mx:,} tokens · **Gemini calls**: **{gemini_calls}**")
                     st.markdown(f"**Input**")
                     st.markdown(f"- Knowledge base (cached): **{kb:,}** tokens")
                     st.markdown(f"- User data (analyzed): **{tr:,}** tokens")

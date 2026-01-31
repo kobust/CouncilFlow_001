@@ -18,3 +18,6 @@ html2text
 rank-bm25
 numpy
 nltk
+langgraph
+langgraph-checkpoint-sqlite
+langchain-core
