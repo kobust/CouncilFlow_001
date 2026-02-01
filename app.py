@@ -24,7 +24,7 @@ except ImportError:
     ZoneInfo = None  # type: ignore[misc, assignment]
 
 # Token usage optimization: configurable delays to spread API calls across time
-PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "10") or "10")
+PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "0") or "0")
 LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "0") or "0")
 
 import pandas as pd
@@ -2666,13 +2666,9 @@ if current_page == "runner":
             if chain_timings:
                 with st.expander("⏱️ Timing by follow‑on step", expanded=False):
                     for i, t in enumerate(chain_timings):
-                        name = t.get("name", f"Step {i + 1}")
-                        st.markdown(f"**{name}**")
-                        st.markdown(f"- Planning: **{t.get('plan_retrieval_s', 0):.2f}s**")
-                        st.markdown(f"- Context: **{t.get('build_context_s', 0):.2f}s**")
-                        st.markdown(f"- Cache: **{t.get('cache_create_s', 0):.2f}s**")
-                        st.markdown(f"- Model: **{t.get('model_run_s', 0):.2f}s**")
-                        st.markdown(f"- **Total**: **{t.get('total_s', 0):.2f}s**")
+                        name = t.get("step_name") or t.get("name", f"Step {i + 1}")
+                        elapsed = t.get("elapsed_s") or t.get("total_s", 0)
+                        st.markdown(f"**{name}**: **{elapsed:.2f}s**")
 
             if rag_report:
                 with st.expander("📚 Sources used", expanded=False):

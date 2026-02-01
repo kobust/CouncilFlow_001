@@ -82,8 +82,8 @@ def _get_output_schema_json(prompt: Any) -> str | None:
             return None
     return None
 
-# Env-based delays (same as app)
-PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "10") or "10")
+# Env-based delays (same as app). Default 0 for faster runs; set to 5-10 if hitting rate limits.
+PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "0") or "0")
 LEGAL_EXPERT_DELAY_SECONDS = int(os.environ.get("LEGAL_EXPERT_DELAY_SECONDS", "0") or "0")
 GEMINI_PACE_DELAY_SECONDS = 0
 try:
@@ -616,7 +616,11 @@ def run_follow_on_chain_step(state: dict, callbacks: Callbacks | None = None) ->
             break
         seen.add(next_p.id)
 
+        _cb(state, "write", f"📋 Follow-on step: **{next_p.name}** — planning retrieval…")
+        step_t0 = time.perf_counter()
         if PIPELINE_STEP_DELAY_SECONDS > 0:
+            logger.info("Pipeline step delay: sleeping %ds before follow-on «%s»", PIPELINE_STEP_DELAY_SECONDS, next_p.name)
+            _cb(state, "write", f"⏳ Waiting {PIPELINE_STEP_DELAY_SECONDS}s (rate-limit pacing)…")
             time.sleep(PIPELINE_STEP_DELAY_SECONDS)
 
         followon_variables = build_prompt_variables(state["username"], state.get("user_name", "unknown"))
@@ -631,16 +635,19 @@ def run_follow_on_chain_step(state: dict, callbacks: Callbacks | None = None) ->
         else:
             sel_ids, top_k_map = get_default_plan(_rs)
         if USE_QUERY_EXPANSION:
+            _cb(state, "write", f"🔍 **{next_p.name}** — expanding queries (LLM)…")
             from brain import expand_queries
             step_phrases = expand_queries(next_p.name, next_p.template_text, accumulated)
         else:
             step_phrases = get_fallback_phrases(next_p.name, next_p.template_text, accumulated)
 
+        _cb(state, "write", f"📚 **{next_p.name}** — retrieving context…")
         step_context_xml, step_report = retrieve_and_build_context_multi(_rs, step_phrases, sel_ids, top_k_map)
         if len(step_context_xml) < MIN_CONTEXT_SIZE:
             state["last_chain_error"] = f"Follow-on «{next_p.name}»: context too small for cache"
             break
 
+        _cb(state, "write", f"📦 **{next_p.name}** — creating context cache…")
         step_cache_name = create_gemini_cache(step_context_xml)
         if GEMINI_PACE_DELAY_SECONDS > 0:
             time.sleep(GEMINI_PACE_DELAY_SECONDS)
@@ -648,6 +655,7 @@ def run_follow_on_chain_step(state: dict, callbacks: Callbacks | None = None) ->
         step_input_schema_json = _get_input_schema_json(next_p)
         step_output_schema_json = _get_output_schema_json(next_p)
 
+        _cb(state, "write", f"🤖 **{next_p.name}** — running agent…")
         retry = 0
         while True:
             try:
@@ -723,6 +731,10 @@ def run_follow_on_chain_step(state: dict, callbacks: Callbacks | None = None) ->
                         step_legal_expert_output = None
                 if step_legal_expert_output:
                     step_output_with_legal = f"{step_main_content}\n\n---\n\n## Legal Expert Consultation\n\n{str(step_legal_expert_output)}"
+
+        step_elapsed = time.perf_counter() - step_t0
+        chain_timings.append({"step_name": next_p.name, "elapsed_s": round(step_elapsed, 2)})
+        logger.info("Follow-on «%s» completed in %.2fs", next_p.name, step_elapsed)
 
         accumulated = accumulated + _sep + step_output_with_legal
         chain.append((next_p.name, accumulated))
