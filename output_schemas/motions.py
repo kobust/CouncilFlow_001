@@ -1,0 +1,467 @@
+"""
+Mayor's Communication / motions schema bundle: JSON shape + transformers to Markdown.
+
+Expects JSON: { mayors_communication_date, computed_docket_date, accounts_master_list, motions[] }.
+Transformers: Table (motions as Markdown table), Minutes (annotated committee minutes).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from output_schemas import register_schema
+
+# Committee order for minutes (strict, from prompt)
+COMMITTEE_ORDER = [
+    "Committee on Personnel, Veterans and Human Services",
+    "Committee on Transportation and Traffic",
+    "Committee on Zoning and Land Use",
+    "Committee on IT and Infrastructure",
+    "Committee on Public Safety and Emergency Management",
+    "Committee on Public Works",
+    "Committee on City Property and Claims",
+    "Committee on Licenses",
+    "Committee on Ordinances, Elections and Legislative Matters",
+    "Committee on Finance",
+]
+
+VOTE_REQUIREMENT_TO_DISPLAY = {
+    "RC-MAJ": "ROLL CALL - MAJORITY",
+    "RC-2/3rds": "ROLL CALL - 2/3 MAJORITY",
+    "RC-3/4ths": "ROLL CALL - 3/4 MAJORITY",
+    "VV": "VOICE VOTE - MAJORITY",
+    "NR": "NOT REQUIRED",
+    "UNKNOWN": "UNKNOWN",
+}
+
+
+def _normalize_line_endings(s: str) -> str:
+    """Normalize \\r\\n and \\r to \\n so line breaks are consistent."""
+    if not isinstance(s, str):
+        return str(s) if s is not None else ""
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _to_md_line_breaks(s: str) -> str:
+    """Convert newlines to Markdown line breaks (two trailing spaces + newline). Renders as visible line breaks."""
+    if not isinstance(s, str):
+        return str(s) if s is not None else ""
+    norm = _normalize_line_endings(s)
+    # Two trailing spaces before newline = Markdown soft line break
+    return norm.replace("\n", "  \n")
+
+
+def _escape_dollars(s: str) -> str:
+    """Escape dollar signs to prevent LaTeX math interpretation in Markdown."""
+    if not isinstance(s, str):
+        return str(s) if s is not None else ""
+    return s.replace("$", "\\$")
+
+
+def _escape_table_cell(s: str, max_len: int | None = 80) -> str:
+    """Escape pipes and dollar signs for Markdown table; convert newlines to <br>. max_len=None = no truncation."""
+    if not isinstance(s, str):
+        return str(s) if s is not None else ""
+    # Use <br> to preserve line breaks in table cells (Markdown tables are single-line per row)
+    out = s.replace("|", "\\|").replace("\n", "<br>").replace("$", "\\$")
+    if max_len is not None and len(out) > max_len:
+        return out[: max_len - 3] + "..."
+    return out
+
+
+def _format_long_date(date_str: str | None) -> str:
+    """Convert YYYY-MM-DD to long format (e.g. January 20, 2026)."""
+    if not date_str:
+        return ""
+    try:
+        dt = datetime.strptime(date_str.strip()[:10], "%Y-%m-%d")
+        return dt.strftime("%B %d, %Y")
+    except (ValueError, TypeError):
+        return date_str
+
+MAYORS_COMMUNICATION_SCHEMA = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cityofattleboro.us/schemas/mayors-communication-canonical.schema.json",
+  "title": "Mayor’s Communication Canonical Record",
+  "type": "object",
+  "additionalProperties": False,
+  "required": [
+    "mayors_communication_date",
+    "computed_docket_date",
+    "accounts_master_list",
+    "motions"
+  ],
+  "properties": {
+    "mayors_communication_date": {
+      "type": "string",
+      "format": "date",
+      "description": "Date printed on the Mayor’s Communication."
+    },
+    "computed_docket_date": {
+      "type": "string",
+      "format": "date",
+      "description": "Next full regular Municipal Council meeting after the Mayor’s Communication date."
+    },
+    "accounts_master_list": {
+      "type": "array",
+      "description": "All accounts mentioned in the Mayor’s Communication. Unique entries only.",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": True
+    },
+    "motions": {
+      "type": "array",
+      "description": "One object per numbered item in the Mayor’s Communication.",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/motion_item" }
+    }
+  },
+  "$defs": {
+    "committee_name": {
+      "type": "string",
+      "enum": [
+        "Committee on Personnel, Veterans and Human Services",
+        "Committee on Transportation and Traffic",
+        "Committee on Zoning and Land Use",
+        "Committee on IT and Infrastructure",
+        "Committee on Public Safety and Emergency Management",
+        "Committee on Public Works",
+        "Committee on City Property and Claims",
+        "Committee on Licenses",
+        "Committee on Ordinances, Elections and Legislative Matters",
+        "Committee on Finance",
+        "FYI"
+      ],
+      "description": "Must be exactly one of the standing committee names (or FYI)."
+    },
+
+    "vote_requirement_code": {
+      "type": "string",
+      "enum": ["RC-MAJ", "RC-2/3rds", "RC-3/4ths", "VV", "NR", "UNKNOWN"],
+      "description": "Voting requirement code from the Voting Index (or UNKNOWN if uncategorizable)."
+    },
+
+    "public_hearing_value": {
+      "type": "string",
+      "enum": ["Yes", "No", "Yes - Joint", "UNKNOWN"]
+    },
+
+    "advertising_value": {
+      "type": "string",
+      "pattern": "^(NR|[0-9]{1,3}d|\\?\\?\\?)$"
+    },
+
+    "citation": {
+      "type": "object",
+      "description": "Legal or reference citation associated with this motion item.",
+      "additionalProperties": True
+    },
+
+    "motion_item": {
+      "type": "object",
+      "additionalProperties": False,
+      "required": [
+        "mc_item_number",
+        "item_id",
+        "raw_item_text_verbatim",
+        "description_clean",
+        "committee_assignment",
+        "vote_category_lookup",
+        "vote_requirement",
+        "public_hearing",
+        "advertising_requirement",
+        "draft_motion_text_verbatim"
+      ],
+      "properties": {
+        "mc_item_number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Mayor’s Communication numbered item."
+        },
+
+        "item_id": {
+          "type": "string",
+          "pattern": "^[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}–MC–[0-9]{3}$",
+          "description": "YY.MM.DD–MC–### (docket date derived at top-level)."
+        },
+
+        "raw_item_text_verbatim": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Verbatim text for the entire item (may include OCR line breaks)."
+        },
+
+        "description_clean": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Short normalized summary of the requested action (prose only)."
+        },
+
+        "committee_assignment": { "$ref": "#/$defs/committee_name" },
+
+        "vote_category_lookup": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact 'Description' value from the Advertising and Voting Requirements Index (or UNKNOWN)."
+        },
+
+        "vote_requirement": { "$ref": "#/$defs/vote_requirement_code" },
+
+        "vote_type_display": {
+          "type": ["string", "null"],
+          "description": "Optional: pre-rendered vote type string (e.g., 'ROLL CALL - MAJORITY'). If provided, must match translation rules."
+        },
+
+        "public_hearing": { "$ref": "#/$defs/public_hearing_value" },
+
+        "advertising_requirement": { "$ref": "#/$defs/advertising_value" },
+
+        "draft_motion_text_verbatim": {
+          "type": ["string", "null"],
+          "description": "Verbatim text after 'I hereby request your honorable body to' (do not include the leading phrase)."
+        },
+
+        "citations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/citation" }
+        },
+
+        "analysis_block": {
+          "type": "object",
+          "additionalProperties": False,
+          "description": "Optional. Populated by analysis injection step.",
+          "required": ["analysis_context", "potential_questions", "include_in_minutes"],
+          "properties": {
+            "analysis_context": { "type": ["string", "null"] },
+            "potential_questions": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "include_in_minutes": {
+              "type": "boolean",
+              "default": True,
+              "description": "Set false for routine transfers (omit analysis block in minutes)."
+            }
+          }
+        },
+
+        "rendering_hints": {
+          "type": "object",
+          "additionalProperties": False,
+          "description": "Optional renderer hints (must never change literals).",
+          "properties": {
+            "exclude_from_minutes": {
+              "type": "boolean",
+              "default": False,
+              "description": "Set true for FYI items (Step 3 excludes FYI)."
+            }
+          }
+        }
+      }
+    },
+
+    "error_item": {
+      "type": "object",
+      "additionalProperties": False,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "ACCOUNT_EXTRACTION_AMBIGUOUS",
+            "ACCOUNT_MISMATCH",
+            "VOTE_METADATA_MISSING",
+            "SCHEMA_VALIDATION_FAILED"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "item_id": { "type": ["string", "null"] },
+        "page": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    }
+  }
+}
+
+
+def to_motions_table_md(data: Any) -> str:
+    """
+    Transform motions JSON to a Markdown table.
+    Includes: item_id, description_clean, committee_assignment, vote_type_display, 
+    vote_category_lookup, vote_requirement, public_hearing, advertising_requirement, 
+    draft_motion_text_verbatim.
+    Line breaks within cells are converted to <br> tags.
+    """
+    if not isinstance(data, dict):
+        return f"Unexpected shape: expected object, got {type(data).__name__}"
+
+    motions = data.get("motions")
+    if not isinstance(motions, list):
+        return "Missing or invalid field: motions (expected array)"
+
+    if not motions:
+        header = "## Motions\n\n"
+        if data.get("mayors_communication_date") or data.get("computed_docket_date"):
+            header += f"*Mayor's Communication: {data.get('mayors_communication_date', '—')} · Docket: {data.get('computed_docket_date', '—')}*\n\n"
+        return header + "No motions."
+
+    parts: list[str] = []
+
+    # Add header metadata
+    mc_date = data.get("mayors_communication_date", "")
+    docket_date = data.get("computed_docket_date", "")
+    if mc_date or docket_date:
+        parts.append(f"*Mayor's Communication: {mc_date} · Docket: {docket_date}*\n")
+
+    # Table header
+    parts.append("| Item ID | Description | Committee | Vote Type | Vote Category | Vote Req | Public Hearing | Advertising | Motion Text |")
+    parts.append("|---------|-------------|-----------|-----------|---------------|----------|----------------|-------------|-------------|")
+
+    # Table rows
+    for m in motions:
+        if not isinstance(m, dict):
+            continue
+        
+        # Extract and escape fields (no truncation)
+        item_id = _escape_table_cell(m.get("item_id", ""), max_len=None)
+        desc = _escape_table_cell(m.get("description_clean", ""), max_len=None)
+        committee = _escape_table_cell(m.get("committee_assignment", ""), max_len=None)
+        
+        # vote_type_display - if provided, use it; otherwise derive from vote_requirement
+        vote_type_display = m.get("vote_type_display")
+        if vote_type_display:
+            vote_type = _escape_table_cell(str(vote_type_display), max_len=None)
+        else:
+            vote_code = m.get("vote_requirement", "UNKNOWN")
+            vote_type = _escape_table_cell(VOTE_REQUIREMENT_TO_DISPLAY.get(vote_code, vote_code), max_len=None)
+        
+        vote_category = _escape_table_cell(m.get("vote_category_lookup", ""), max_len=None)
+        vote_req = _escape_table_cell(m.get("vote_requirement", ""), max_len=None)
+        ph = _escape_table_cell(m.get("public_hearing", ""), max_len=None)
+        advert = _escape_table_cell(m.get("advertising_requirement", ""), max_len=None)
+        
+        motion_text = m.get("draft_motion_text_verbatim") or ""
+        motion_str = _escape_table_cell(str(motion_text), max_len=None)
+
+        # Build table row
+        row = f"| {item_id} | {desc} | {committee} | {vote_type} | {vote_category} | {vote_req} | {ph} | {advert} | {motion_str} |"
+        parts.append(row)
+
+    return "\n".join(parts)
+
+
+def to_minutes_md(data: Any) -> str:
+    """
+    Transform canonical JSON to Annotated Committee Minutes markdown.
+    Excludes FYI items and motions with exclude_from_minutes or include_in_minutes=false.
+    Groups by committee in strict order, sorts by item_id within committee.
+    """
+    if not isinstance(data, dict):
+        return f"Unexpected shape: expected object, got {type(data).__name__}"
+
+    motions = data.get("motions")
+    if not isinstance(motions, list):
+        return "Missing or invalid field: motions (expected array)"
+
+    accounts_master = set()
+    for a in data.get("accounts_master_list") or []:
+        if isinstance(a, str) and a.strip():
+            accounts_master.add(a.strip())
+
+    docket_date_raw = data.get("computed_docket_date", "")
+    docket_date_long = _format_long_date(docket_date_raw)
+
+    def _include_motion(m: Any) -> bool:
+        if not isinstance(m, dict):
+            return False
+        if m.get("committee_assignment") == "FYI":
+            return False
+        rh = m.get("rendering_hints")
+        if isinstance(rh, dict) and rh.get("exclude_from_minutes"):
+            return False
+        ab = m.get("analysis_block")
+        if isinstance(ab, dict) and ab.get("include_in_minutes") is False:
+            return False
+        return True
+
+    included = [m for m in motions if _include_motion(m)]
+
+    def _committee_sort_key(m: dict) -> tuple[int, str]:
+        comm = m.get("committee_assignment", "")
+        try:
+            idx = COMMITTEE_ORDER.index(comm)
+        except ValueError:
+            idx = 999
+        return (idx, m.get("item_id", ""))
+
+    included.sort(key=_committee_sort_key)
+
+    parts: list[str] = ["# Annotated Committee Minutes", ""]
+    last_committee = ""
+
+    for m in included:
+        comm = m.get("committee_assignment", "")
+        if comm and comm != last_committee:
+            parts.append(f"## {comm}")
+            parts.append("")
+            last_committee = comm
+        item_id = m.get("item_id", "")
+        draft_text = m.get("draft_motion_text_verbatim")
+        vote_code = m.get("vote_requirement", "UNKNOWN")
+        vote_display = VOTE_REQUIREMENT_TO_DISPLAY.get(vote_code, "UNKNOWN")
+
+        parts.append(f"### [{item_id}] FROM THE DOCKET OF: {docket_date_long}")
+        parts.append("")
+
+        if draft_text is None or (isinstance(draft_text, str) and not draft_text.strip()):
+            motion_line = f"I entertain a motion to TAKE UP ITEM [{item_id}] AS WRITTEN."
+        else:
+            dt_norm = _normalize_line_endings(draft_text.strip())
+            dt_md = _to_md_line_breaks(dt_norm)  # preserve line breaks
+            motion_line = f"I entertain a motion to {_escape_dollars(dt_md)}"
+
+        parts.append(motion_line)
+        parts.append("")
+
+        ab = m.get("analysis_block")
+        if isinstance(ab, dict) and ab.get("include_in_minutes", True):
+            ctx = ab.get("analysis_context")
+            if ctx is not None and str(ctx).strip():
+                # Preserve all lines including blank lines; normalize line endings
+                ctx_norm = _normalize_line_endings(str(ctx))
+                lines = [_escape_dollars(ln.rstrip()) for ln in ctx_norm.split("\n")]
+                if lines:
+                    parts.append(f"> **Analysis/context:** {lines[0]}")
+                    for ln in lines[1:]:
+                        parts.append(f"> {ln}")
+            questions = ab.get("potential_questions") if isinstance(ab, dict) else []
+            if isinstance(questions, list) and questions:
+                parts.append("")
+                parts.append("> **Potential Questions:**")
+                for q in questions:
+                    if isinstance(q, str) and q.strip():
+                        # Preserve line breaks within each question; normalize line endings
+                        q_norm = _normalize_line_endings(q)
+                        q_lines = q_norm.split("\n")
+                        parts.append(f"> - {_escape_dollars(q_lines[0].strip())}")
+                        for cont in q_lines[1:]:
+                            parts.append(f">   {_escape_dollars(cont.strip())}")
+            if ctx or (isinstance(questions, list) and questions):
+                parts.append("")
+
+        parts.append(vote_display + "\n")
+        parts.append("Seconded _____________________ Motion [ ] Passed or [ ] Rejected\n")
+        parts.append("YEAS_____ NAYS_____ ABSENT_____ ABSTAIN_____\n")
+        parts.append("\n")
+
+    return "\n".join(parts).strip() or "# Annotated Committee Minutes"
+
+
+def load() -> None:
+    register_schema(
+        "mayors_communication",
+        MAYORS_COMMUNICATION_SCHEMA,
+        [
+            ("Table", to_motions_table_md),
+            ("Minutes", to_minutes_md),
+        ],
+    )

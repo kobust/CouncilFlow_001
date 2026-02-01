@@ -1581,6 +1581,7 @@ def run_agent(
     context_xml: str | None = None,
     input_schema_json: str | None = None,
     output_schema_json: str | None = None,
+    fallback_expected: bool = False,
 ) -> str | dict[str, Any]:
     """
     Render prompt_template with transient_data (jinja2), call Gemini with
@@ -1591,6 +1592,7 @@ def run_agent(
     
     If cache_name is None, will include context_xml directly in the prompt (fallback mode).
     This is slower and more expensive but works when caching fails.
+    Set fallback_expected=True when the caller intentionally does not use a cache (e.g. QA step).
     
     Retries on transient server errors with exponential backoff.
     """
@@ -1665,7 +1667,10 @@ def run_agent(
         # Fallback: include context directly (works but slower/expensive)
         if not context_xml:
             raise ValueError("context_xml is required when cache_name is None (fallback mode)")
-        logger.warning("Running without cache - including full context in prompt (slower and more expensive)")
+        if fallback_expected:
+            logger.debug("Running without cache (expected for this step, e.g. QA)")
+        else:
+            logger.warning("Running without cache - including full context in prompt (slower and more expensive)")
         # Combine context and prompt
         full_prompt = f"{context_xml}\n\n---\n\n{prompt}"
 

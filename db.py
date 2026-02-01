@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -63,17 +63,17 @@ class PromptTemplate(SQLModel, table=True):
     verifier_id: Optional[int] = None
     follow_on_only: bool = Field(default=False, nullable=False)  # follow-on only
     legal_expert_prompt_id: Optional[int] = None  # prompt to use for legal questions
-    # Optional reusable JSON Schemas (sidecars) for this prompt:
-    # - input_schema_id: schema describing the expected transient input shape
-    # - output_schema_id: schema describing the model's output shape
-    input_schema_id: Optional[int] = Field(default=None, nullable=True)
-    output_schema_id: Optional[int] = Field(default=None, nullable=True)
+    # Code-defined JSON schemas (from output_schemas registry). No DB schema table.
+    input_schema_key: Optional[str] = Field(default=None, nullable=True)
+    output_schema_key: Optional[str] = Field(default=None, nullable=True)
     # Auto-incremented on each save; used when recording which prompt version produced a run.
     current_version: Optional[int] = Field(default=1, nullable=True)
     # Phase 4: when True, run QA agent after follow-on chain to review and polish final output.
     use_qa_agent: bool = Field(default=False, nullable=False)
     # Phase 5: which workflow (graph) runs when this prompt is selected at start. N/A for follow_on_only.
     workflow_id: Optional[int] = Field(default=None, nullable=True)
+    # JSON transformers: when output_schema_key is set, optional default transformer (e.g. "mayors_communication::Table").
+    output_transformer_key: Optional[str] = Field(default=None, nullable=True)
 
 
 class PromptVersion(SQLModel, table=True):
@@ -92,10 +92,11 @@ class PromptVersion(SQLModel, table=True):
     verifier_id: Optional[int] = None
     follow_on_only: bool = Field(default=False, nullable=False)
     legal_expert_prompt_id: Optional[int] = None
-    input_schema_id: Optional[int] = None
-    output_schema_id: Optional[int] = None
+    input_schema_key: Optional[str] = None
+    output_schema_key: Optional[str] = None
     use_qa_agent: bool = Field(default=False, nullable=False)
     workflow_id: Optional[int] = None
+    output_transformer_key: Optional[str] = None
     saved_at: Optional[datetime] = None  # when this version was saved
 
 
@@ -115,6 +116,10 @@ class JsonSchema(SQLModel, table=True):
     description: Optional[str] = None
     # Raw JSON Schema document (Draft-07+). Stored as TEXT in SQLite.
     schema_json: str
+    # Optional: reference to code-defined schema bundle (output_schemas registry key).
+    schema_key: Optional[str] = Field(default=None, nullable=True)
+    # Optional: JSON array of transformer composite keys (e.g. ["constituent_reply::Summary", "constituent_reply::Full"]).
+    transformer_keys: Optional[str] = Field(default=None, nullable=True)
 
 
 class AppConfig(SQLModel, table=True):
@@ -257,6 +262,86 @@ def _migrate_use_qa_agent() -> None:
         logger.warning(f"Migration use_qa_agent: {e}")
 
 
+def _migrate_output_transformer_key() -> None:
+    """Add output_transformer_key to prompttemplate and promptversion if missing (JSON transformers)."""
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows_pt = conn.execute(text("PRAGMA table_info(prompttemplate)")).fetchall()
+        columns_pt = [r[1].lower() for r in rows_pt] if rows_pt else []
+        if "output_transformer_key" not in columns_pt:
+            logger.info("Adding output_transformer_key column to prompttemplate")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN output_transformer_key VARCHAR(128)"))
+                conn.commit()
+        try:
+            with engine.connect() as conn:
+                rows_pv = conn.execute(text("PRAGMA table_info(promptversion)")).fetchall()
+        except Exception:
+            rows_pv = []
+        columns_pv = [r[1].lower() for r in rows_pv] if rows_pv else []
+        if rows_pv and "output_transformer_key" not in columns_pv:
+            logger.info("Adding output_transformer_key column to promptversion")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE promptversion ADD COLUMN output_transformer_key VARCHAR(128)"))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration output_transformer_key: {e}")
+
+
+def _migrate_schema_keys() -> None:
+    """Add input_schema_key and output_schema_key to prompttemplate and promptversion (code-defined schemas only)."""
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows_pt = conn.execute(text("PRAGMA table_info(prompttemplate)")).fetchall()
+        columns_pt = [r[1].lower() for r in rows_pt] if rows_pt else []
+        with engine.connect() as conn:
+            if "output_schema_key" not in columns_pt:
+                logger.info("Adding output_schema_key column to prompttemplate")
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN output_schema_key VARCHAR(64)"))
+            if "input_schema_key" not in columns_pt:
+                logger.info("Adding input_schema_key column to prompttemplate")
+                conn.execute(text("ALTER TABLE prompttemplate ADD COLUMN input_schema_key VARCHAR(64)"))
+            conn.commit()
+        try:
+            with engine.connect() as conn:
+                rows_pv = conn.execute(text("PRAGMA table_info(promptversion)")).fetchall()
+        except Exception:
+            rows_pv = []
+        columns_pv = [r[1].lower() for r in rows_pv] if rows_pv else []
+        if rows_pv:
+            with engine.connect() as conn:
+                if "output_schema_key" not in columns_pv:
+                    logger.info("Adding output_schema_key column to promptversion")
+                    conn.execute(text("ALTER TABLE promptversion ADD COLUMN output_schema_key VARCHAR(64)"))
+                if "input_schema_key" not in columns_pv:
+                    logger.info("Adding input_schema_key column to promptversion")
+                    conn.execute(text("ALTER TABLE promptversion ADD COLUMN input_schema_key VARCHAR(64)"))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration schema_keys: {e}")
+
+
+def _migrate_jsonschema_transformers() -> None:
+    """Add schema_key and transformer_keys to jsonschema if missing (JSON transformers)."""
+    try:
+        engine = _get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(jsonschema)")).fetchall()
+        columns = [r[1].lower() for r in rows] if rows else []
+        with engine.connect() as conn:
+            if "schema_key" not in columns:
+                logger.info("Adding schema_key column to jsonschema")
+                conn.execute(text("ALTER TABLE jsonschema ADD COLUMN schema_key VARCHAR(64)"))
+            if "transformer_keys" not in columns:
+                logger.info("Adding transformer_keys column to jsonschema")
+                conn.execute(text("ALTER TABLE jsonschema ADD COLUMN transformer_keys TEXT"))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration jsonschema transformers: {e}")
+
+
 def _seed_workflows() -> None:
     """Seed Workflow table with default workflow(s) if empty (Phase 5)."""
     try:
@@ -309,6 +394,9 @@ def init_db() -> None:
         _migrate_current_version()
         _migrate_use_qa_agent()
         _migrate_workflow_id()
+        _migrate_output_transformer_key()
+        _migrate_schema_keys()
+        _migrate_jsonschema_transformers()
         _init_app_config()
         _seed_workflows()
         with Session(engine) as s:
@@ -441,26 +529,28 @@ def save_prompt(
     follow_on_only: bool = False,
     legal_expert_prompt_id: Optional[int] = None,
     *,
-    input_schema_id: Optional[int] = None,
-    output_schema_id: Optional[int] = None,
+    input_schema_key: Optional[str] = None,
+    output_schema_key: Optional[str] = None,
     use_qa_agent: bool = False,
     workflow_id: Optional[int] = None,
+    output_transformer_key: Optional[str] = None,
     id: Optional[int] = None,
 ) -> PromptTemplate:
     """Insert or update a prompt template. If id is given, update; else insert.
     On each save, a snapshot is written to PromptVersion and current_version is set/incremented.
+    Schemas are code-defined only (from output_schemas registry); no DB schema table.
     """
     follow_on_only = bool(follow_on_only)
     logger.info(
         "Saving prompt: %s (id: %s, mode: %s, follow_on_only: %s, legal_expert: %s, "
-        "input_schema_id: %s, output_schema_id: %s)",
+        "input_schema_key: %s, output_schema_key: %s)",
         name,
         id,
         output_mode,
         follow_on_only,
         legal_expert_prompt_id,
-        input_schema_id,
-        output_schema_id,
+        input_schema_key,
+        output_schema_key,
     )
     try:
         engine = _get_engine()
@@ -477,11 +567,12 @@ def save_prompt(
                         verifier_id=verifier_id,
                         follow_on_only=follow_on_only,
                         legal_expert_prompt_id=legal_expert_prompt_id,
-                        input_schema_id=input_schema_id,
-                        output_schema_id=output_schema_id,
+                        input_schema_key=input_schema_key,
+                        output_schema_key=output_schema_key,
                         current_version=1,
                         use_qa_agent=use_qa_agent,
                         workflow_id=workflow_id if not follow_on_only else None,
+                        output_transformer_key=output_transformer_key,
                     )
                     s.add(p)
                     s.flush()  # get p.id
@@ -495,11 +586,12 @@ def save_prompt(
                             verifier_id=p.verifier_id,
                             follow_on_only=p.follow_on_only,
                             legal_expert_prompt_id=p.legal_expert_prompt_id,
-                            input_schema_id=p.input_schema_id,
-                            output_schema_id=p.output_schema_id,
+                            input_schema_key=p.input_schema_key,
+                            output_schema_key=p.output_schema_key,
                             use_qa_agent=p.use_qa_agent,
                             workflow_id=p.workflow_id,
-                            saved_at=datetime.utcnow(),
+                            output_transformer_key=output_transformer_key,
+                            saved_at=datetime.now(timezone.utc),
                         )
                     )
                 else:
@@ -516,11 +608,12 @@ def save_prompt(
                             verifier_id=existing.verifier_id,
                             follow_on_only=existing.follow_on_only,
                             legal_expert_prompt_id=existing.legal_expert_prompt_id,
-                            input_schema_id=existing.input_schema_id,
-                            output_schema_id=existing.output_schema_id,
+                            input_schema_key=existing.input_schema_key,
+                            output_schema_key=existing.output_schema_key,
                             use_qa_agent=getattr(existing, "use_qa_agent", False),
                             workflow_id=getattr(existing, "workflow_id", None),
-                            saved_at=datetime.utcnow(),
+                            output_transformer_key=getattr(existing, "output_transformer_key", None),
+                            saved_at=datetime.now(timezone.utc),
                         )
                     )
                     new_ver = cur_ver + 1
@@ -530,10 +623,11 @@ def save_prompt(
                     existing.verifier_id = verifier_id
                     existing.follow_on_only = follow_on_only
                     existing.legal_expert_prompt_id = legal_expert_prompt_id
-                    existing.input_schema_id = input_schema_id
-                    existing.output_schema_id = output_schema_id
+                    existing.input_schema_key = input_schema_key
+                    existing.output_schema_key = output_schema_key
                     existing.use_qa_agent = use_qa_agent
                     existing.workflow_id = workflow_id if not follow_on_only else None
+                    existing.output_transformer_key = output_transformer_key
                     existing.current_version = new_ver
                     p = existing
             else:
@@ -544,12 +638,13 @@ def save_prompt(
                     output_mode=output_mode,
                     verifier_id=verifier_id,
                     follow_on_only=follow_on_only,
-                    legal_expert_prompt_id=legal_expert_prompt_id,
-                    input_schema_id=input_schema_id,
-                    output_schema_id=output_schema_id,
-                    current_version=1,
+                        legal_expert_prompt_id=legal_expert_prompt_id,
+                        input_schema_key=input_schema_key,
+                        output_schema_key=output_schema_key,
+                        current_version=1,
                     use_qa_agent=use_qa_agent,
                     workflow_id=workflow_id if not follow_on_only else None,
+                    output_transformer_key=output_transformer_key,
                 )
                 s.add(p)
                 s.flush()
@@ -563,11 +658,12 @@ def save_prompt(
                         verifier_id=p.verifier_id,
                         follow_on_only=p.follow_on_only,
                         legal_expert_prompt_id=p.legal_expert_prompt_id,
-                        input_schema_id=p.input_schema_id,
-                        output_schema_id=p.output_schema_id,
+                        input_schema_key=p.input_schema_key,
+                        output_schema_key=p.output_schema_key,
                         use_qa_agent=p.use_qa_agent,
                         workflow_id=p.workflow_id,
-                        saved_at=datetime.utcnow(),
+                        output_transformer_key=output_transformer_key,
+                        saved_at=datetime.now(timezone.utc),
                     )
                 )
             s.commit()
@@ -648,10 +744,13 @@ def save_schema(
     description: Optional[str] = None,
     *,
     id: Optional[int] = None,
+    schema_key: Optional[str] = None,
+    transformer_keys: Optional[str] = None,
 ) -> JsonSchema:
     """
     Insert or update a JSON Schema. If id is given, update; else insert.
     The schema_json string should already be valid JSON (we do not enforce it here).
+    schema_key: optional code-defined bundle key. transformer_keys: optional JSON array of composite keys.
     """
     logger.info("Saving JSON Schema: %s (id: %s)", name, id)
     try:
@@ -665,18 +764,24 @@ def save_schema(
                         name=name,
                         description=description,
                         schema_json=schema_json,
+                        schema_key=schema_key,
+                        transformer_keys=transformer_keys,
                     )
                     s.add(schema)
                 else:
                     existing.name = name
                     existing.description = description
                     existing.schema_json = schema_json
+                    existing.schema_key = schema_key
+                    existing.transformer_keys = transformer_keys
                     schema = existing
             else:
                 schema = JsonSchema(
                     name=name,
                     description=description,
                     schema_json=schema_json,
+                    schema_key=schema_key,
+                    transformer_keys=transformer_keys,
                 )
                 s.add(schema)
             s.commit()

@@ -8,8 +8,10 @@ No Streamlit dependency; app passes optional callbacks for progress. Steps raise
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
+import re
 import time
 from typing import Any, Callable
 
@@ -35,6 +37,50 @@ from rag_loader import (
 logger = logging.getLogger(__name__)
 
 MIN_CONTEXT_SIZE = 16000  # Same as app: too small for Gemini cache
+
+# Collapse 3+ consecutive newlines to 2 (paragraph break); avoids model output with repeated \n.
+_NL_COLLAPSE = re.compile(r"\n{3,}")
+
+
+def _collapse_repeated_newlines(obj: Any) -> Any:
+    """Recursively collapse 3+ consecutive newlines to \\n\\n in string values (in-place for dict/list)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            obj[k] = _collapse_repeated_newlines(v)
+        return obj
+    if isinstance(obj, list):
+        for i, v in enumerate(obj):
+            obj[i] = _collapse_repeated_newlines(v)
+        return obj
+    if isinstance(obj, str):
+        return _NL_COLLAPSE.sub("\n\n", obj)
+    return obj
+
+
+def _get_input_schema_json(prompt: Any) -> str | None:
+    """Resolve input schema JSON from prompt's input_schema_key (code registry only)."""
+    sk = getattr(prompt, "input_schema_key", None)
+    if sk:
+        try:
+            import output_schemas
+            output_schemas.ensure_registry_loaded()
+            return output_schemas.get_schema_json(sk)
+        except Exception:
+            return None
+    return None
+
+
+def _get_output_schema_json(prompt: Any) -> str | None:
+    """Resolve output schema JSON from prompt's output_schema_key (code registry only)."""
+    sk = getattr(prompt, "output_schema_key", None)
+    if sk:
+        try:
+            import output_schemas
+            output_schemas.ensure_registry_loaded()
+            return output_schemas.get_schema_json(sk)
+        except Exception:
+            return None
+    return None
 
 # Env-based delays (same as app)
 PIPELINE_STEP_DELAY_SECONDS = int(os.environ.get("PIPELINE_STEP_DELAY_SECONDS", "10") or "10")
@@ -344,18 +390,25 @@ def run_main_agent_step(state: dict, callbacks: Callbacks | None = None) -> None
                 "input_schema_json": input_schema_json or "",
                 "output_schema_json": output_schema_json or "",
             }
+            expect_json = bool(output_schema_json)
             result = run_agent(
                 full_template,
                 main_transient_data,
                 cache_name,
-                expect_json=False,
+                expect_json=expect_json,
                 input_schema_json=input_schema_json,
                 output_schema_json=output_schema_json,
             )
             state["gemini_call_count"] = state.get("gemini_call_count", 0) + 1
             timings["model_run_s"] = time.perf_counter() - _t0
             _cb(state, "write", f"✓ Main agent done in {timings['model_run_s']:.2f}s")
-            state["main_output"] = str(result)
+            if expect_json and isinstance(result, dict):
+                _collapse_repeated_newlines(result)
+                state["main_output"] = json.dumps(result, indent=2)
+                state["main_output_dict"] = result
+            else:
+                state["main_output"] = str(result)
+                state["main_output_dict"] = None
             return
         except CacheExpiredError as cache_expired:
             if retry_attempt < max_retries:
@@ -456,14 +509,8 @@ def run_legal_expert_step(state: dict, callbacks: Callbacks | None = None) -> No
         try:
             le_input_schema_json = None
             le_output_schema_json = None
-            if getattr(legal_expert_p, "input_schema_id", None):
-                _le = db.get_schema_by_id(legal_expert_p.input_schema_id)
-                if _le and getattr(_le, "schema_json", None):
-                    le_input_schema_json = _le.schema_json
-            if getattr(legal_expert_p, "output_schema_id", None):
-                _le = db.get_schema_by_id(legal_expert_p.output_schema_id)
-                if _le and getattr(_le, "schema_json", None):
-                    le_output_schema_json = _le.schema_json
+            le_input_schema_json = _get_input_schema_json(legal_expert_p)
+            le_output_schema_json = _get_output_schema_json(legal_expert_p)
             le_transient_data = {
                 "legal_questions": legal_query_text,
                 "original_output": main_content,
@@ -508,9 +555,19 @@ def integrate_legal_step(state: dict, callbacks: Callbacks | None = None) -> Non
 def run_follow_on_chain_step(state: dict, callbacks: Callbacks | None = None) -> None:
     state["_callbacks"] = callbacks or {}
     _cb(state, "write", "Running follow-on verification chain…")
-    _rs = state["rag_state"]
-    selected = state["selected_prompt"]
-    build_prompt_variables = state["build_prompt_variables"]
+    selected = state.get("selected_prompt")
+    if selected is None:
+        _cb(state, "write", "⚠️ No prompt selected; skipping follow-on chain.")
+        logger.warning("run_follow_on_chain_step: selected_prompt is None, skipping")
+        return
+    _rs = state.get("rag_state")
+    if _rs is None:
+        _cb(state, "write", "⚠️ RAG state not loaded; skipping follow-on chain.")
+        logger.warning("run_follow_on_chain_step: rag_state is None, skipping")
+        return
+    build_prompt_variables = state.get("build_prompt_variables")
+    if not callable(build_prompt_variables):
+        build_prompt_variables = lambda u, n: "\n\n**Context Variables**\n\n- **Analysis Performed By**: " + (n or u or "unknown")
     _sep = "\n\n---\n\n"
     accumulated = state["final_output"]
     chain: list[tuple[str, str]] = [(state["task_name"], accumulated)]
@@ -588,16 +645,8 @@ def run_follow_on_chain_step(state: dict, callbacks: Callbacks | None = None) ->
         if GEMINI_PACE_DELAY_SECONDS > 0:
             time.sleep(GEMINI_PACE_DELAY_SECONDS)
 
-        step_input_schema_json = None
-        step_output_schema_json = None
-        if getattr(next_p, "input_schema_id", None):
-            _s = db.get_schema_by_id(next_p.input_schema_id)
-            if _s and getattr(_s, "schema_json", None):
-                step_input_schema_json = _s.schema_json
-        if getattr(next_p, "output_schema_id", None):
-            _s = db.get_schema_by_id(next_p.output_schema_id)
-            if _s and getattr(_s, "schema_json", None):
-                step_output_schema_json = _s.schema_json
+        step_input_schema_json = _get_input_schema_json(next_p)
+        step_output_schema_json = _get_output_schema_json(next_p)
 
         retry = 0
         while True:
@@ -657,15 +706,8 @@ def run_follow_on_chain_step(state: dict, callbacks: Callbacks | None = None) ->
                         + "\n\n---\n\nLegal questions to answer:\n{{ legal_questions }}\n\n---\n\nOriginal analysis context:\n{{ original_output }}"
                     )
                     try:
-                        sle_input = sle_output = None
-                        if getattr(step_legal_expert_p, "input_schema_id", None):
-                            _s = db.get_schema_by_id(step_legal_expert_p.input_schema_id)
-                            if _s and getattr(_s, "schema_json", None):
-                                sle_input = _s.schema_json
-                        if getattr(step_legal_expert_p, "output_schema_id", None):
-                            _s = db.get_schema_by_id(step_legal_expert_p.output_schema_id)
-                            if _s and getattr(_s, "schema_json", None):
-                                sle_output = _s.schema_json
+                        sle_input = _get_input_schema_json(step_legal_expert_p)
+                        sle_output = _get_output_schema_json(step_legal_expert_p)
                         sle_data = {
                             "legal_questions": step_legal_query_text,
                             "original_output": step_main_content,
@@ -766,6 +808,7 @@ def run_qa_step(state: dict, callbacks: Callbacks | None = None) -> None:
             cache_name=None,
             expect_json=False,
             context_xml=" ",
+            fallback_expected=True,
         )
         state["gemini_call_count"] = state.get("gemini_call_count", 0) + 1
         state["final_output"] = str(qa_result).strip() if qa_result else draft

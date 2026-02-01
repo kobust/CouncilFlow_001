@@ -17,6 +17,7 @@ import os
 from typing import Any, Literal, TypedDict
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.config import get_config
 from langgraph.graph import END, START, StateGraph
 
 try:
@@ -71,6 +72,11 @@ _NON_SERIALIZABLE_KEYS = ("_callbacks", "selected_prompt", "rag_state", "build_p
 
 def _configurable(config: Any) -> dict[str, Any]:
     """Extract configurable dict from LangGraph config (dict or RunnableConfig)."""
+    if config is None:
+        try:
+            config = get_config()
+        except Exception:
+            return {}
     if config is None:
         return {}
     if isinstance(config, dict):
@@ -130,7 +136,7 @@ def _status_write(d: dict, msg: str) -> None:
             pass
 
 
-def _node_plan_retrieval(state: GraphState, config: RunnableConfig | None = None) -> GraphState:
+def _node_plan_retrieval(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "plan_retrieval", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -143,7 +149,7 @@ def _node_plan_retrieval(state: GraphState, config: RunnableConfig | None = None
     return {"data": d}
 
 
-def _node_retrieve_context(state: GraphState, config: RunnableConfig | None = None) -> GraphState:
+def _node_retrieve_context(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "retrieve_context", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -155,7 +161,7 @@ def _node_retrieve_context(state: GraphState, config: RunnableConfig | None = No
     return {"data": d}
 
 
-def _node_create_cache(state: GraphState, config: Any = None) -> GraphState:
+def _node_create_cache(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "create_cache", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -167,7 +173,7 @@ def _node_create_cache(state: GraphState, config: Any = None) -> GraphState:
     return {"data": d}
 
 
-def _node_main_agent(state: GraphState, config: RunnableConfig | None = None) -> GraphState:
+def _node_main_agent(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "main_agent", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -179,7 +185,7 @@ def _node_main_agent(state: GraphState, config: RunnableConfig | None = None) ->
     return {"data": d}
 
 
-def _node_extract_legal_questions(state: GraphState, config: Any = None) -> GraphState:
+def _node_extract_legal_questions(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "extract_legal_questions", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -191,7 +197,7 @@ def _node_extract_legal_questions(state: GraphState, config: Any = None) -> Grap
     return {"data": d}
 
 
-def _node_legal_agent(state: GraphState, config: RunnableConfig | None = None) -> GraphState:
+def _node_legal_agent(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "legal_agent", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -205,7 +211,7 @@ def _node_legal_agent(state: GraphState, config: RunnableConfig | None = None) -
     return {"data": d}
 
 
-def _node_integrate_legal(state: GraphState, config: Any = None) -> GraphState:
+def _node_integrate_legal(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "integrate_legal", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -216,7 +222,7 @@ def _node_integrate_legal(state: GraphState, config: Any = None) -> GraphState:
     return {"data": d}
 
 
-def _node_follow_on_chain(state: GraphState, config: RunnableConfig | None = None) -> GraphState:
+def _node_follow_on_chain(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "follow_on_chain", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -228,7 +234,7 @@ def _node_follow_on_chain(state: GraphState, config: RunnableConfig | None = Non
     return {"data": d}
 
 
-def _node_qa_agent(state: GraphState, config: Any = None) -> GraphState:
+def _node_qa_agent(state: GraphState, config: RunnableConfig) -> GraphState:
     _log_run_event(config, "qa_agent", "node_started")
     d = _data(state)
     callbacks = _prepare_step_state(d, config)
@@ -240,7 +246,7 @@ def _node_qa_agent(state: GraphState, config: Any = None) -> GraphState:
     return {"data": d}
 
 
-def _node_finalize(state: GraphState, config: RunnableConfig | None = None) -> GraphState:
+def _node_finalize(state: GraphState, config: RunnableConfig) -> GraphState:
     """Set last_run_context_stats and status=completed (same as workflow.run_workflow)."""
     _log_run_event(config, "finalize", "node_started")
     d = _data(state)

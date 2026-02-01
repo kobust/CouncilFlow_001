@@ -706,6 +706,50 @@ def _format_run_datetime(
         return dt.strftime("%Y-%m-%d %H:%M") + " (UTC)"
 
 
+def _get_json_view_options(schema_key: str | None = None) -> list[tuple[str, str]]:
+    """Return [(value, label), ...] for JSON output view selector: Saved, Raw JSON, then transformer views."""
+    options: list[tuple[str, str]] = [("saved", "Saved"), ("raw", "Raw JSON")]
+    if not schema_key:
+        return options
+    try:
+        import output_schemas
+        output_schemas.ensure_registry_loaded()
+        for display_name, _ in output_schemas.get_transformers(schema_key):
+            composite = f"{schema_key}::{display_name}"
+            options.append((composite, f"{schema_key} :: {display_name}"))
+    except Exception as e:
+        logger.debug("Could not get transformer options (schema_key=%s): %s", schema_key, e)
+    return options
+
+
+def _render_json_view(
+    output_json_str: str | None,
+    output_text_saved: str,
+    view_choice: str,
+) -> str:
+    """Return the string to display for the chosen view (Saved, Raw JSON, or transformer result)."""
+    if view_choice == "saved":
+        return output_text_saved or "(no output)"
+    if view_choice == "raw":
+        if not output_json_str:
+            return "(raw JSON not stored for this run)"
+        try:
+            parsed = json.loads(output_json_str)
+            return json.dumps(parsed, indent=2)
+        except Exception:
+            return output_json_str
+    # Transformer key
+    if not output_json_str:
+        return "(raw JSON not stored; cannot re-run transformer)"
+    try:
+        import output_schemas
+        output_schemas.ensure_registry_loaded()
+        data = json.loads(output_json_str)
+        return output_schemas.run_transformer(view_choice, data)
+    except Exception as e:
+        return f"Transformer failed: {e}"
+
+
 def _build_prompt_variables(username: str = "", user_name: str = "") -> str:
     """
     Build a variables section to inject into all prompts.
@@ -1085,12 +1129,19 @@ if is_admin:
     if run_history_clicked:
         st.session_state["current_page"] = "run_history"
         st.rerun()
+    transformer_playground_clicked = st.sidebar.button("🔧 Transformer playground", key="nav_playground", use_container_width=True)
+    if transformer_playground_clicked:
+        st.session_state["current_page"] = "transformer_playground"
+        st.rerun()
 
 current_page = st.session_state.get("current_page", "runner")
 if current_page == "edit_prompts" and not is_admin:
     st.session_state["current_page"] = "runner"
     st.rerun()
 if current_page == "run_history" and not is_admin:
+    st.session_state["current_page"] = "runner"
+    st.rerun()
+if current_page == "transformer_playground" and not is_admin:
     st.session_state["current_page"] = "runner"
     st.rerun()
 
@@ -1413,81 +1464,9 @@ if current_page == "edit_prompts":
                             pass
     
     st.markdown("---")
-    # Load prompts and any reusable JSON Schemas for sidecars
+    # Load prompts. JSON schemas are code-defined only (output_schemas registry); no DB schema table.
     crud_prompts = sorted(db.get_all_prompts(), key=lambda p: p.name.casefold())
-    try:
-        crud_schemas = sorted(db.get_all_schemas(), key=lambda s: s.name.casefold())
-    except Exception as e:
-        logger.error(f"Error loading JSON Schemas: {e}", exc_info=True)
-        crud_schemas = []
 
-    # Lightweight JSON Schema manager so schemas can be created/edited and then
-    # attached to one or more prompts.
-    with st.expander("🧩 JSON Schema library (sidecars)", expanded=False):
-        schema_options = ["+ Add new"] + [s.name for s in crud_schemas]
-        schema_select = st.selectbox("Select JSON Schema", schema_options, key="schema_select")
-        existing_schema = next((s for s in crud_schemas if s.name == schema_select), None)
-
-        schema_selected_id = existing_schema.id if existing_schema else None
-        if st.session_state.get("schema_last_selected") != schema_selected_id:
-            st.session_state["schema_last_selected"] = schema_selected_id
-            if existing_schema:
-                st.session_state["schema_name"] = existing_schema.name
-                st.session_state["schema_description"] = existing_schema.description or ""
-                st.session_state["schema_json"] = existing_schema.schema_json
-            else:
-                st.session_state["schema_name"] = ""
-                st.session_state["schema_description"] = ""
-                st.session_state["schema_json"] = "{\n  \"$schema\": \"https://json-schema.org/draft-07/schema#\",\n  \"type\": \"object\",\n  \"properties\": {},\n  \"required\": []\n}"
-
-        with st.form("schema_form", clear_on_submit=False):
-            schema_name = st.text_input("Schema name", value=st.session_state.get("schema_name", ""))
-            schema_description = st.text_input(
-                "Description (optional)",
-                value=st.session_state.get("schema_description", ""),
-                placeholder="Short description of how this schema is used",
-            )
-            schema_json_text = st.text_area(
-                "JSON Schema (raw JSON)",
-                value=st.session_state.get("schema_json", ""),
-                height=200,
-            )
-            schema_saved = st.form_submit_button("Save JSON Schema")
-            if schema_saved and schema_name and schema_json_text:
-                try:
-                    # Best-effort validation that the text is valid JSON
-                    import json as _json  # local import to avoid polluting top-level
-                    _ = _json.loads(schema_json_text)
-                    saved = db.save_schema(
-                        schema_name,
-                        schema_json_text,
-                        description=schema_description or None,
-                        id=existing_schema.id if existing_schema else None,
-                    )
-                    st.success(f"Saved JSON Schema «{saved.name}»")
-                    st.session_state["schema_select"] = saved.name
-                    st.rerun()
-                except Exception as e:
-                    logger.error(f"Error saving JSON Schema: {e}", exc_info=True)
-                    st.error(f"Error saving JSON Schema: {e}")
-
-        if existing_schema:
-            col_del1, col_del2 = st.columns([3, 1])
-            with col_del2:
-                confirm_schema_delete = st.checkbox(
-                    "Confirm delete", key="confirm_delete_schema", help="This will detach the schema from prompts but not modify them."
-                )
-                if st.button("Delete JSON Schema", key="delete_schema_btn", disabled=not confirm_schema_delete):
-                    try:
-                        db.delete_schema(existing_schema.id)
-                        st.success(f"Deleted JSON Schema «{existing_schema.name}»")
-                        if "schema_last_selected" in st.session_state:
-                            del st.session_state["schema_last_selected"]
-                        st.session_state["schema_select"] = "+ Add new"
-                        st.rerun()
-                    except Exception as e:
-                        logger.error(f"Error deleting JSON Schema: {e}", exc_info=True)
-                        st.error(f"Error deleting JSON Schema: {e}")
     crud_options = ["+ Add new"] + [p.name for p in crud_prompts]
     crud_select = st.selectbox("Select prompt", crud_options, key="crud_select")
     existing = next((p for p in crud_prompts if p.name == crud_select), None)
@@ -1524,10 +1503,11 @@ if current_page == "edit_prompts":
                             st.session_state["crud_verifier_id"] = pv.verifier_id
                             st.session_state["crud_follow_on_only"] = getattr(pv, "follow_on_only", False)
                             st.session_state["crud_legal_expert_prompt_id"] = getattr(pv, "legal_expert_prompt_id", None)
-                            st.session_state["crud_input_schema_id"] = getattr(pv, "input_schema_id", None)
-                            st.session_state["crud_output_schema_id"] = getattr(pv, "output_schema_id", None)
+                            st.session_state["crud_input_schema_key"] = getattr(pv, "input_schema_key", None)
+                            st.session_state["crud_output_schema_key"] = getattr(pv, "output_schema_key", None)
                             st.session_state["crud_use_qa_agent"] = getattr(pv, "use_qa_agent", False)
                             st.session_state["crud_workflow_id"] = getattr(pv, "workflow_id", None)
+                            st.session_state["crud_output_transformer_key"] = getattr(pv, "output_transformer_key", None)
                             st.session_state["crud_restored_version"] = pv.version
                             # Sync widget keys so selectboxes show restored selection
                             _fk = f"followon_select_{existing.id}"
@@ -1554,16 +1534,8 @@ if current_page == "edit_prompts":
                                 st.session_state[_lk] = "— None —"
                             _ik = f"input_schema_select_{existing.id}"
                             _ok = f"output_schema_select_{existing.id}"
-                            if pv.input_schema_id and crud_schemas:
-                                _is = next((s for s in crud_schemas if s.id == pv.input_schema_id), None)
-                                st.session_state[_ik] = f"{_is.id}: {_is.name}" if _is else "— None —"
-                            else:
-                                st.session_state[_ik] = "— None —"
-                            if pv.output_schema_id and crud_schemas:
-                                _os = next((s for s in crud_schemas if s.id == pv.output_schema_id), None)
-                                st.session_state[_ok] = f"{_os.id}: {_os.name}" if _os else "— None —"
-                            else:
-                                st.session_state[_ok] = "— None —"
+                            st.session_state[_ik] = f"code::{pv.input_schema_key}" if getattr(pv, "input_schema_key", None) else "— None —"
+                            st.session_state[_ok] = f"code::{pv.output_schema_key}" if getattr(pv, "output_schema_key", None) else "— None —"
                             st.rerun()
     
     # Sync form values only when selection changes (avoid clobbering submitted values)
@@ -1576,20 +1548,22 @@ if current_page == "edit_prompts":
             st.session_state["crud_verifier_id"] = existing.verifier_id
             st.session_state["crud_follow_on_only"] = getattr(existing, "follow_on_only", False)
             st.session_state["crud_legal_expert_prompt_id"] = getattr(existing, "legal_expert_prompt_id", None)
-            st.session_state["crud_input_schema_id"] = getattr(existing, "input_schema_id", None)
-            st.session_state["crud_output_schema_id"] = getattr(existing, "output_schema_id", None)
+            st.session_state["crud_input_schema_key"] = getattr(existing, "input_schema_key", None)
+            st.session_state["crud_output_schema_key"] = getattr(existing, "output_schema_key", None)
             st.session_state["crud_use_qa_agent"] = getattr(existing, "use_qa_agent", False)
             st.session_state["crud_workflow_id"] = getattr(existing, "workflow_id", None)
+            st.session_state["crud_output_transformer_key"] = getattr(existing, "output_transformer_key", None)
         else:
             st.session_state["crud_name"] = ""
             st.session_state["crud_template"] = ""
             st.session_state["crud_verifier_id"] = None
             st.session_state["crud_follow_on_only"] = False
             st.session_state["crud_legal_expert_prompt_id"] = None
-            st.session_state["crud_input_schema_id"] = None
-            st.session_state["crud_output_schema_id"] = None
+            st.session_state["crud_input_schema_key"] = None
+            st.session_state["crud_output_schema_key"] = None
             st.session_state["crud_use_qa_agent"] = False
             st.session_state["crud_workflow_id"] = None
+            st.session_state["crud_output_transformer_key"] = None
 
     with st.form("prompt_form", clear_on_submit=False):
         name_value = st.session_state.get("crud_name", "")
@@ -1597,8 +1571,6 @@ if current_page == "edit_prompts":
         verifier_id_value = st.session_state.get("crud_verifier_id", None)
         follow_on_only_value = st.session_state.get("crud_follow_on_only", False)
         legal_expert_prompt_id_value = st.session_state.get("crud_legal_expert_prompt_id", None)
-        input_schema_id_value = st.session_state.get("crud_input_schema_id", None)
-        output_schema_id_value = st.session_state.get("crud_output_schema_id", None)
         use_qa_agent_value = st.session_state.get("crud_use_qa_agent", False)
         workflow_id_value = st.session_state.get("crud_workflow_id", None)
         
@@ -1741,70 +1713,74 @@ if current_page == "edit_prompts":
             "`{{ input_schema_json }}` and `{{ output_schema_json }}`."
         )
 
-        schema_options = ["— None —"] + [f"{s.id}: {s.name}" for s in crud_schemas]
+        # Code-defined schemas only (from output_schemas registry); no DB schema table
+        code_schema_options = ["— None —"]
+        try:
+            import output_schemas as _osc
+            _osc.ensure_registry_loaded()
+            for _rk in _osc.get_registry_schema_keys():
+                code_schema_options.append(f"code::{_rk}")
+        except Exception:
+            pass
 
-        # Input schema selector
-        current_input_schema_str = None
-        if input_schema_id_value:
-            _is = next((s for s in crud_schemas if s.id == input_schema_id_value), None)
-            if _is:
-                current_input_schema_str = f"{_is.id}: {_is.name}"
-        input_schema_key = f"input_schema_select_{selected_id}"
-        if input_schema_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
-            st.session_state[input_schema_key] = current_input_schema_str or "— None —"
+        # Input schema selector (code-defined only)
+        input_schema_key_value = st.session_state.get("crud_input_schema_key") or None
+        current_input_schema_str = f"code::{input_schema_key_value}" if input_schema_key_value else "— None —"
+        in_schema_widget_key = f"input_schema_select_{selected_id}"
+        if in_schema_widget_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
+            st.session_state[in_schema_widget_key] = current_input_schema_str
         input_schema_index = 0
-        current_input_selection = st.session_state.get(input_schema_key, current_input_schema_str or "— None —")
-        if current_input_selection and current_input_selection in schema_options:
-            input_schema_index = schema_options.index(current_input_selection)
+        if current_input_schema_str in code_schema_options:
+            input_schema_index = code_schema_options.index(current_input_schema_str)
         selected_input_schema_str = st.selectbox(
-            "Input JSON schema", schema_options, index=input_schema_index, key=input_schema_key
+            "Input JSON schema", code_schema_options, index=input_schema_index, key=in_schema_widget_key,
+            help="Code-defined schemas from output_schemas registry (e.g. mayors_communication).",
         )
-        input_schema_id = None
-        if selected_input_schema_str and selected_input_schema_str != "— None —":
-            try:
-                input_schema_id = int(selected_input_schema_str.split(":")[0])
-                logger.debug(f"Selected input schema ID: {input_schema_id}")
-            except (ValueError, IndexError):
-                logger.warning(f"Could not parse input schema ID from: {selected_input_schema_str}")
-                input_schema_id = None
+        input_schema_key = (selected_input_schema_str[6:] if selected_input_schema_str.startswith("code::") else None) if selected_input_schema_str and selected_input_schema_str != "— None —" else None
 
-        # Output schema selector
-        current_output_schema_str = None
-        if output_schema_id_value:
-            _os = next((s for s in crud_schemas if s.id == output_schema_id_value), None)
-            if _os:
-                current_output_schema_str = f"{_os.id}: {_os.name}"
-        output_schema_key = f"output_schema_select_{selected_id}"
-        if output_schema_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
-            st.session_state[output_schema_key] = current_output_schema_str or "— None —"
+        # Output schema selector (code-defined only)
+        output_schema_key_value = st.session_state.get("crud_output_schema_key") or None
+        current_output_schema_str = f"code::{output_schema_key_value}" if output_schema_key_value else "— None —"
+        out_schema_widget_key = f"output_schema_select_{selected_id}"
+        if out_schema_widget_key not in st.session_state or st.session_state.get("crud_last_selected") != selected_id:
+            st.session_state[out_schema_widget_key] = current_output_schema_str
         output_schema_index = 0
-        current_output_selection = st.session_state.get(output_schema_key, current_output_schema_str or "— None —")
-        if current_output_selection and current_output_selection in schema_options:
-            output_schema_index = schema_options.index(current_output_selection)
+        if current_output_schema_str in code_schema_options:
+            output_schema_index = code_schema_options.index(current_output_schema_str)
         selected_output_schema_str = st.selectbox(
-            "Output JSON schema", schema_options, index=output_schema_index, key=output_schema_key
+            "Output JSON schema", code_schema_options, index=output_schema_index, key=out_schema_widget_key,
+            help="Code-defined schemas from output_schemas registry (e.g. mayors_communication).",
         )
-        output_schema_id = None
-        if selected_output_schema_str and selected_output_schema_str != "— None —":
-            try:
-                output_schema_id = int(selected_output_schema_str.split(":")[0])
-                logger.debug(f"Selected output schema ID: {output_schema_id}")
-            except (ValueError, IndexError):
-                logger.warning(f"Could not parse output schema ID from: {selected_output_schema_str}")
-                output_schema_id = None
+        output_schema_key = (selected_output_schema_str[6:] if selected_output_schema_str.startswith("code::") else None) if selected_output_schema_str and selected_output_schema_str != "— None —" else None
+
+        # Default transformer (when output schema is selected): run-time transformer for JSON -> Markdown
+        output_transformer_key = None
+        if output_schema_key:
+            transformer_opts = _get_json_view_options(schema_key=output_schema_key)
+            # Only transformer keys, not Saved/Raw
+            transformer_choices = [(val, lbl) for val, lbl in transformer_opts if val not in ("saved", "raw")]
+            if transformer_choices:
+                ot_key = f"output_transformer_select_{selected_id}"
+                current_ot = st.session_state.get("crud_output_transformer_key")
+                labels = ["— None —"] + [lbl for _, lbl in transformer_choices]
+                keys = [None] + [val for val, _ in transformer_choices]
+                idx = next((i for i, k in enumerate(keys) if k == current_ot), 0)
+                st.caption("Optional: default transformer to apply at run time (JSON → Markdown).")
+                sel_label = st.selectbox("Default transformer for this prompt", options=labels, index=idx, key=ot_key)
+                output_transformer_key = keys[labels.index(sel_label)] if sel_label in labels else None
         
         submitted = st.form_submit_button("Save")
         if submitted and name and template_text:
             logger.info(
                 "Saving prompt: %s (id: %s, verifier_id: %s, follow_on_only: %s, "
-                "legal_expert: %s, input_schema_id: %s, output_schema_id: %s)",
+                "legal_expert: %s, input_schema_key: %s, output_schema_key: %s)",
                 name,
                 existing.id if existing else "new",
                 verifier_id,
                 follow_on_only,
                 legal_expert_prompt_id,
-                input_schema_id,
-                output_schema_id,
+                input_schema_key,
+                output_schema_key,
             )
             try:
                 db.save_prompt(
@@ -1814,10 +1790,11 @@ if current_page == "edit_prompts":
                     verifier_id=verifier_id,
                     follow_on_only=follow_on_only,
                     legal_expert_prompt_id=legal_expert_prompt_id,
-                    input_schema_id=input_schema_id,
-                    output_schema_id=output_schema_id,
+                    input_schema_key=input_schema_key,
+                    output_schema_key=output_schema_key,
                     use_qa_agent=use_qa_agent,
                     workflow_id=workflow_id if not follow_on_only else None,
+                    output_transformer_key=output_transformer_key,
                     id=existing.id if existing else None,
                 )
                 logger.info("Prompt saved successfully")
@@ -1898,7 +1875,27 @@ elif current_page == "run_history":
                         _markdown_with_copy(qa_out, f"run_{run_detail.id}_post_qa")
             else:
                 st.markdown("#### Output")
-                _markdown_with_copy(run_detail.output_text or "(no output)", f"run_{run_detail.id}_output")
+                out_json = getattr(run_detail, "output_json", None)
+                if out_json and run_detail.prompt_template_id:
+                    try:
+                        prompt = db.get_prompt_by_id(run_detail.prompt_template_id)
+                        schema_key = getattr(prompt, "output_schema_key", None) if prompt else None
+                    except Exception:
+                        schema_key = None
+                    if schema_key:
+                        view_opts = _get_json_view_options(schema_key=schema_key)
+                        view_labels = [lbl for _, lbl in view_opts]
+                        view_keys = [val for val, _ in view_opts]
+                        sh_key = f"run_detail_view_{run_detail.id}"
+                        idx = view_keys.index(st.session_state.get(sh_key, "saved")) if st.session_state.get(sh_key, "saved") in view_keys else 0
+                        view_choice = st.selectbox("View as", options=view_labels, index=idx, key=sh_key + "_select")
+                        st.session_state[sh_key] = view_keys[view_labels.index(view_choice)]
+                        display_str = _render_json_view(out_json, run_detail.output_text or "", st.session_state[sh_key])
+                        _markdown_with_copy(display_str, f"run_{run_detail.id}_output")
+                    else:
+                        _markdown_with_copy(run_detail.output_text or "(no output)", f"run_{run_detail.id}_output")
+                else:
+                    _markdown_with_copy(run_detail.output_text or "(no output)", f"run_{run_detail.id}_output")
             if run_detail.chain_steps:
                 try:
                     steps = json.loads(run_detail.chain_steps) if isinstance(run_detail.chain_steps, str) else run_detail.chain_steps
@@ -2041,6 +2038,150 @@ elif current_page == "run_history":
                     st.divider()
 
 # -----------------------------------------------------------------------------
+# Transformer playground page (admin only)
+# -----------------------------------------------------------------------------
+
+elif current_page == "transformer_playground":
+    st.markdown("### 🔧 Transformer playground")
+    if st.button("← Back to Run Analysis", key="back_from_playground"):
+        st.session_state["current_page"] = "runner"
+        st.rerun()
+    st.caption(
+        "Debug transformers without re-running a prompt: pick a past run (with stored raw JSON) or paste JSON, "
+        "choose a transformer, and see the Markdown. Edit transformer code and refresh to re-apply."
+    )
+
+    import output_schemas
+    output_schemas.ensure_registry_loaded()
+    all_transformers = output_schemas.get_all_transformer_keys()
+    if not all_transformers:
+        st.info("No transformers registered. Add schema bundles in `output_schemas/` and register them.")
+    else:
+        if "playground_source" not in st.session_state:
+            st.session_state["playground_source"] = "run"
+        if "playground_run_id" not in st.session_state:
+            st.session_state["playground_run_id"] = None
+        if "playground_transformer_key" not in st.session_state:
+            st.session_state["playground_transformer_key"] = all_transformers[0][0] if all_transformers else ""
+
+        source = st.radio(
+            "JSON source",
+            options=["run", "paste"],
+            format_func=lambda x: "From a past run" if x == "run" else "Paste JSON",
+            key="playground_source_radio",
+            horizontal=True,
+        )
+        st.session_state["playground_source"] = source
+
+        json_str: str | None = None
+        json_source_label = ""
+
+        if source == "run":
+            runs_list = runs_db.list_analysis_runs(50)
+            runs_with_json = []
+            for r in runs_list:
+                out_json = getattr(r, "output_json", None)
+                if out_json:
+                    runs_with_json.append(r)
+                else:
+                    try:
+                        if (r.output_text or "").strip():
+                            json.loads(r.output_text)
+                            runs_with_json.append(r)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            if not runs_with_json:
+                st.info("No past runs with stored JSON. Run an analysis that uses an output JSON schema, or use **Paste JSON** below.")
+            else:
+                run_options = []
+                for r in runs_with_json:
+                    stored_tz = getattr(r, "stored_timezone", None) or "UTC"
+                    started_str = _format_run_datetime(r.started_at, stored_tz)
+                    run_options.append((r.id, f"Run #{r.id} — {r.task_name} — {started_str}"))
+                default_idx = 0
+                if st.session_state.get("playground_run_id") is not None:
+                    ids = [ro[0] for ro in run_options]
+                    if st.session_state["playground_run_id"] in ids:
+                        default_idx = ids.index(st.session_state["playground_run_id"])
+                chosen = st.selectbox(
+                    "Select run",
+                    options=[ro[0] for ro in run_options],
+                    format_func=lambda rid: next((ro[1] for ro in run_options if ro[0] == rid), f"Run #{rid}"),
+                    index=default_idx,
+                    key="playground_run_select",
+                )
+                st.session_state["playground_run_id"] = chosen
+                run_detail = runs_db.get_analysis_run_by_id(chosen)
+                if run_detail:
+                    out_json = getattr(run_detail, "output_json", None)
+                    if out_json:
+                        json_str = out_json
+                        json_source_label = f"Run #{chosen} (output_json)"
+                    else:
+                        try:
+                            json_str = run_detail.output_text or ""
+                            if json_str.strip():
+                                json.loads(json_str)
+                                json_source_label = f"Run #{chosen} (output_text as JSON)"
+                            else:
+                                json_str = None
+                        except (json.JSONDecodeError, TypeError):
+                            st.warning(f"Run #{chosen} has no stored raw JSON and output_text is not valid JSON. Use a run that had an output schema.")
+        else:
+            pasted = st.text_area(
+                "Paste raw JSON",
+                value=st.session_state.get("playground_pasted_json", ""),
+                height=200,
+                key="playground_paste_ta",
+                placeholder='{"summary": "...", "points": [], ...}',
+            )
+            st.session_state["playground_pasted_json"] = pasted
+            if pasted.strip():
+                try:
+                    json.loads(pasted)
+                    json_str = pasted.strip()
+                    json_source_label = "Pasted JSON"
+                except json.JSONDecodeError as e:
+                    st.error(f"Invalid JSON: {e}")
+
+        transformer_options = [(composite, label) for composite, label in all_transformers]
+        transformer_labels = [label for _, label in transformer_options]
+        current_key = st.session_state.get("playground_transformer_key", "")
+        t_idx = 0
+        if current_key:
+            for i, (comp, _) in enumerate(transformer_options):
+                if comp == current_key:
+                    t_idx = i
+                    break
+        chosen_transformer = st.selectbox(
+            "Transformer",
+            options=transformer_labels,
+            index=t_idx,
+            key="playground_transformer_select",
+        )
+        st.session_state["playground_transformer_key"] = next(c for c, l in transformer_options if l == chosen_transformer)
+
+        st.markdown("---")
+        st.markdown("#### Output (Markdown)")
+
+        if json_str and st.session_state["playground_transformer_key"]:
+            try:
+                data = json.loads(json_str)
+                composite_key = st.session_state["playground_transformer_key"]
+                md = output_schemas.run_transformer(composite_key, data)
+                _markdown_with_copy(md, "playground_output_md")
+                st.caption(f"Source: {json_source_label} · Transformer: {chosen_transformer}")
+            except json.JSONDecodeError as e:
+                st.error(f"JSON parse error: {e}")
+            except Exception as e:
+                st.error(f"Transformer error: {e}")
+        else:
+            if not json_str:
+                st.caption("Select a run or paste JSON above.")
+            else:
+                st.caption("Select a transformer above.")
+
+# -----------------------------------------------------------------------------
 # Run Analysis page
 # -----------------------------------------------------------------------------
 
@@ -2068,6 +2209,8 @@ if current_page == "runner":
         st.session_state["last_chain_error"] = None
         st.session_state["last_rag_retrieval_report"] = None
         st.session_state["last_run_context_stats"] = None
+        st.session_state["last_result_output_json"] = None
+        st.session_state["last_result_json_view"] = None
         st.session_state["analysis_session_id"] = st.session_state.get("analysis_session_id", 0) + 1
         logger.info("New Analysis: reset runner state")
         st.rerun()
@@ -2086,14 +2229,14 @@ if current_page == "runner":
         input_schema_json = None
         output_schema_json = None
         try:
-            if getattr(selected, "input_schema_id", None):
-                _schema = db.get_schema_by_id(selected.input_schema_id)
-                if _schema and getattr(_schema, "schema_json", None):
-                    input_schema_json = _schema.schema_json
-            if getattr(selected, "output_schema_id", None):
-                _schema = db.get_schema_by_id(selected.output_schema_id)
-                if _schema and getattr(_schema, "schema_json", None):
-                    output_schema_json = _schema.schema_json
+            import output_schemas as _os
+            _os.ensure_registry_loaded()
+            input_sk = getattr(selected, "input_schema_key", None)
+            if input_sk:
+                input_schema_json = _os.get_schema_json(input_sk)
+            output_sk = getattr(selected, "output_schema_key", None)
+            if output_sk:
+                output_schema_json = _os.get_schema_json(output_sk)
         except Exception as e:
             logger.error(f"Error loading JSON Schemas for prompt {selected.id}: {e}", exc_info=True)
             input_schema_json = None
@@ -2198,7 +2341,7 @@ if current_page == "runner":
                 can_proceed = False
 
             if can_proceed:
-                run_started_at = datetime.utcnow()
+                run_started_at = datetime.now(timezone.utc)
                 st.session_state["_run_started_at"] = run_started_at
                 _rs = st.session_state.get("rag_state")
                 if _rs is None and folder_id:
@@ -2282,8 +2425,8 @@ if current_page == "runner":
                             prompt_template_id=selected.id,
                             prompt_version=_prompt_version,
                             folder_id=folder_id,
-                            started_at=st.session_state.get("_run_started_at") or datetime.utcnow(),
-                            completed_at=datetime.utcnow(),
+                            started_at=st.session_state.get("_run_started_at") or datetime.now(timezone.utc),
+                            completed_at=datetime.now(timezone.utc),
                             input_summary=f"{len(user_content)} chars",
                             error_message=e.message,
                         )
@@ -2327,6 +2470,51 @@ if current_page == "runner":
                         for r in state["retrieval_report"]
                     ]
                     _retrieval_summary = "; ".join(parts) if parts else ""
+                # JSON output: save both raw JSON and (optionally) transformer-generated Markdown.
+                # Use last pipeline step's output when it's valid JSON with motions (e.g. analysis
+                # injection step adds analysis_block); else use main agent output.
+                _output_json = None
+                _output_text = state["final_output"]
+                if getattr(selected, "output_schema_key", None) and (state.get("main_output_dict") is not None or state.get("main_output")):
+                    _parsed = state.get("main_output_dict")
+                    _raw_json_str = state.get("main_output")
+                    if _parsed is not None:
+                        _raw_json_str = json.dumps(_parsed, indent=2) if _raw_json_str is None else _raw_json_str
+                    elif _raw_json_str:
+                        try:
+                            _parsed = json.loads(_raw_json_str)
+                        except json.JSONDecodeError:
+                            _parsed = None
+                    # Prefer last pipeline step's output when it has motions (analysis injection adds analysis_block)
+                    _steps = state.get("pipeline_step_results") or []
+                    if len(_steps) > 1:
+                        _last_out = _steps[-1].get("output") or _steps[-1].get("full_output") or ""
+                        if isinstance(_last_out, str) and _last_out.strip():
+                            try:
+                                _last_parsed = json.loads(_last_out.strip())
+                                if isinstance(_last_parsed, dict) and isinstance(_last_parsed.get("motions"), list):
+                                    _parsed = _last_parsed
+                                    workflow_module._collapse_repeated_newlines(_parsed)
+                                    _raw_json_str = json.dumps(_parsed, indent=2)
+                                    logger.debug("Using last pipeline step output for transformer (has motions)")
+                            except json.JSONDecodeError:
+                                pass
+                    _output_json = _raw_json_str
+                    _transformer_key = getattr(selected, "output_transformer_key", None)
+                    if _transformer_key and _parsed is not None:
+                        try:
+                            import output_schemas
+                            output_schemas.ensure_registry_loaded()
+                            _output_text = output_schemas.run_transformer(_transformer_key, _parsed)
+                        except Exception as te:
+                            logger.warning(f"Transformer {_transformer_key} failed: {te}; using pretty JSON for output_text")
+                            _output_text = _raw_json_str or state["final_output"]
+                    elif _raw_json_str:
+                        _output_text = _raw_json_str or state["final_output"]
+                    st.session_state["last_result"] = _output_text
+                    st.session_state["last_result_output_json"] = _output_json
+                else:
+                    st.session_state["last_result_output_json"] = None
                 try:
                     run_row = runs_db.insert_analysis_run(
                         username=_username,
@@ -2336,9 +2524,9 @@ if current_page == "runner":
                         prompt_version=_prompt_version,
                         folder_id=folder_id,
                         started_at=_started,
-                        completed_at=datetime.utcnow(),
+                        completed_at=datetime.now(timezone.utc),
                         input_summary=f"{len(user_content)} chars",
-                        output_text=state["final_output"],
+                        output_text=_output_text,
                         output_mode="markdown",
                         has_legal_review=bool(state.get("legal_questions")),
                         legal_questions=json.dumps(state["legal_questions"]) if state.get("legal_questions") else None,
@@ -2351,6 +2539,7 @@ if current_page == "runner":
                         model_used=get_effective_model(),
                         pre_qa_output=state.get("pre_qa_output"),
                         qa_output=state.get("qa_output"),
+                        output_json=_output_json,
                     )
                     if run_row and run_row.id:
                         runs_db.update_run_events_run_id(_thread_id, run_row.id)
@@ -2424,7 +2613,19 @@ if current_page == "runner":
             else:
                 # Fallback: if no step results stored, show final result
                 md = res if isinstance(res, str) else str(res)
-                _markdown_with_copy(md, "result")
+                # JSON view selector when run had JSON output
+                json_out = st.session_state.get("last_result_output_json")
+                if json_out and (getattr(selected, "output_schema_id", None) or getattr(selected, "output_schema_key", None)):
+                    view_opts = _get_json_view_options(schema_id=selected.output_schema_id, schema_key=getattr(selected, "output_schema_key", None))
+                    view_labels = [lbl for _, lbl in view_opts]
+                    view_keys = [val for val, _ in view_opts]
+                    idx = view_keys.index(st.session_state.get("last_result_json_view", "saved")) if st.session_state.get("last_result_json_view", "saved") in view_keys else 0
+                    view_choice = st.selectbox("View as", options=view_labels, index=idx, key="last_result_json_view_select")
+                    st.session_state["last_result_json_view"] = view_keys[view_labels.index(view_choice)]
+                    display_str = _render_json_view(json_out, md, st.session_state["last_result_json_view"])
+                    _markdown_with_copy(display_str, "result")
+                else:
+                    _markdown_with_copy(md, "result")
 
             ctx_stats = st.session_state.get("last_run_context_stats")
             if ctx_stats:

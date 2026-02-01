@@ -9,7 +9,8 @@ only; run data is never exported or imported.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time
+import os
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -25,8 +26,9 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 # Same directory as council.db; run data is isolated from config (db.py).
+# Use forward slashes so SqliteSaver/checkpointer can open the file on Windows.
 RUNS_DB_PATH = str(data_path("council_runs.db"))
-RUNS_SQLITE_URL = f"sqlite:///{RUNS_DB_PATH}"
+RUNS_SQLITE_URL = f"sqlite:///{RUNS_DB_PATH.replace(os.sep, '/')}"
 
 _runs_engine = None
 
@@ -76,6 +78,7 @@ class AnalysisRun(SQLModel, table=True):
     stored_timezone: Optional[str] = None  # IANA name for stored datetimes (e.g. 'UTC')
     pre_qa_output: Optional[str] = None  # Phase 4: output before QA agent (if QA ran)
     qa_output: Optional[str] = None  # Phase 4: output after QA agent (if QA ran)
+    output_json: Optional[str] = None  # JSON transformers: raw JSON when prompt had output schema
 
 
 class RunEvent(SQLModel, table=True):
@@ -151,6 +154,22 @@ def _migrate_pre_qa_qa_output() -> None:
         logger.warning(f"Migration pre_qa/qa_output: {e}")
 
 
+def _migrate_output_json() -> None:
+    """Add output_json column to analysisrun if missing (JSON transformers)."""
+    try:
+        engine = _get_runs_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(analysisrun)")).fetchall()
+        columns = [r[1].lower() for r in rows] if rows else []
+        if "output_json" not in columns:
+            logger.info("Adding output_json column to analysisrun")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE analysisrun ADD COLUMN output_json TEXT"))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration output_json: {e}")
+
+
 def init_runs_db() -> None:
     """Create AnalysisRun and RunEvent tables if they do not exist. Only these tables are in council_runs.db."""
     logger.info("Initializing runs database")
@@ -161,6 +180,7 @@ def init_runs_db() -> None:
         _migrate_prompt_version()
         _migrate_stored_timezone()
         _migrate_pre_qa_qa_output()
+        _migrate_output_json()
         logger.debug("Runs database initialized")
     except Exception as e:
         logger.error(f"Error initializing runs database: {e}", exc_info=True)
@@ -195,12 +215,13 @@ def insert_analysis_run(
     stored_timezone: Optional[str] = None,
     pre_qa_output: Optional[str] = None,
     qa_output: Optional[str] = None,
+    output_json: Optional[str] = None,
 ) -> AnalysisRun:
     """Insert one analysis run. Returns the created row with id set.
     Datetimes are stored in UTC; stored_timezone records that (default 'UTC').
     """
     if started_at is None:
-        started_at = datetime.utcnow()
+        started_at = datetime.now(timezone.utc)
     if stored_timezone is None:
         stored_timezone = "UTC"
     run = AnalysisRun(
@@ -225,6 +246,7 @@ def insert_analysis_run(
         stored_timezone=stored_timezone,
         pre_qa_output=pre_qa_output,
         qa_output=qa_output,
+        output_json=output_json,
     )
     try:
         engine = _get_runs_engine()
@@ -308,7 +330,7 @@ def insert_run_event(
         step_name=step_name,
         event_type=event_type,
         payload=payload,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     try:
         engine = _get_runs_engine()
