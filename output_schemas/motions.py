@@ -288,7 +288,8 @@ def to_motions_table_md(data: Any) -> str:
     Transform motions JSON to a Markdown table.
     Includes: item_id, description_clean, committee_assignment, vote_type_display, 
     vote_category_lookup, vote_requirement, public_hearing, advertising_requirement, 
-    draft_motion_text.
+    draft_motion_text, analysis (from analysis_block.analysis_context), 
+    questions (from analysis_block.potential_questions).
     """
     if not isinstance(data, dict):
         return f"Unexpected shape: expected object, got {type(data).__name__}"
@@ -312,8 +313,8 @@ def to_motions_table_md(data: Any) -> str:
         parts.append(f"*Mayor's Communication: {mc_date} · Docket: {docket_date}*\n")
 
     # Table header
-    parts.append("| Item ID | Description | Committee | Vote Type | Vote Category | Vote Req | Public Hearing | Advertising | Motion Text |")
-    parts.append("|---------|-------------|-----------|-----------|---------------|----------|----------------|-------------|-------------|")
+    parts.append("| Item ID | Description | Committee | Vote Type | Vote Category | Vote Req | Public Hearing | Advertising | Motion Text | Analysis | Questions |")
+    parts.append("|---------|-------------|-----------|-----------|---------------|----------|----------------|-------------|-------------|----------|------------|")
 
     # Table rows
     for m in motions:
@@ -341,8 +342,22 @@ def to_motions_table_md(data: Any) -> str:
         motion_text = m.get("draft_motion_text") or ""
         motion_str = _escape_table_cell(str(motion_text), max_len=None)
 
+        # Analysis and Questions from analysis_block
+        ab = m.get("analysis_block")
+        if isinstance(ab, dict):
+            analysis_raw = ab.get("analysis_context")
+            analysis_str = _escape_table_cell(str(analysis_raw) if analysis_raw is not None else "", max_len=None)
+            qs = ab.get("potential_questions")
+            if isinstance(qs, list) and qs:
+                questions_str = _escape_table_cell(" • ".join(str(q).strip() for q in qs if isinstance(q, str) and q.strip()), max_len=None)
+            else:
+                questions_str = ""
+        else:
+            analysis_str = ""
+            questions_str = ""
+
         # Build table row
-        row = f"| {item_id} | {desc} | {committee} | {vote_type} | {vote_category} | {vote_req} | {ph} | {advert} | {motion_str} |"
+        row = f"| {item_id} | {desc} | {committee} | {vote_type} | {vote_category} | {vote_req} | {ph} | {advert} | {motion_str} | {analysis_str} | {questions_str} |"
         parts.append(row)
 
     return "\n".join(parts)
