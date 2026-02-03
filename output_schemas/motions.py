@@ -83,7 +83,7 @@ def _format_long_date(date_str: str | None) -> str:
 MAYORS_COMMUNICATION_SCHEMA = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cityofattleboro.us/schemas/mayors-communication-canonical.schema.json",
-  "title": "Mayor’s Communication Canonical Record",
+  "title": "Mayor's Communication Canonical Record",
   "type": "object",
   "additionalProperties": False,
   "required": [
@@ -96,22 +96,22 @@ MAYORS_COMMUNICATION_SCHEMA = {
     "mayors_communication_date": {
       "type": "string",
       "format": "date",
-      "description": "Date printed on the Mayor’s Communication."
+      "description": "Date printed on the Mayor's Communication."
     },
     "computed_docket_date": {
       "type": "string",
       "format": "date",
-      "description": "Next full regular Municipal Council meeting after the Mayor’s Communication date."
+      "description": "Next full regular Municipal Council meeting after the Mayor's Communication date."
     },
     "accounts_master_list": {
       "type": "array",
-      "description": "All accounts mentioned in the Mayor’s Communication. Unique entries only.",
+      "description": "All accounts mentioned in the Mayor's Communication. Unique entries only.",
       "items": { "type": "string", "minLength": 1 },
       "uniqueItems": True
     },
     "motions": {
       "type": "array",
-      "description": "One object per numbered item in the Mayor’s Communication.",
+      "description": "One object per numbered item in the Mayor's Communication.",
       "minItems": 1,
       "items": { "$ref": "#/$defs/motion_item" }
     }
@@ -170,25 +170,25 @@ MAYORS_COMMUNICATION_SCHEMA = {
         "vote_requirement",
         "public_hearing",
         "advertising_requirement",
-        "draft_motion_text_verbatim"
+        "draft_motion_text"
       ],
       "properties": {
         "mc_item_number": {
           "type": "integer",
           "minimum": 1,
-          "description": "Mayor’s Communication numbered item."
+          "description": "Mayor's Communication numbered item."
         },
 
         "item_id": {
           "type": "string",
-          "pattern": "^[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}–MC–[0-9]{3}$",
-          "description": "YY.MM.DD–MC–### (docket date derived at top-level)."
+          "pattern": "^[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}-MC-[0-9]{3}$",
+          "description": "YY.MM.DD-MC-### (docket date derived at top-level)."
         },
 
         "raw_item_text_verbatim": {
           "type": "string",
           "minLength": 1,
-          "description": "Verbatim text for the entire item (may include OCR line breaks)."
+          "description": "verbatim block between number and REFERRED TO COMMITTEE"
         },
 
         "description_clean": {
@@ -216,9 +216,9 @@ MAYORS_COMMUNICATION_SCHEMA = {
 
         "advertising_requirement": { "$ref": "#/$defs/advertising_value" },
 
-        "draft_motion_text_verbatim": {
+        "draft_motion_text": {
           "type": ["string", "null"],
-          "description": "Verbatim text after 'I hereby request your honorable body to' (do not include the leading phrase)."
+          "description": "Text after 'I hereby request your honorable body to' (do not include the leading phrase)."
         },
 
         "citations": {
@@ -288,8 +288,7 @@ def to_motions_table_md(data: Any) -> str:
     Transform motions JSON to a Markdown table.
     Includes: item_id, description_clean, committee_assignment, vote_type_display, 
     vote_category_lookup, vote_requirement, public_hearing, advertising_requirement, 
-    draft_motion_text_verbatim.
-    Line breaks within cells are converted to <br> tags.
+    draft_motion_text.
     """
     if not isinstance(data, dict):
         return f"Unexpected shape: expected object, got {type(data).__name__}"
@@ -339,7 +338,7 @@ def to_motions_table_md(data: Any) -> str:
         ph = _escape_table_cell(m.get("public_hearing", ""), max_len=None)
         advert = _escape_table_cell(m.get("advertising_requirement", ""), max_len=None)
         
-        motion_text = m.get("draft_motion_text_verbatim") or ""
+        motion_text = m.get("draft_motion_text") or ""
         motion_str = _escape_table_cell(str(motion_text), max_len=None)
 
         # Build table row
@@ -405,7 +404,7 @@ def to_minutes_md(data: Any) -> str:
             parts.append("")
             last_committee = comm
         item_id = m.get("item_id", "")
-        draft_text = m.get("draft_motion_text_verbatim")
+        draft_text = m.get("draft_motion_text")
         vote_code = m.get("vote_requirement", "UNKNOWN")
         vote_display = VOTE_REQUIREMENT_TO_DISPLAY.get(vote_code, "UNKNOWN")
 
