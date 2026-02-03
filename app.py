@@ -2113,20 +2113,63 @@ elif current_page == "transformer_playground":
                 st.session_state["playground_run_id"] = chosen
                 run_detail = runs_db.get_analysis_run_by_id(chosen)
                 if run_detail:
-                    out_json = getattr(run_detail, "output_json", None)
-                    if out_json:
-                        json_str = out_json
-                        json_source_label = f"Run #{chosen} (output_json)"
-                    else:
+                    # Prefer per-step JSON when run has pipeline_step_results (chained prompts)
+                    chain_steps_raw = getattr(run_detail, "chain_steps", None)
+                    pipeline_steps = []
+                    if chain_steps_raw:
                         try:
-                            json_str = run_detail.output_text or ""
-                            if json_str.strip():
-                                json.loads(json_str)
-                                json_source_label = f"Run #{chosen} (output_text as JSON)"
-                            else:
-                                json_str = None
+                            pipeline_steps = json.loads(chain_steps_raw)
+                            if not isinstance(pipeline_steps, list):
+                                pipeline_steps = []
                         except (json.JSONDecodeError, TypeError):
-                            st.warning(f"Run #{chosen} has no stored raw JSON and output_text is not valid JSON. Use a run that had an output schema.")
+                            pipeline_steps = []
+                    # New format: list of {step_number, step_name, output, full_output, ...}
+                    step_choices = []
+                    if pipeline_steps and isinstance(pipeline_steps[0], dict) and ("step_number" in pipeline_steps[0] or "full_output" in pipeline_steps[0]):
+                        step_choices = [
+                            (i, f"Step {s.get('step_number', i + 1)}: {s.get('step_name', 'Unknown')}")
+                            for i, s in enumerate(pipeline_steps)
+                        ]
+                    if step_choices:
+                        default_step_idx = len(step_choices) - 1  # default: final step
+                        step_key = f"playground_run_step_{chosen}"
+                        if step_key not in st.session_state:
+                            st.session_state[step_key] = default_step_idx
+                        chosen_step_idx = st.selectbox(
+                            "Step (chained prompt)",
+                            options=list(range(len(step_choices))),
+                            format_func=lambda i: step_choices[i][1],
+                            index=min(st.session_state.get(step_key, default_step_idx), len(step_choices) - 1),
+                            key=f"playground_step_select_{chosen}",
+                        )
+                        st.session_state[step_key] = chosen_step_idx
+                        step_data = pipeline_steps[chosen_step_idx]
+                        # Use full_output if valid JSON (e.g. has analysis_block), else output
+                        for candidate in ("full_output", "output"):
+                            raw = step_data.get(candidate) or ""
+                            if isinstance(raw, str) and raw.strip():
+                                try:
+                                    json.loads(raw.strip())
+                                    json_str = raw.strip()
+                                    json_source_label = f"Run #{chosen} — {step_choices[chosen_step_idx][1]}"
+                                    break
+                                except (json.JSONDecodeError, TypeError):
+                                    continue
+                    if json_str is None:
+                        out_json = getattr(run_detail, "output_json", None)
+                        if out_json:
+                            json_str = out_json
+                            json_source_label = f"Run #{chosen} (output_json — final step)"
+                        else:
+                            try:
+                                json_str = run_detail.output_text or ""
+                                if json_str.strip():
+                                    json.loads(json_str)
+                                    json_source_label = f"Run #{chosen} (output_text as JSON)"
+                                else:
+                                    json_str = None
+                            except (json.JSONDecodeError, TypeError):
+                                st.warning(f"Run #{chosen} has no stored raw JSON and output_text is not valid JSON. Use a run that had an output schema.")
         else:
             pasted = st.text_area(
                 "Paste raw JSON",
@@ -2532,8 +2575,8 @@ if current_page == "runner":
                         legal_questions=json.dumps(state["legal_questions"]) if state.get("legal_questions") else None,
                         legal_expert_output=state.get("legal_expert_output"),
                         chain_steps=(
-                            json.dumps([{"step_name": n, "output": o} for n, o in state["chain"]])
-                            if state.get("chain") else None
+                            json.dumps(state["pipeline_step_results"], default=str)
+                            if state.get("pipeline_step_results") else None
                         ),
                         retrieval_report_summary=_retrieval_summary or None,
                         model_used=get_effective_model(),
