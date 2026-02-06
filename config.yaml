@@ -1,6 +1,8 @@
 # CouncilFlow auth: admin (full access) and user (Run Analysis only).
 # IMPORTANT: Change all passwords and cookie.key before production use.
 # Regenerate password hash: python -c "import streamlit_authenticator as stauth; print(stauth.Hasher.hash('YOUR_PASSWORD'))"
+app:
+  base_url: "http://localhost:8501"
 credentials:
   usernames:
     admin:
@@ -19,3 +21,6 @@ cookie:
   name: councilflow_cookie
   key: councilflow_secret_key_change_in_production  # Change in production
   expiry_days: 30
+
+# Optional: base URL for shared deep links (e.g. https://councilflow.example.com). Required for "Copy link" to work.
+# Can override with environment variable COUNCILFLOW_BASE_URL.

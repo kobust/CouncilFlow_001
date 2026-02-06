@@ -218,25 +218,7 @@ except Exception as e:
     st.error(f"Authentication setup failed: {e}")
     st.stop()
 
-logger.debug("Rendering login widget")
-authenticator.login(location="main")
-
-if not st.session_state.get("authentication_status"):
-    if st.session_state.get("authentication_status") is False:
-        logger.warning("Login failed: incorrect credentials")
-        st.error("Username/password is incorrect")
-    else:
-        logger.debug("User not authenticated, stopping")
-    st.stop()
-
-_username = st.session_state.get("username", "")
-logger.info(f"User authenticated: {_username} ({st.session_state.get('name', 'unknown')})")
-is_admin = _username == "admin"
-
-# -----------------------------------------------------------------------------
-# Init
-# -----------------------------------------------------------------------------
-
+# Init DBs early so we can resolve share tokens before login
 logger.debug("Initializing database")
 try:
     db.init_db()
@@ -254,6 +236,52 @@ except Exception as e:
     logger.error(f"Runs database initialization failed: {e}", exc_info=True)
     st.error(f"Runs database error: {e}")
     st.stop()
+
+# -----------------------------------------------------------------------------
+# Deep-link share viewer (no login required)
+# -----------------------------------------------------------------------------
+_share_token = st.query_params.get("v")
+if _share_token:
+    _shared_run = runs_db.get_analysis_run_by_share_token(_share_token)
+    if _shared_run:
+        # Run login so sidebar can show nav if user has cookie, and so audit can record username
+        authenticator.login(location="sidebar")
+        # Record audit once per session per run
+        _recorded = st.session_state.get("share_view_recorded_run_ids") or set()
+        if _shared_run.id not in _recorded:
+            try:
+                runs_db.insert_share_view_event(
+                    _shared_run.id,
+                    viewer_username=st.session_state.get("username") if st.session_state.get("authentication_status") else None,
+                )
+                st.session_state["share_view_recorded_run_ids"] = _recorded | {_shared_run.id}
+            except Exception as e:
+                logger.debug("Share view audit: %s", e)
+        from share_viewer import render_share_viewer
+        render_share_viewer(_shared_run)
+        st.stop()
+    else:
+        st.info("This link is invalid or has been disabled.")
+        # Fall through to normal login
+
+logger.debug("Rendering login widget")
+authenticator.login(location="main")
+
+if not st.session_state.get("authentication_status"):
+    if st.session_state.get("authentication_status") is False:
+        logger.warning("Login failed: incorrect credentials")
+        st.error("Username/password is incorrect")
+    else:
+        logger.debug("User not authenticated, stopping")
+    st.stop()
+
+_username = st.session_state.get("username", "")
+logger.info(f"User authenticated: {_username} ({st.session_state.get('name', 'unknown')})")
+is_admin = _username == "admin"
+
+# -----------------------------------------------------------------------------
+# Init (session state; DBs already inited above)
+# -----------------------------------------------------------------------------
 
 # Pre-load disk caches on startup for faster first use
 if "caches_preloaded" not in st.session_state:
@@ -748,6 +776,49 @@ def _render_json_view(
         return output_schemas.run_transformer(view_choice, data)
     except Exception as e:
         return f"Transformer failed: {e}"
+
+
+def _get_base_url() -> str | None:
+    """Base URL for share links from config.yaml, .streamlit/config.toml, or env. None if not set."""
+    base = None
+    try:
+        # 1) config.yaml: app.base_url (or top-level base_url)
+        c = config.get("app")
+        if isinstance(c, dict) and c.get("base_url"):
+            base = c.get("base_url")
+        if not base and config.get("base_url"):
+            base = config.get("base_url")
+        # 2) Environment
+        if not base:
+            base = os.environ.get("COUNCILFLOW_BASE_URL")
+        # 3) .streamlit/config.toml [app] base_url (so Streamlit config works too)
+        if not base:
+            try:
+                toml_path = repo_path(".streamlit", "config.toml")
+                if toml_path.exists():
+                    text = toml_path.read_text(encoding="utf-8")
+                    in_app = False
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if line == "[app]":
+                            in_app = True
+                            continue
+                        if in_app and line.startswith("["):
+                            break
+                        if in_app and "base_url" in line and "=" in line:
+                            # base_url = "..." or base_url = '...' or base_url = value
+                            parts = line.split("=", 1)
+                            if len(parts) == 2 and "base_url" in parts[0]:
+                                val = parts[1].strip().strip("'\"").strip()
+                                if val:
+                                    base = val
+                                    break
+            except Exception as e:
+                logger.debug("Reading base_url from .streamlit/config.toml: %s", e)
+        return (base or "").strip() or None
+    except Exception as e:
+        logger.debug("_get_base_url: %s", e)
+        return None
 
 
 def _build_prompt_variables(username: str = "", user_name: str = "") -> str:
@@ -1852,6 +1923,60 @@ elif current_page == "run_history":
             )
             st.caption(f"**Started:** {started_str} · **Completed:** {completed_str}")
             st.caption(f"Stored in **{stored_tz}**, shown in local time.")
+            # Sharing (deep link)
+            share_enabled = getattr(run_detail, "share_enabled", False)
+            share_token = getattr(run_detail, "share_token", None)
+            if share_enabled and share_token:
+                st.markdown("#### Sharing")
+                share_title_val = (getattr(run_detail, "share_title", None) or "").strip() or run_detail.task_name
+                new_share_title = st.text_input(
+                    "Share title",
+                    value=share_title_val,
+                    key=f"share_title_{run_detail.id}",
+                    help="Display title for the shared link. Shown on the viewer page.",
+                )
+                if st.button("Save title", key=f"save_share_title_{run_detail.id}"):
+                    try:
+                        runs_db.update_run_share_title(run_detail.id, new_share_title.strip() or None)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not save title: {e}")
+                view_count = runs_db.count_share_view_events(run_detail.id)
+                st.caption(f"Viewed **{view_count}** time(s) via share link.")
+                base_url = _get_base_url()
+                if base_url:
+                    share_url = f"{base_url.rstrip('/')}?v={share_token}"
+                    st.caption("Share link (use the copy icon on the code block to copy):")
+                    st.code(share_url, language=None)
+                else:
+                    st.caption(
+                        "Set **base_url** in one of: **config.yaml** under `app.base_url`, "
+                        "**.streamlit/config.toml** under `[app]` as `base_url = \"...\"`, "
+                        "or env **COUNCILFLOW_BASE_URL**. Restart the app after changing config."
+                    )
+                if st.button("Disable sharing", key=f"disable_share_{run_detail.id}"):
+                    try:
+                        runs_db.set_run_share_enabled(run_detail.id, False)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not disable sharing: {e}")
+            else:
+                st.markdown("#### Sharing")
+                with st.expander("Enable sharing (deep link)", expanded=False):
+                    st.warning(
+                        "Only enable sharing if this analysis does **not** contain confidential information "
+                        "or personally identifiable information (PII). Anyone with the link will be able to view "
+                        "the content without logging in."
+                    )
+                    pii_ack = st.checkbox("I confirm this analysis does not contain confidential or PII", key=f"pii_ack_{run_detail.id}")
+                    if st.button("Enable sharing", key=f"enable_share_{run_detail.id}", disabled=not pii_ack):
+                        if pii_ack:
+                            try:
+                                runs_db.set_run_share_enabled(run_detail.id, True)
+                                st.success("Sharing enabled. You can set a share title and copy the link above.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not enable sharing: {e}")
             st.markdown("---")
             # Output / Pre-QA / Post-QA when QA was used
             pre_qa = getattr(run_detail, "pre_qa_output", None)

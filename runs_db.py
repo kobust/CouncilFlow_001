@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Optional
@@ -79,6 +80,10 @@ class AnalysisRun(SQLModel, table=True):
     pre_qa_output: Optional[str] = None  # Phase 4: output before QA agent (if QA ran)
     qa_output: Optional[str] = None  # Phase 4: output after QA agent (if QA ran)
     output_json: Optional[str] = None  # JSON transformers: raw JSON when prompt had output schema
+    # Deep-link sharing (opt-in)
+    share_token: Optional[str] = None  # nullable, unique; set when sharing enabled
+    share_enabled: bool = False
+    share_title: Optional[str] = None  # user-editable display title for shared view
 
 
 class RunEvent(SQLModel, table=True):
@@ -95,6 +100,18 @@ class RunEvent(SQLModel, table=True):
     event_type: str = ""  # e.g. node_started, node_completed, interrupt_requested, human_responded
     payload: Optional[str] = None  # optional JSON or short text
     created_at: Optional[datetime] = None
+
+
+class ShareViewEvent(SQLModel, table=True):
+    """
+    Audit log: each time a shared link (?v=...) is viewed.
+    """
+    __table_args__ = {"extend_existing": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: Optional[int] = None  # FK to AnalysisRun
+    viewed_at: Optional[datetime] = None  # UTC
+    viewer_username: Optional[str] = None  # set only if viewer was logged in
 
 
 # -----------------------------------------------------------------------------
@@ -170,6 +187,28 @@ def _migrate_output_json() -> None:
         logger.warning(f"Migration output_json: {e}")
 
 
+def _migrate_share_fields() -> None:
+    """Add share_token, share_enabled, share_title to analysisrun if missing."""
+    try:
+        engine = _get_runs_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(analysisrun)")).fetchall()
+        columns = [r[1].lower() for r in rows] if rows else []
+        with engine.connect() as conn:
+            if "share_token" not in columns:
+                logger.info("Adding share_token column to analysisrun")
+                conn.execute(text("ALTER TABLE analysisrun ADD COLUMN share_token VARCHAR(64)"))
+            if "share_enabled" not in columns:
+                logger.info("Adding share_enabled column to analysisrun")
+                conn.execute(text("ALTER TABLE analysisrun ADD COLUMN share_enabled INTEGER DEFAULT 0"))
+            if "share_title" not in columns:
+                logger.info("Adding share_title column to analysisrun")
+                conn.execute(text("ALTER TABLE analysisrun ADD COLUMN share_title TEXT"))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration share fields: {e}")
+
+
 def init_runs_db() -> None:
     """Create AnalysisRun and RunEvent tables if they do not exist. Only these tables are in council_runs.db."""
     logger.info("Initializing runs database")
@@ -177,10 +216,12 @@ def init_runs_db() -> None:
         engine = _get_runs_engine()
         AnalysisRun.__table__.create(engine, checkfirst=True)
         RunEvent.__table__.create(engine, checkfirst=True)
+        ShareViewEvent.__table__.create(engine, checkfirst=True)
         _migrate_prompt_version()
         _migrate_stored_timezone()
         _migrate_pre_qa_qa_output()
         _migrate_output_json()
+        _migrate_share_fields()
         logger.debug("Runs database initialized")
     except Exception as e:
         logger.error(f"Error initializing runs database: {e}", exc_info=True)
@@ -270,6 +311,93 @@ def get_analysis_run_by_id(run_id: int) -> AnalysisRun | None:
     except Exception as e:
         logger.error(f"Error getting analysis run {run_id}: {e}", exc_info=True)
         raise
+
+
+def get_analysis_run_by_share_token(token: str) -> AnalysisRun | None:
+    """Return the analysis run for the given share token only if sharing is enabled, or None."""
+    if not token or not token.strip():
+        return None
+    try:
+        engine = _get_runs_engine()
+        with Session(engine) as session:
+            stmt = select(AnalysisRun).where(
+                AnalysisRun.share_token == token.strip(),
+                AnalysisRun.share_enabled == True,  # noqa: E712
+            )
+            return session.exec(stmt).first()
+    except Exception as e:
+        logger.debug("get_analysis_run_by_share_token: %s", e)
+        return None
+
+
+def update_run_share_title(run_id: int, title: Optional[str]) -> None:
+    """Update the share title for a run. Pass None or empty to clear."""
+    try:
+        from sqlalchemy import update
+        engine = _get_runs_engine()
+        with Session(engine) as session:
+            stmt = update(AnalysisRun).where(AnalysisRun.id == run_id).values(
+                share_title=title.strip() if title and title.strip() else None
+            )
+            session.execute(stmt)
+            session.commit()
+    except Exception as e:
+        logger.error(f"Error updating share title for run {run_id}: {e}", exc_info=True)
+        raise
+
+
+def set_run_share_enabled(run_id: int, enabled: bool) -> AnalysisRun | None:
+    """Enable or disable sharing for a run. If enabling, generates a share_token if missing. Returns updated run or None."""
+    try:
+        engine = _get_runs_engine()
+        with Session(engine) as session:
+            run = session.get(AnalysisRun, run_id)
+            if not run:
+                return None
+            if enabled:
+                if not run.share_token:
+                    run.share_token = secrets.token_urlsafe(32)
+                run.share_enabled = True
+            else:
+                run.share_enabled = False
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            return run
+    except Exception as e:
+        logger.error(f"Error set_run_share_enabled run_id={run_id} enabled={enabled}: {e}", exc_info=True)
+        raise
+
+
+def insert_share_view_event(run_id: int, *, viewer_username: Optional[str] = None) -> ShareViewEvent:
+    """Record that a shared link was viewed (audit)."""
+    ev = ShareViewEvent(
+        run_id=run_id,
+        viewed_at=datetime.now(timezone.utc),
+        viewer_username=viewer_username,
+    )
+    try:
+        engine = _get_runs_engine()
+        with Session(engine) as session:
+            session.add(ev)
+            session.commit()
+            session.refresh(ev)
+        return ev
+    except Exception as e:
+        logger.warning("Error inserting share view event: %s", e)
+        raise
+
+
+def count_share_view_events(run_id: int) -> int:
+    """Return the number of times a shared link for this run was viewed."""
+    try:
+        engine = _get_runs_engine()
+        with Session(engine) as session:
+            stmt = select(ShareViewEvent).where(ShareViewEvent.run_id == run_id)
+            return len(list(session.exec(stmt).all()))
+    except Exception as e:
+        logger.debug("count_share_view_events: %s", e)
+        return 0
 
 
 def list_analysis_runs(
