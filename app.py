@@ -782,9 +782,20 @@ def _render_json_view(
 
 
 def _get_base_url() -> str | None:
-    """Base URL for share links from config.yaml, .streamlit/config.toml, or env. None if not set."""
-    base = None
+    """Base URL for share links from env, config.yaml, or .streamlit/config.toml.
+
+    Precedence (highest to lowest):
+    1. COUNCILFLOW_BASE_URL environment variable
+    2. config.yaml: app.base_url (or top-level base_url)
+    3. .streamlit/config.toml: [app] base_url
+    """
+    base: str | None = None
     try:
+        # 1) Environment (highest precedence)
+        env_val = os.environ.get("COUNCILFLOW_BASE_URL")
+        if env_val:
+            return env_val.strip() or None
+
         # 1) config.yaml: app.base_url (or top-level base_url)
         c = config.get("app")
         if isinstance(c, dict):
