@@ -187,13 +187,16 @@ st.set_page_config(
 
 try:
     logger.debug("Loading config.yaml")
-    config_path = repo_path("config.yaml")
+    # Load from same directory as this file (app.py) so we always find the right config
+    _config_dir = Path(__file__).resolve().parent
+    config_path = _config_dir / "config.yaml"
     with open(config_path, encoding="utf-8") as f:
         config = yaml.load(f, Loader=SafeLoader)
-    logger.debug("Config loaded successfully")
+    config["_config_path_loaded"] = str(config_path)  # for diagnostics
+    logger.debug("Config loaded successfully from %s", config_path)
 except FileNotFoundError:
-    logger.error("config.yaml not found")
-    st.error("Configuration file (config.yaml) not found. Place it in the app data folder.")
+    logger.error("config.yaml not found at %s", config_path)
+    st.error(f"Configuration file not found. Place **config.yaml** in the same folder as app.py. Looked at: `{config_path}`")
     st.stop()
 except Exception as e:
     logger.error(f"Error loading config.yaml: {e}", exc_info=True)
@@ -784,17 +787,20 @@ def _get_base_url() -> str | None:
     try:
         # 1) config.yaml: app.base_url (or top-level base_url)
         c = config.get("app")
-        if isinstance(c, dict) and c.get("base_url"):
+        if isinstance(c, dict):
             base = c.get("base_url")
-        if not base and config.get("base_url"):
+        if not base:
             base = config.get("base_url")
+        # Normalize: might be str or None
+        if base is not None and not isinstance(base, str):
+            base = str(base).strip() or None
         # 2) Environment
         if not base:
             base = os.environ.get("COUNCILFLOW_BASE_URL")
-        # 3) .streamlit/config.toml [app] base_url (so Streamlit config works too)
+        # 3) .streamlit/config.toml [app] base_url
         if not base:
             try:
-                toml_path = repo_path(".streamlit", "config.toml")
+                toml_path = Path(__file__).resolve().parent / ".streamlit" / "config.toml"
                 if toml_path.exists():
                     text = toml_path.read_text(encoding="utf-8")
                     in_app = False
@@ -806,7 +812,6 @@ def _get_base_url() -> str | None:
                         if in_app and line.startswith("["):
                             break
                         if in_app and "base_url" in line and "=" in line:
-                            # base_url = "..." or base_url = '...' or base_url = value
                             parts = line.split("=", 1)
                             if len(parts) == 2 and "base_url" in parts[0]:
                                 val = parts[1].strip().strip("'\"").strip()
@@ -819,6 +824,19 @@ def _get_base_url() -> str | None:
     except Exception as e:
         logger.debug("_get_base_url: %s", e)
         return None
+
+
+def _get_base_url_diagnostic() -> dict:
+    """Return a small dict of diagnostic info for base_url lookup (for UI when base_url is missing)."""
+    c = config.get("app")
+    return {
+        "config_file": config.get("_config_path_loaded", "unknown"),
+        "has_app_key": "app" in config,
+        "app_type": type(c).__name__ if c is not None else "N/A",
+        "app_keys": list(c.keys()) if isinstance(c, dict) else [],
+        "base_url_from_app": c.get("base_url") if isinstance(c, dict) else None,
+        "COUNCILFLOW_BASE_URL_set": bool(os.environ.get("COUNCILFLOW_BASE_URL")),
+    }
 
 
 def _build_prompt_variables(username: str = "", user_name: str = "") -> str:
@@ -1321,8 +1339,8 @@ if is_admin:
         try:
             available_models = list_available_models()
             if available_models:
-                config = db.get_app_config()
-                current_selected = config.selected_model if config else current_model
+                app_config = db.get_app_config()
+                current_selected = app_config.selected_model if app_config else current_model
                 
                 # Find current model index, or default to 0
                 try:
@@ -1954,6 +1972,17 @@ elif current_page == "run_history":
                         "**.streamlit/config.toml** under `[app]` as `base_url = \"...\"`, "
                         "or env **COUNCILFLOW_BASE_URL**. Restart the app after changing config."
                     )
+                    with st.expander("Debug: why is base_url missing?"):
+                        diag = _get_base_url_diagnostic()
+                        st.code(
+                            f"Config file: {diag['config_file']}\n"
+                            f"config has 'app': {diag['has_app_key']}\n"
+                            f"app type: {diag['app_type']}\n"
+                            f"app keys: {diag['app_keys']}\n"
+                            f"base_url from app: {diag['base_url_from_app']!r}\n"
+                            f"COUNCILFLOW_BASE_URL in env: {diag['COUNCILFLOW_BASE_URL_set']}",
+                            language=None,
+                        )
                 if st.button("Disable sharing", key=f"disable_share_{run_detail.id}"):
                     try:
                         runs_db.set_run_share_enabled(run_detail.id, False)
