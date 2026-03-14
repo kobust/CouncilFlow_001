@@ -284,8 +284,8 @@ MAYORS_COMMUNICATION_SCHEMA = {
 
 PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://attleboro-ma.gov/schemas/public-testimony-agenda-output-wrapped.schema.json",
-  "title": "Attleboro Municipal Council Written Public Testimony Output (Agenda-Based, Wrapped)",
+  "$id": "https://attleboro-ma.gov/schemas/public-testimony-agenda-output-wrapped-with-date.schema.json",
+  "title": "Attleboro Municipal Council Written Public Testimony Output (Agenda-Based, Wrapped, With Date)",
   "description": "Schema for structured extraction of written public testimony matched to matters listed on a Council agenda or to other municipal issues.",
   "type": "object",
   "additionalProperties": False,
@@ -307,6 +307,7 @@ PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
         "filename",
         "author",
         "how-to-contact",
+        "date",
         "summary",
         "position",
         "categorization"
@@ -326,6 +327,24 @@ PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
           "type": "string",
           "minLength": 1,
           "description": "Contact information explicitly present in the source, or 'Not provided'."
+        },
+        "date": {
+          "type": "string",
+          "description": "Date explicitly available in the source, normalized when possible. Allowed forms: YYYY-MM-DD, YYYY-MM, YYYY, or 'Not provided'.",
+          "anyOf": [
+            {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            {
+              "pattern": "^\\d{4}-\\d{2}$"
+            },
+            {
+              "pattern": "^\\d{4}$"
+            },
+            {
+              "const": "Not provided"
+            }
+          ]
         },
         "summary": {
           "type": "string",
@@ -373,6 +392,7 @@ PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
           "filename": "BusinessesinAttleboro.docx",
           "author": "Julie Hall",
           "how-to-contact": "Not provided",
+          "date": "2026-02-16",
           "summary": "The author supports opposition to a proposed tax break for a development at 61 Union Street and argues that all businesses should be treated fairly under city ordinances.",
           "position": "Opposed",
           "categorization": "Agenda Item [No listed ID] - Tax increment financing agreement for 61 Union Street"
@@ -386,7 +406,7 @@ PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
 def to_public_testimony_table_md(data: Any) -> str:
     """
     Transform public testimony JSON (wrapped object with "items" array of testimonyItem) to a Markdown table.
-    Columns: filename, author, how-to-contact, position, categorization, summary.
+    Columns: filename, author, how-to-contact, date, position, categorization, summary.
     """
     if not isinstance(data, dict) or "items" not in data:
         return f"Unexpected shape: expected object with 'items' array, got {type(data).__name__}"
@@ -401,8 +421,8 @@ def to_public_testimony_table_md(data: Any) -> str:
     parts: list[str] = []
 
     # Table header
-    parts.append("| Filename | Author | How to contact | Position | Categorization | Summary |")
-    parts.append("|----------|--------|----------------|----------|----------------|---------|")
+    parts.append("| Filename | Author | How to contact | Date | Position | Categorization | Summary |")
+    parts.append("|----------|--------|----------------|------|----------|----------------|---------|")
 
     for item in items:
         if not isinstance(item, dict):
@@ -411,17 +431,107 @@ def to_public_testimony_table_md(data: Any) -> str:
         filename = _escape_table_cell(str(item.get("filename", "")), max_len=None)
         author = _escape_table_cell(str(item.get("author", "")), max_len=None)
         how_to_contact = _escape_table_cell(str(item.get("how-to-contact", "")), max_len=None)
+        date = _escape_table_cell(str(item.get("date", "")), max_len=None)
         position = _escape_table_cell(str(item.get("position", "")), max_len=None)
         categorization = _escape_table_cell(str(item.get("categorization", "")), max_len=None)
         summary = _escape_table_cell(str(item.get("summary", "")), max_len=None)
 
         row = (
-            f"| {filename} | {author} | {how_to_contact} | "
+            f"| {filename} | {author} | {how_to_contact} | {date} | "
             f"{position} | {categorization} | {summary} |"
         )
         parts.append(row)
 
     return "\n".join(parts)
+
+
+# Order for sorting testimony by position within a category
+_PUBLIC_TESTIMONY_POSITION_ORDER = ("In Favor", "Opposed", "Neither For Nor Against")
+
+
+def to_public_testimony_by_category_md(data: Any) -> str:
+    """
+    Transform public testimony JSON into markdown grouped by category, then by position
+    (In Favor, Opposed, Neither For Nor Against). Each category has a short blurb with
+    counts. Output is plain markdown suitable for export to Google Docs.
+    """
+    if not isinstance(data, dict) or "items" not in data:
+        return f"Unexpected shape: expected object with 'items' array, got {type(data).__name__}"
+
+    items = data["items"]
+    if not isinstance(items, list):
+        return f"Unexpected shape: 'items' must be an array, got {type(items).__name__}"
+
+    if not items:
+        return "## Public Testimony\n\nNo testimony items."
+
+    # Collect valid items and group by categorization
+    by_category: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        cat = str(item.get("categorization", "")).strip()
+        if not cat:
+            cat = "Uncategorized"
+        by_category.setdefault(cat, []).append(item)
+
+    # Sort categories by first occurrence order (preserve logical order)
+    category_order = list(by_category.keys())
+
+    def position_sort_key(it: dict[str, Any]) -> int:
+        pos = str(it.get("position", ""))
+        try:
+            return _PUBLIC_TESTIMONY_POSITION_ORDER.index(pos)
+        except ValueError:
+            return len(_PUBLIC_TESTIMONY_POSITION_ORDER)
+
+    parts: list[str] = ["# Public Testimony\n"]
+
+    for cat in category_order:
+        group = by_category[cat]
+        # Sort by position: In Favor, Opposed, Neither For Nor Against
+        group = sorted(group, key=position_sort_key)
+
+        in_favor = sum(1 for it in group if it.get("position") == "In Favor")
+        opposed = sum(1 for it in group if it.get("position") == "Opposed")
+        neither = sum(1 for it in group if it.get("position") == "Neither For Nor Against")
+
+        parts.append(f"## {cat}\n")
+        blurb_parts = [f"{len(group)} piece{'s' if len(group) != 1 else ''} of public testimony"]
+        if in_favor or opposed or neither:
+            count_bits = []
+            if in_favor:
+                count_bits.append(f"{in_favor} in favor")
+            if opposed:
+                count_bits.append(f"{opposed} opposed")
+            if neither:
+                count_bits.append(f"{neither} neither for nor against")
+            blurb_parts.append(": " + ", ".join(count_bits) + ".")
+        else:
+            blurb_parts.append(".")
+        parts.append("".join(blurb_parts) + "\n")
+
+        for it in group:
+            author = str(it.get("author", "")).strip() or "—"
+            date_val = str(it.get("date", "")).strip()
+            position = str(it.get("position", "")).strip() or "—"
+            summary = str(it.get("summary", "")).strip() or "—"
+            filename = str(it.get("filename", "")).strip()
+
+            if date_val and date_val.lower() != "not provided":
+                author_line = f"**{author}** ({date_val}) — *{position}*"
+            else:
+                author_line = f"**{author}** — *{position}*"
+            if filename:
+                author_line += f" — *{filename}*"
+            parts.append(author_line)
+            parts.append("")
+            parts.append(summary)
+            parts.append("")
+            parts.append("")
+
+    return "\n".join(parts).strip()
+
 
 def to_motions_table_md(data: Any) -> str:
     """
@@ -624,5 +734,6 @@ def load() -> None:
         PUBLIC_TESTIMONY_OUTPUT_SCHEMA,
         [
             ("Table", to_public_testimony_table_md),
+            ("By category", to_public_testimony_by_category_md),
         ],
     )
