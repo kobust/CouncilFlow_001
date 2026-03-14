@@ -530,17 +530,21 @@ def to_public_testimony_by_category_md(data: Any) -> str:
         "",
     ]
 
+    def _is_anonymous(it: dict[str, Any]) -> bool:
+        return str(it.get("author", "")).strip().lower() == "anonymous"
+
     for cat in category_order:
         group = by_category[cat]
         # Sort by position: In Favor, Opposed, Neither For Nor Against
         group = sorted(group, key=position_sort_key)
+        named = [it for it in group if not _is_anonymous(it)]
 
-        in_favor = sum(1 for it in group if it.get("position") == "In Favor")
-        opposed = sum(1 for it in group if it.get("position") == "Opposed")
-        neither = sum(1 for it in group if it.get("position") == "Neither For Nor Against")
+        in_favor = sum(1 for it in named if it.get("position") == "In Favor")
+        opposed = sum(1 for it in named if it.get("position") == "Opposed")
+        neither = sum(1 for it in named if it.get("position") == "Neither For Nor Against")
 
         parts.append(f"### {cat}\n")
-        blurb_parts = [f"{len(group)} piece{'s' if len(group) != 1 else ''} of public testimony"]
+        blurb_parts = [f"{len(named)} piece{'s' if len(named) != 1 else ''} of public testimony"]
         if in_favor or opposed or neither:
             count_bits = []
             if in_favor:
@@ -564,17 +568,19 @@ def to_public_testimony_by_category_md(data: Any) -> str:
             how_to_contact = str(it.get("how-to-contact", "")).strip()
             contact_email, contact_phone = _parse_how_to_contact(how_to_contact)
 
-            # First line: Result - name (mailto if email) - Received: date; optional Phone
-            received = date_val if (date_val and date_val.lower() != "not provided") else "Unknown"
-            if contact_email:
-                author_display = f"**[{author}](mailto:{contact_email})**"
-            else:
-                author_display = f"**{author}**"
-            author_line = f"**{position_display}** - {author_display} - Received: {received}"
-            if contact_phone:
-                author_line += f" - Phone: {contact_phone}"
-            author_line += ":"
-            parts.append(author_line)
+            # First line: Result - name (mailto if email) - Received: date; optional Phone. Omit when Anonymous.
+            is_anonymous = _is_anonymous(it)
+            if not is_anonymous:
+                received = date_val if (date_val and date_val.lower() != "not provided") else "Unknown"
+                if contact_email:
+                    author_display = f"**[{author}](mailto:{contact_email})**"
+                else:
+                    author_display = f"**{author}**"
+                author_line = f"**{position_display}** - {author_display} - Received: {received}"
+                if contact_phone:
+                    author_line += f" - Phone: {contact_phone}"
+                author_line += ":"
+                parts.append(author_line)
             if filename:
                 parts.append(f"{summary} *(filename: {filename})*")
             else:
