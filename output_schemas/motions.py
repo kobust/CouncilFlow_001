@@ -448,12 +448,26 @@ def to_public_testimony_table_md(data: Any) -> str:
 # Order for sorting testimony by position within a category
 _PUBLIC_TESTIMONY_POSITION_ORDER = ("In Favor", "Opposed", "Neither For Nor Against")
 
+# Display labels with color indicator (green / red / grey) for markdown and Google Docs
+_PUBLIC_TESTIMONY_POSITION_DISPLAY = {
+    "In Favor": "🟢 In Favor",
+    "Opposed": "🔴 Opposed",
+    "Neither For Nor Against": "⚫ Neither For Nor Against",
+}
+
+
+def _public_testimony_position_display(position: str) -> str:
+    return _PUBLIC_TESTIMONY_POSITION_DISPLAY.get(
+        position.strip(), position or "—"
+    )
+
 
 def to_public_testimony_by_category_md(data: Any) -> str:
     """
     Transform public testimony JSON into markdown grouped by category, then by position
     (In Favor, Opposed, Neither For Nor Against). Each category has a short blurb with
     counts. Output is plain markdown suitable for export to Google Docs.
+    Uses Times New Roman (set in document), position indicators (🟢/🔴/⚫), and a fill-in header.
     """
     if not isinstance(data, dict) or "items" not in data:
         return f"Unexpected shape: expected object with 'items' array, got {type(data).__name__}"
@@ -485,7 +499,16 @@ def to_public_testimony_by_category_md(data: Any) -> str:
         except ValueError:
             return len(_PUBLIC_TESTIMONY_POSITION_ORDER)
 
-    parts: list[str] = ["# Public Testimony\n"]
+    parts: list[str] = [
+        "# Public Testimony\n",
+        "*Document font: Times New Roman*\n",
+        "**Meeting date:** _______________",
+        "",
+        "**Public testimony folder:** [Add link to folder](#)",
+        "",
+        "---",
+        "",
+    ]
 
     for cat in category_order:
         group = by_category[cat]
@@ -514,19 +537,22 @@ def to_public_testimony_by_category_md(data: Any) -> str:
         for it in group:
             author = str(it.get("author", "")).strip() or "—"
             date_val = str(it.get("date", "")).strip()
-            position = str(it.get("position", "")).strip() or "—"
+            position_raw = str(it.get("position", "")).strip() or "—"
+            position_display = _public_testimony_position_display(position_raw)
             summary = str(it.get("summary", "")).strip() or "—"
             filename = str(it.get("filename", "")).strip()
 
+            # Name, date, and position all bold; position includes 🟢/🔴/⚫
             if date_val and date_val.lower() != "not provided":
-                author_line = f"**{author}** ({date_val}) — *{position}*"
+                author_line = f"**{author}** **{date_val}** **{position_display}**"
             else:
-                author_line = f"**{author}** — *{position}*"
-            if filename:
-                author_line += f" — *{filename}*"
+                author_line = f"**{author}** **{position_display}**"
             parts.append(author_line)
             parts.append("")
             parts.append(summary)
+            if filename:
+                parts.append("")
+                parts.append(f"*{filename}*")
             parts.append("")
             parts.append("")
 
