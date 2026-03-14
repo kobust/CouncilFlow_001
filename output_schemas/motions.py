@@ -542,7 +542,7 @@ def to_public_testimony_by_category_md(data: Any) -> str:
             filename = str(it.get("filename", "")).strip()
 
             # First line: Result (position) - name - Received: date; position and name bold
-            received = date_val if (date_val and date_val.lower() != "not provided") else "Not provided"
+            received = date_val if (date_val and date_val.lower() != "not provided") else "Unknown"
             author_line = f"**{position_display}** - **{author}** - Received: {received}"
             parts.append(author_line)
             parts.append("")
