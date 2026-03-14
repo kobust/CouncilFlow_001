@@ -500,12 +500,9 @@ def to_public_testimony_by_category_md(data: Any) -> str:
             return len(_PUBLIC_TESTIMONY_POSITION_ORDER)
 
     parts: list[str] = [
-        "# Public Testimony\n",
-        "**Meeting date:** _______________",
-        "",
-        "**Public testimony folder:** [Add link to folder](#)",
-        "",
-        "---",
+        "# Public Testimony Summary\n",
+        "**Meeting date:** TODO",
+        "**Public testimony folder:** TODO",
         "",
     ]
 
@@ -543,14 +540,12 @@ def to_public_testimony_by_category_md(data: Any) -> str:
 
             # First line: Result (position) - name - Received: date; position and name bold
             received = date_val if (date_val and date_val.lower() != "not provided") else "Unknown"
-            author_line = f"**{position_display}** - **{author}** - Received: **{received}**"
+            author_line = f"**{position_display}** - **{author}** - Received: **{received}**:"
             parts.append(author_line)
-            parts.append("")
             if filename:
                 parts.append(f"{summary} *(filename: {filename})*")
             else:
                 parts.append(summary)
-            parts.append("")
             parts.append("")
 
     return "\n".join(parts).strip()
