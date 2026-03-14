@@ -542,11 +542,9 @@ def to_public_testimony_by_category_md(data: Any) -> str:
             summary = str(it.get("summary", "")).strip() or "—"
             filename = str(it.get("filename", "")).strip()
 
-            # Name, date, and position all bold; position includes 🟢/🔴/⚫
-            if date_val and date_val.lower() != "not provided":
-                author_line = f"**{author}** **{date_val}** **{position_display}**"
-            else:
-                author_line = f"**{author}** **{position_display}**"
+            # First line: Result (position) - name - Received: date; position and name bold
+            received = date_val if (date_val and date_val.lower() != "not provided") else "Not provided"
+            author_line = f"**{position_display}** - **{author}** - Received: {received}"
             parts.append(author_line)
             parts.append("")
             parts.append(summary)

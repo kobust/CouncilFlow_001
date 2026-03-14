@@ -2833,13 +2833,16 @@ if current_page == "runner":
                             _markdown_with_copy(
                                 full_output, f"step_{step_num}_{step_name}_full"
                             )
-            else:
-                # Fallback: if no step results stored, show final result
-                md = res if isinstance(res, str) else str(res)
-                # JSON view selector when run had JSON output
+
+                # When run has JSON output and a schema, show transformed (default) and raw so both are visible
                 json_out = st.session_state.get("last_result_output_json")
-                if json_out and (getattr(selected, "output_schema_id", None) or getattr(selected, "output_schema_key", None)):
-                    view_opts = _get_json_view_options(schema_id=selected.output_schema_id, schema_key=getattr(selected, "output_schema_key", None))
+                schema_key = getattr(selected, "output_schema_key", None)
+                if json_out and (getattr(selected, "output_schema_id", None) or schema_key):
+                    st.markdown("---")
+                    st.markdown("**Final output**")
+                    st.caption("Default transformer output is shown first; use \"View as\" to switch. Raw JSON is below.")
+                    md = res if isinstance(res, str) else str(res)
+                    view_opts = _get_json_view_options(schema_key=schema_key)
                     view_labels = [lbl for _, lbl in view_opts]
                     view_keys = [val for val, _ in view_opts]
                     idx = view_keys.index(st.session_state.get("last_result_json_view", "saved")) if st.session_state.get("last_result_json_view", "saved") in view_keys else 0
@@ -2847,6 +2850,35 @@ if current_page == "runner":
                     st.session_state["last_result_json_view"] = view_keys[view_labels.index(view_choice)]
                     display_str = _render_json_view(json_out, md, st.session_state["last_result_json_view"])
                     _markdown_with_copy(display_str, "result")
+                    with st.expander("Raw JSON", expanded=False):
+                        try:
+                            parsed = json.loads(json_out)
+                            raw_display = json.dumps(parsed, indent=2)
+                        except Exception:
+                            raw_display = json_out
+                        _markdown_with_copy(raw_display, "result_raw_json")
+            else:
+                # Fallback: if no step results stored, show final result
+                md = res if isinstance(res, str) else str(res)
+                # JSON view selector when run had JSON output; show both transformed and raw
+                json_out = st.session_state.get("last_result_output_json")
+                schema_key = getattr(selected, "output_schema_key", None)
+                if json_out and (getattr(selected, "output_schema_id", None) or schema_key):
+                    view_opts = _get_json_view_options(schema_key=schema_key)
+                    view_labels = [lbl for _, lbl in view_opts]
+                    view_keys = [val for val, _ in view_opts]
+                    idx = view_keys.index(st.session_state.get("last_result_json_view", "saved")) if st.session_state.get("last_result_json_view", "saved") in view_keys else 0
+                    view_choice = st.selectbox("View as", options=view_labels, index=idx, key="last_result_json_view_select")
+                    st.session_state["last_result_json_view"] = view_keys[view_labels.index(view_choice)]
+                    display_str = _render_json_view(json_out, md, st.session_state["last_result_json_view"])
+                    _markdown_with_copy(display_str, "result")
+                    with st.expander("Raw JSON", expanded=False):
+                        try:
+                            parsed = json.loads(json_out)
+                            raw_display = json.dumps(parsed, indent=2)
+                        except Exception:
+                            raw_display = json_out
+                        _markdown_with_copy(raw_display, "result_raw_json")
                 else:
                     _markdown_with_copy(md, "result")
 
