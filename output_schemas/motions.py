@@ -467,7 +467,7 @@ def to_public_testimony_by_category_md(data: Any) -> str:
     Transform public testimony JSON into markdown grouped by category, then by position
     (In Favor, Opposed, Neither For Nor Against). Each category has a short blurb with
     counts. Output is plain markdown suitable for export to Google Docs.
-    Uses Times New Roman (set in document), position indicators (🟢/🔴/⚫), and a fill-in header.
+    Uses position indicators (🟢/🔴/⚫) and a fill-in header for meeting date and testimony folder link.
     """
     if not isinstance(data, dict) or "items" not in data:
         return f"Unexpected shape: expected object with 'items' array, got {type(data).__name__}"
@@ -501,7 +501,6 @@ def to_public_testimony_by_category_md(data: Any) -> str:
 
     parts: list[str] = [
         "# Public Testimony\n",
-        "*Document font: Times New Roman*\n",
         "**Meeting date:** _______________",
         "",
         "**Public testimony folder:** [Add link to folder](#)",
@@ -519,7 +518,7 @@ def to_public_testimony_by_category_md(data: Any) -> str:
         opposed = sum(1 for it in group if it.get("position") == "Opposed")
         neither = sum(1 for it in group if it.get("position") == "Neither For Nor Against")
 
-        parts.append(f"## {cat}\n")
+        parts.append(f"### {cat}\n")
         blurb_parts = [f"{len(group)} piece{'s' if len(group) != 1 else ''} of public testimony"]
         if in_favor or opposed or neither:
             count_bits = []
