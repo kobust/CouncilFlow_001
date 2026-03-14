@@ -462,6 +462,30 @@ def _public_testimony_position_display(position: str) -> str:
     )
 
 
+def _parse_how_to_contact(how_to_contact: str) -> tuple[str | None, str | None]:
+    """Parse how-to-contact string; return (email, phone) for use in author line.
+    Input format example: 'Email: ksalome2@comcast.net; Address: 84 Sentinel Hill Road, Attleboro, MA'
+    """
+    email: str | None = None
+    phone: str | None = None
+    s = (how_to_contact or "").strip()
+    for part in s.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        lower = part.lower()
+        if lower.startswith("email:"):
+            val = part[6:].strip()
+            if val and "@" in val:
+                email = val
+        elif lower.startswith("phone:") or lower.startswith("tel:"):
+            prefix_len = 6 if lower.startswith("phone:") else 4
+            val = part[prefix_len:].strip()
+            if val:
+                phone = val
+    return (email, phone)
+
+
 def to_public_testimony_by_category_md(data: Any) -> str:
     """
     Transform public testimony JSON into markdown grouped by category, then by position
@@ -537,10 +561,19 @@ def to_public_testimony_by_category_md(data: Any) -> str:
             position_display = _public_testimony_position_display(position_raw)
             summary = str(it.get("summary", "")).strip() or "—"
             filename = str(it.get("filename", "")).strip()
+            how_to_contact = str(it.get("how-to-contact", "")).strip()
+            contact_email, contact_phone = _parse_how_to_contact(how_to_contact)
 
-            # First line: Result (position) - name - Received: date; position and name bold
+            # First line: Result - name (mailto if email) - Received: date; optional Phone
             received = date_val if (date_val and date_val.lower() != "not provided") else "Unknown"
-            author_line = f"**{position_display}** - **{author}** - Received: **{received}**:"
+            if contact_email:
+                author_display = f"**[{author}](mailto:{contact_email})**"
+            else:
+                author_display = f"**{author}**"
+            author_line = f"**{position_display}** - {author_display} - Received: {received}"
+            if contact_phone:
+                author_line += f" - Phone: {contact_phone}"
+            author_line += ":"
             parts.append(author_line)
             if filename:
                 parts.append(f"{summary} *(filename: {filename})*")
