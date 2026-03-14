@@ -282,6 +282,130 @@ MAYORS_COMMUNICATION_SCHEMA = {
   }
 }
 
+PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://attleboro-ma.gov/schemas/public-testimony-output.schema.json",
+  "title": "Attleboro Municipal Council Written Public Testimony Output",
+  "description": "Schema for structured extraction of written public testimony matched to current Council business or other municipal issues.",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/testimonyItem"
+  },
+  "$defs": {
+    "testimonyItem": {
+      "type": "object",
+      "additionalProperties": False,
+      "required": [
+        "filename",
+        "author",
+        "how-to-contact",
+        "summary",
+        "position",
+        "categorization"
+      ],
+      "properties": {
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filename of the input testimony document or email."
+        },
+        "author": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the author, or 'Anonymous' if the author cannot be determined."
+        },
+        "how-to-contact": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Contact information explicitly present in the source, or 'Not provided'. Examples: 'Email: name@example.com', 'Phone: 508-555-0123', 'Email: name@example.com; Phone: 508-555-0123', 'Mailing address provided', 'Not provided'."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Brief neutral summary of the testimony."
+        },
+        "position": {
+          "type": "string",
+          "enum": [
+            "In Favor",
+            "Opposed",
+            "Neither For Nor Against"
+          ],
+          "description": "Constituent position relative to the matched motion or categorized issue."
+        },
+        "categorization": {
+          "type": "string",
+          "description": "Primary categorization of the testimony.",
+          "oneOf": [
+            {
+              "pattern": "^Motion \\[[^\\]]+\\] - .+$",
+              "description": "Matched to a specific motion, for example: Motion [26.03.03-MC-005] - Rescue 4 overtime funding"
+            },
+            {
+              "pattern": "^Ward Issue - .+$",
+              "description": "Localized constituent or neighborhood issue."
+            },
+            {
+              "pattern": "^General Municipal Issue - .+$",
+              "description": "Citywide or general policy issue not clearly tied to a current motion."
+            },
+            {
+              "const": "Not Within Council Jurisdiction / Unclear",
+              "description": "Submission is unrelated, too vague, or not reasonably connected to Council business."
+            }
+          ]
+        }
+      },
+      "examples": [
+        {
+          "filename": "No_Disturb Zone Testimony_Ken Salome.pdf",
+          "author": "Ken Salome",
+          "how-to-contact": "Not provided",
+          "summary": "Resident comments on the proposed no-disturbance zone and describes concerns about how the policy would affect nearby neighbors and enforcement.",
+          "position": "Opposed",
+          "categorization": "Motion [26.03.17-MC-005] - No-disturbance zone proposal"
+        }
+      ]
+    }
+  }
+}
+
+
+def to_public_testimony_table_md(data: Any) -> str:
+    """
+    Transform public testimony JSON (array of testimonyItem) to a Markdown table.
+    Columns: filename, author, how-to-contact, position, categorization, summary.
+    """
+    if not isinstance(data, list):
+        return f"Unexpected shape: expected array, got {type(data).__name__}"
+
+    if not data:
+        return "## Public Testimony\n\nNo testimony items."
+
+    parts: list[str] = []
+
+    # Table header
+    parts.append("| Filename | Author | How to contact | Position | Categorization | Summary |")
+    parts.append("|----------|--------|----------------|----------|----------------|---------|")
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        filename = _escape_table_cell(str(item.get("filename", "")), max_len=None)
+        author = _escape_table_cell(str(item.get("author", "")), max_len=None)
+        how_to_contact = _escape_table_cell(str(item.get("how-to-contact", "")), max_len=None)
+        position = _escape_table_cell(str(item.get("position", "")), max_len=None)
+        categorization = _escape_table_cell(str(item.get("categorization", "")), max_len=None)
+        summary = _escape_table_cell(str(item.get("summary", "")), max_len=None)
+
+        row = (
+            f"| {filename} | {author} | {how_to_contact} | "
+            f"{position} | {categorization} | {summary} |"
+        )
+        parts.append(row)
+
+    return "\n".join(parts)
 
 def to_motions_table_md(data: Any) -> str:
     """
@@ -477,5 +601,12 @@ def load() -> None:
         [
             ("Table", to_motions_table_md),
             ("Minutes", to_minutes_md),
+        ],
+    )
+    register_schema(
+        "public_testimony_output",
+        PUBLIC_TESTIMONY_OUTPUT_SCHEMA,
+        [
+            ("Table", to_public_testimony_table_md),
         ],
     )

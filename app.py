@@ -1351,7 +1351,15 @@ if is_admin:
             available_models = list_available_models()
             if available_models:
                 app_config = db.get_app_config()
-                current_selected = app_config.selected_model if app_config else current_model
+
+                # Handle both ORM object and dict-based app_config defensively
+                if app_config:
+                    if isinstance(app_config, dict):
+                        current_selected = app_config.get("selected_model", current_model) or current_model
+                    else:
+                        current_selected = getattr(app_config, "selected_model", None) or current_model
+                else:
+                    current_selected = current_model
                 
                 # Find current model index, or default to 0
                 try:
@@ -1393,7 +1401,14 @@ if is_admin:
                 st.markdown("---")
                 st.caption("**Planner Model** (optional override)")
                 planner_options = ["— Use same as main model —"] + available_models
-                current_planner_selected = config.planner_model if config and config.planner_model else None
+
+                # Read planner model safely from app_config (dict or ORM)
+                current_planner_selected = None
+                if app_config:
+                    if isinstance(app_config, dict):
+                        current_planner_selected = app_config.get("planner_model") or None
+                    else:
+                        current_planner_selected = getattr(app_config, "planner_model", None) or None
                 
                 if current_planner_selected:
                     try:

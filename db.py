@@ -127,7 +127,7 @@ class AppConfig(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=1, primary_key=True)  # Always ID 1 (singleton)
-    selected_model: str = Field(default="gemini-3-flash-preview")  # Selected Gemini model
+    selected_model: str = Field(default="gemini-3.1-pro-preview")  # Selected Gemini model
     planner_model: Optional[str] = Field(default="gemini-2.0-flash")  # Planner model (optional override)
 
 
@@ -342,6 +342,21 @@ def _migrate_jsonschema_transformers() -> None:
         logger.warning(f"Migration jsonschema transformers: {e}")
 
 
+def _migrate_default_model_to_3_1() -> None:
+    """Migrate existing AppConfig rows that still use the old default model to Gemini 3.1 Pro."""
+    try:
+        engine = _get_engine()
+        with Session(engine) as s:
+            config = s.get(AppConfig, 1)
+            if config and getattr(config, "selected_model", None) == "gemini-3-flash-preview":
+                logger.info("Migrating AppConfig.selected_model from gemini-3-flash-preview to gemini-3.1-pro-preview")
+                config.selected_model = "gemini-3.1-pro-preview"
+                s.add(config)
+                s.commit()
+    except Exception as e:
+        logger.warning(f"Migration default model to 3.1 failed (non-fatal): {e}")
+
+
 def _seed_workflows() -> None:
     """Seed Workflow table with default workflow(s) if empty (Phase 5)."""
     try:
@@ -369,7 +384,7 @@ def _init_app_config() -> None:
                 logger.info("Initializing AppConfig with default model")
                 config = AppConfig(
                     id=1,
-                    selected_model="gemini-3-flash-preview",
+                    selected_model="gemini-3.1-pro-preview",
                     planner_model="gemini-2.0-flash",
                 )
                 s.add(config)
@@ -397,6 +412,7 @@ def init_db() -> None:
         _migrate_output_transformer_key()
         _migrate_schema_keys()
         _migrate_jsonschema_transformers()
+        _migrate_default_model_to_3_1()
         _init_app_config()
         _seed_workflows()
         with Session(engine) as s:

@@ -78,7 +78,7 @@ Open the URL shown in the terminal. Log in with a user from `config.yaml`, conne
 |----------|-------------|
 | `GEMINI_API_KEY` | Gemini API key (required if not in `secrets.toml`) |
 | `GCP_SERVICE_ACCOUNT_JSON` | Full Service Account JSON string for Drive (if not in `secrets.toml`) |
-| `GEMINI_MODEL` | Main model for the agent (default: `gemini-3-flash-preview`). e.g. `gemini-2.0-flash` |
+| `GEMINI_MODEL` | Main model for the agent (default: `gemini-3.1-pro-preview`). e.g. `gemini-2.0-flash` |
 | `GEMINI_PLANNER_MODEL` | Model for the retrieval planner (default: `gemini-2.0-flash`) |
 | `GEMINI_PACE_DELAY_SECONDS` | Seconds to wait before each GenerateContent call; helps with rate limits (default: `0`) |
 | `PIPELINE_STEP_DELAY_SECONDS` | Seconds to wait before each follow-on prompt in the chain (default: `0`). Set to 5–10 if hitting rate limits. |

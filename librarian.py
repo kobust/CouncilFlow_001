@@ -85,7 +85,11 @@ def _drive_list_kw() -> dict[str, Any]:
 
 def _drive_get_export_kw() -> dict[str, Any]:
     """Params for get_media / export_media (shared-drive support)."""
-    return {"supportsAllDrives": True}
+    # NOTE: Some Drive API client versions do NOT accept supportsAllDrives
+    # on export_media, only on get/list. To avoid
+    #   TypeError: unexpected keyword argument supportsAllDrives
+    # we no longer pass any extra kwargs here and rely on default behaviour.
+    return {}
 
 
 # -----------------------------------------------------------------------------
@@ -338,7 +342,8 @@ def _download_file(drive, file_info: dict[str, Any]) -> bytes:
     try:
         if "vnd.google-apps." in mime:
             logger.debug(f"Exporting Google Workspace file {name} as text/plain")
-            req = drive.files().export_media(fileId=fid, mimeType="text/plain", **kw)
+            # export_media does not accept supportsAllDrives on some client versions
+            req = drive.files().export_media(fileId=fid, mimeType="text/plain")
             buf = io.BytesIO()
             download = MediaIoBaseDownload(buf, req)
             done = False
@@ -349,6 +354,8 @@ def _download_file(drive, file_info: dict[str, Any]) -> bytes:
             return result
 
         logger.debug(f"Downloading binary file {name}")
+        # get_media may accept supportsAllDrives on newer clients, but it's optional;
+        # we keep kw for forward compatibility, and it's empty on older ones.
         req = drive.files().get_media(fileId=fid, **kw)
         buf = io.BytesIO()
         download = MediaIoBaseDownload(buf, req)

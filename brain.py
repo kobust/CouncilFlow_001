@@ -29,7 +29,7 @@ class CacheExpiredError(RuntimeError):
 # Init
 # -----------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gemini-3-flash-preview"
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
 CACHE_TTL_SECONDS = 3600  # 60 minutes
 
 # Override via env to reduce quota issues (e.g. GEMINI_MODEL=gemini-2.0-flash).
@@ -71,9 +71,18 @@ def _planner_model() -> str:
     try:
         import db
         config = db.get_app_config()
-        if config and config.planner_model:
-            logger.debug(f"Using planner model from database: {config.planner_model}")
-            return config.planner_model
+        if config:
+            # Support both ORM objects and plain dicts (defensive)
+            planner_value = None
+            try:
+                planner_value = getattr(config, "planner_model", None)
+            except Exception:
+                planner_value = None
+            if isinstance(config, dict) and (planner_value is None):
+                planner_value = config.get("planner_model")
+            if planner_value:
+                logger.debug(f"Using planner model from database: {planner_value}")
+                return planner_value
     except Exception as e:
         logger.debug(f"Could not get planner model from database (non-fatal): {e}")
     
@@ -100,7 +109,7 @@ PLANNER_MODEL = get_planner_model()  # Initial value, but functions should call 
 def list_available_models() -> list[str]:
     """
     Query Gemini API for available models.
-    Returns list of model names (e.g., ['gemini-3-flash-preview', 'gemini-2.0-flash', ...]).
+    Returns list of model names (e.g., ['gemini-3.1-pro-preview', 'gemini-2.0-flash', ...]).
     """
     try:
         models = []
@@ -147,6 +156,7 @@ def list_available_models() -> list[str]:
             # Return common models as fallback if API call failed
             logger.warning("Could not fetch models from API, using fallback list")
             return [
+                "gemini-3.1-pro-preview",
                 "gemini-3-flash-preview",
                 "gemini-2.5-flash",
                 "gemini-2.5-pro",
@@ -158,6 +168,7 @@ def list_available_models() -> list[str]:
         logger.warning(f"Error listing available models: {e}")
         # Return common models as fallback
         return [
+            "gemini-3.1-pro-preview",
             "gemini-3-flash-preview",
             "gemini-2.5-flash",
             "gemini-2.5-pro",
@@ -267,6 +278,7 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "gemini-2.5-flash": 1_000_000,
     "gemini-2.5-pro": 1_000_000,
     "gemini-3-flash-preview": 1_048_576,
+    "gemini-3.1-pro-preview": 1_000_000,
 }
 DEFAULT_MAX_CONTEXT = 1_048_576
 
