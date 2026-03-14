@@ -1604,7 +1604,7 @@ if current_page == "edit_prompts":
             if not versions:
                 st.caption("No version history yet (save this prompt to create the first version).")
             else:
-                for pv in versions:
+                for idx, pv in enumerate(versions):
                     saved_str = pv.saved_at.strftime("%Y-%m-%d %H:%M") if getattr(pv, "saved_at", None) else "—"
                     col1, col2, col3 = st.columns([1, 2, 2])
                     with col1:
@@ -1612,7 +1612,7 @@ if current_page == "edit_prompts":
                     with col2:
                         st.caption(f"Saved: {saved_str}")
                     with col3:
-                        if st.button("Restore", key=f"restore_v{pv.version}_{existing.id}"):
+                        if st.button("Restore", key=f"restore_v{pv.version}_{existing.id}_{idx}"):
                             st.session_state["crud_name"] = pv.name
                             st.session_state["crud_template"] = pv.template_text
                             st.session_state["crud_verifier_id"] = pv.verifier_id
