@@ -581,11 +581,12 @@ def to_public_testimony_by_category_md(data: Any) -> str:
                     author_line += f" - Phone: {contact_phone}"
                 author_line += ":"
                 parts.append(author_line)
-            if filename:
-                parts.append(f"{summary} *(filename: {filename})*")
-            else:
-                parts.append(summary)
-            parts.append("")
+
+                if filename:
+                    parts.append(f"{summary} *(filename: {filename})*")
+                else:
+                    parts.append(summary)
+                parts.append("")
 
     return "\n".join(parts).strip()
 
