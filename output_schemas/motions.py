@@ -284,12 +284,20 @@ MAYORS_COMMUNICATION_SCHEMA = {
 
 PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://attleboro-ma.gov/schemas/public-testimony-output.schema.json",
-  "title": "Attleboro Municipal Council Written Public Testimony Output",
-  "description": "Schema for structured extraction of written public testimony matched to current Council business or other municipal issues.",
-  "type": "array",
-  "items": {
-    "$ref": "#/$defs/testimonyItem"
+  "$id": "https://attleboro-ma.gov/schemas/public-testimony-agenda-output-wrapped.schema.json",
+  "title": "Attleboro Municipal Council Written Public Testimony Output (Agenda-Based, Wrapped)",
+  "description": "Schema for structured extraction of written public testimony matched to matters listed on a Council agenda or to other municipal issues.",
+  "type": "object",
+  "additionalProperties": False,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "description": "One output record per testimony file processed.",
+      "items": {
+        "$ref": "#/$defs/testimonyItem"
+      }
+    }
   },
   "$defs": {
     "testimonyItem": {
@@ -317,7 +325,7 @@ PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
         "how-to-contact": {
           "type": "string",
           "minLength": 1,
-          "description": "Contact information explicitly present in the source, or 'Not provided'. Examples: 'Email: name@example.com', 'Phone: 508-555-0123', 'Email: name@example.com; Phone: 508-555-0123', 'Mailing address provided', 'Not provided'."
+          "description": "Contact information explicitly present in the source, or 'Not provided'."
         },
         "summary": {
           "type": "string",
@@ -331,23 +339,23 @@ PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
             "Opposed",
             "Neither For Nor Against"
           ],
-          "description": "Constituent position relative to the matched motion or categorized issue."
+          "description": "Constituent position relative to the matched agenda item or categorized issue."
         },
         "categorization": {
           "type": "string",
           "description": "Primary categorization of the testimony.",
-          "oneOf": [
+          "anyOf": [
             {
-              "pattern": "^Motion \\[[^\\]]+\\] - .+$",
-              "description": "Matched to a specific motion, for example: Motion [26.03.03-MC-005] - Rescue 4 overtime funding"
+              "pattern": "^Agenda Item \\[[^\\]]+\\] - .+$",
+              "description": "Matched to a specific agenda item, including items with a listed ID or the literal label 'No listed ID'."
             },
             {
               "pattern": "^Ward Issue - .+$",
-              "description": "Localized constituent or neighborhood issue."
+              "description": "Localized constituent or neighborhood issue not clearly tied to a current agenda item."
             },
             {
               "pattern": "^General Municipal Issue - .+$",
-              "description": "Citywide or general policy issue not clearly tied to a current motion."
+              "description": "Citywide or general policy issue not clearly tied to a current agenda item."
             },
             {
               "const": "Not Within Council Jurisdiction / Unclear",
@@ -355,31 +363,39 @@ PUBLIC_TESTIMONY_OUTPUT_SCHEMA = {
             }
           ]
         }
-      },
-      "examples": [
+      }
+    }
+  },
+  "examples": [
+    {
+      "items": [
         {
-          "filename": "No_Disturb Zone Testimony_Ken Salome.pdf",
-          "author": "Ken Salome",
+          "filename": "BusinessesinAttleboro.docx",
+          "author": "Julie Hall",
           "how-to-contact": "Not provided",
-          "summary": "Resident comments on the proposed no-disturbance zone and describes concerns about how the policy would affect nearby neighbors and enforcement.",
+          "summary": "The author supports opposition to a proposed tax break for a development at 61 Union Street and argues that all businesses should be treated fairly under city ordinances.",
           "position": "Opposed",
-          "categorization": "Motion [26.03.17-MC-005] - No-disturbance zone proposal"
+          "categorization": "Agenda Item [No listed ID] - Tax increment financing agreement for 61 Union Street"
         }
       ]
     }
-  }
+  ]
 }
 
 
 def to_public_testimony_table_md(data: Any) -> str:
     """
-    Transform public testimony JSON (array of testimonyItem) to a Markdown table.
+    Transform public testimony JSON (wrapped object with "items" array of testimonyItem) to a Markdown table.
     Columns: filename, author, how-to-contact, position, categorization, summary.
     """
-    if not isinstance(data, list):
-        return f"Unexpected shape: expected array, got {type(data).__name__}"
+    if not isinstance(data, dict) or "items" not in data:
+        return f"Unexpected shape: expected object with 'items' array, got {type(data).__name__}"
 
-    if not data:
+    items = data["items"]
+    if not isinstance(items, list):
+        return f"Unexpected shape: 'items' must be an array, got {type(items).__name__}"
+
+    if not items:
         return "## Public Testimony\n\nNo testimony items."
 
     parts: list[str] = []
@@ -388,7 +404,7 @@ def to_public_testimony_table_md(data: Any) -> str:
     parts.append("| Filename | Author | How to contact | Position | Categorization | Summary |")
     parts.append("|----------|--------|----------------|----------|----------------|---------|")
 
-    for item in data:
+    for item in items:
         if not isinstance(item, dict):
             continue
 
